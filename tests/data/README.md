@@ -6,9 +6,14 @@ A real `session.snapshot` response, captured from a running herdr 0.8.0 server
 (protocol 19) with 10 workspaces, 18 agents and 18 panes.
 
 Every key, nesting level and value *type* is exactly as the server sent it. Only
-identifying string values were replaced — workspace labels, repository names and
-paths, terminal titles, and the agent-session UUID. Nothing was added, removed or
-restructured.
+identifying string values were replaced — workspace labels, agent names,
+repository names and paths, terminal titles, and the agent-session UUID. Nothing
+was added, removed or restructured.
+
+In particular, *which* entries carry an optional field is preserved: 15 of the 18
+`agents[]` entries have a `name` and 3 do not, exactly as captured, and one
+carries a `display_agent`. That distribution is the point — a fixture where every
+entry looks the same cannot catch a client that assumes a field is always there.
 
 The point of capturing rather than hand-writing this is that a fake built from
 assumptions tests only the assumptions. The structural detail that matters most

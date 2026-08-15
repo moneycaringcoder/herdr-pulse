@@ -622,7 +622,7 @@ fn the_label_is_the_program_and_never_the_users_agent_name() {
         .flat_map(|w| w.agents.iter())
         .collect();
 
-    // 15 of the capture's 18 agents carry a user label such as `pulselead` in a
+    // 15 of the capture's 18 agents carry a user label of their own in a
     // `name` field. `AgentObservation::program` is documented as the *program*,
     // so it must be `claude`/`opencode` — a field that sometimes holds a program
     // and sometimes a nickname is a field nothing can render honestly.

@@ -34,7 +34,7 @@
 //!
 //! The captured fixture disagrees with the paragraph above on one point: 15 of
 //! its 18 `agents[]` entries *do* carry a `name` (the user's own label for the
-//! agent, e.g. `pulselead`), and one carries a `display_agent` (`✦ Claude`).
+//! agent, such as `reviewer`), and one carries a `display_agent`.
 //! We still populate [`AgentObservation::program`] from `agent`, because that
 //! field is named and documented in `model.rs` as *the program* — filling it
 //! with a user label would make the type lie. `name` is deliberately not

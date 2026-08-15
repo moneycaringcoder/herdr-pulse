@@ -76,10 +76,18 @@ Both confirmed against a live snapshot:
 1. **`agents[]` entries carry the full pane shape**, not a reduced
    `{pane_id, tab_id, workspace_id, agent_session}`. `agents` is essentially
    `panes` filtered to those running a recognised agent.
-2. **There is no `name` field on an `agents[]` entry.** Use `agent` — the
-   program, `claude` or `opencode` — as the label. `agent_session` is an object
-   (`{agent, kind, source, value}`), not a string, so it is no use as a display
-   name either.
+2. **`name` is present but optional**, and it is the *user's* label for the
+   agent, not the program. In the captured snapshot 15 of 18 entries carry one
+   and 3 do not; one entry also carries a `display_agent`. `agent` is the
+   program (`claude`, `opencode`) and is always present, so it is the field to
+   rely on. `agent_session` is an object (`{agent, kind, source, value}`), not a
+   string, so it is no use as a display name either.
+
+   An earlier version of this document asserted there was no `name` field at
+   all, which was simply wrong — the mistake came from reading one entry rather
+   than the whole array. It is recorded here because it is the exact shape of
+   error this project keeps finding: a confident claim about a payload, derived
+   from too small a sample, that nothing downstream can contradict.
 
 `workspaces[].worktree` also carries a `repo_name` field that the inherited
 notes do not mention.

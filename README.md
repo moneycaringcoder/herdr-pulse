@@ -47,7 +47,7 @@ have been renamed; every glyph, column and number is as the plugin printed it.
 pulse — 19 workspaces — 23:32:18 UTC
 
 workspace           activity                            state          for  seen  agents
-orchestrator        [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·▃·····]  ? unknown      35m  3s    0
+web-api             [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·▃·····]  ? unknown      35m  3s    0
 research            [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  ? unknown      ?    3s    0
 planner             [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  ? unknown      32m  3s    0
 media-fix           [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  - idle         ?    3s    2
