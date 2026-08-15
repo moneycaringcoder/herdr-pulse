@@ -1,0 +1,94 @@
+# herdr plugin: pulse
+#
+# Records what each workspace's agents were doing over the last few hours and
+# renders it as a sparkline in the sidebar, so a wedged agent and a busy one
+# stop looking identical between glances.
+#
+# Install:   herdr plugin install moneycaringcoder/herdr-pulse
+# Local dev: herdr plugin link /path/to/herdr-pulse   (does NOT run [[build]])
+# Remove:    herdr plugin unlink moneycaringcoder.pulse
+# Logs:      herdr plugin log list --plugin moneycaringcoder.pulse
+
+id = "moneycaringcoder.pulse"
+name = "Pulse"
+version = "0.1.0"
+# Oldest herdr with every API this plugin calls: the `tokens` metadata API on
+# workspace.report_metadata, which landed in 0.7.5. Developed and verified
+# against 0.8.0 / protocol 19.
+min_herdr_version = "0.7.5"
+description = "Per-workspace agent activity history, rendered as a sidebar sparkline."
+platforms = ["linux", "macos"]
+
+# Commands are argv arrays run with no shell and a minimal PATH, with the plugin
+# root as cwd. Compiled once at install time; the resulting binary is what every
+# command below invokes.
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+# Restart recovery. herdr runs startup hooks on a fresh server start AND on a
+# live handoff (`herdr update --handoff`), so this fires whenever herdr comes
+# back. --restore re-spawns the sampler only if it was enabled when herdr went
+# away, and is a silent no-op otherwise.
+[[startup]]
+command = ["./target/release/pulse", "--restore"]
+
+# Live detail view: every workspace, its sparkline, its current state and how
+# long that state has lasted.
+[[panes]]
+id = "activity"
+title = "Pulse: activity"
+placement = "overlay"
+command = ["./target/release/pulse", "--watch"]
+
+[[actions]]
+id = "report"
+title = "Pulse: report"
+description = "One-shot activity report for the whole session."
+contexts = ["global", "workspace"]
+command = ["./target/release/pulse", "--once"]
+
+[[actions]]
+id = "json"
+title = "Pulse: JSON history"
+description = "Machine-readable activity history for scripting."
+contexts = ["global", "workspace"]
+command = ["./target/release/pulse", "--json"]
+
+[[actions]]
+id = "setup"
+title = "Pulse: set up sidebar (start here)"
+description = "Add pulse's tokens to herdr's config.toml, back it up, and reload."
+contexts = ["global"]
+command = ["./target/release/pulse", "--setup"]
+
+[[actions]]
+id = "setup-rollback"
+title = "Pulse: undo sidebar setup"
+description = "Restore the config.toml backup taken by setup."
+contexts = ["global"]
+command = ["./target/release/pulse", "--setup-rollback"]
+
+[[actions]]
+id = "sampler-toggle"
+title = "Pulse: toggle sampler"
+contexts = ["global"]
+command = ["./target/release/pulse", "--toggle"]
+
+[[actions]]
+id = "sampler-enable"
+title = "Pulse: enable sampler"
+contexts = ["global"]
+command = ["./target/release/pulse", "--enable"]
+
+[[actions]]
+id = "sampler-disable"
+title = "Pulse: disable sampler"
+contexts = ["global"]
+command = ["./target/release/pulse", "--disable"]
+
+[[actions]]
+id = "forget"
+title = "Pulse: forget recorded history"
+description = "Delete the on-disk activity history and start over."
+contexts = ["global"]
+command = ["./target/release/pulse", "--forget"]
