@@ -209,41 +209,49 @@ fn the_plugin_shells_out_only_to_itself_and_to_herdr() {
     // that merely watches a run. The rule is small enough to state exactly —
     // the daemon re-execs this binary, and setup asks herdr to reload its
     // config. Nothing else, and in particular never `git`.
+    // Asserting the exact *set* of spawn sites, rather than searching each line
+    // for a permitted substring: a loose `line.contains("bin")` would wave
+    // through `Command::new(user_supplied_binary)` without a murmur.
+    const SANCTIONED: [&str; 2] = [
+        // setup.rs — `herdr server reload-config`, so sidebar rows take effect
+        // without the user restarting herdr.
+        "src/setup.rs: Command::new(bin)",
+        // daemon.rs — this binary re-execing itself as a detached `--daemon`.
+        "src/daemon.rs: Command::new(exe)",
+    ];
+
     let src = repo_root().join("src");
-    let mut offenders = Vec::new();
-    let mut walk = |dir: &Path, offenders: &mut Vec<String>| {
-        for entry in std::fs::read_dir(dir).expect("read src").flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source");
-            for (n, line) in text.lines().enumerate() {
-                if !line.contains("Command::new") {
-                    continue;
-                }
-                // The two sanctioned spawns, by the expression each uses.
-                let sanctioned = line.contains("current_exe") || line.contains("bin");
-                if !sanctioned {
-                    offenders.push(format!(
-                        "{}:{}: {}",
-                        path.file_name().unwrap().to_string_lossy(),
-                        n + 1,
-                        line.trim()
-                    ));
-                }
-            }
-            assert!(
-                !text.contains("\"git\""),
-                "{} names the git binary; this plugin must never invoke git",
-                path.display()
-            );
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("read src").flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
         }
-    };
-    walk(&src, &mut offenders);
-    assert!(
-        offenders.is_empty(),
-        "unexpected subprocess spawns: {offenders:#?}"
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&path).expect("read source");
+
+        for line in text.lines() {
+            if let Some(at) = line.find("Command::new") {
+                // Normalise `std::process::Command::new(x)` and `Command::new(x)`
+                // to one spelling, and keep the argument expression verbatim.
+                let call = line[at..].split(';').next().unwrap_or("").trim();
+                found.push(format!("src/{name}: {call}"));
+            }
+        }
+
+        assert!(
+            !text.contains("\"git\""),
+            "src/{name} names the git binary; this plugin must never invoke git"
+        );
+    }
+
+    found.sort();
+    let mut expected: Vec<String> = SANCTIONED.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "the set of subprocess spawn sites changed; each one needs a deliberate \
+         review before it is added to SANCTIONED"
     );
 }
 
@@ -256,7 +264,21 @@ fn the_dependency_tree_cannot_reach_the_network() {
     // Asserting the whole allowlist rather than searching for known-bad names
     // means a *new* dependency has to be considered deliberately, instead of
     // slipping in because nobody thought to add it to a denylist.
-    const ALLOWED: [&str; 17] = [
+    //
+    // The list is checked against `Cargo.lock`, which records every platform's
+    // dependencies rather than only this host's. That is deliberate: the lockfile
+    // is what a supply-chain review reads, and a crate that is harmless because
+    // it never compiles here should still be a decision somebody made on purpose.
+    //
+    // `windows-link` and `windows-sys` are exactly that case. They arrive via
+    // `signal-hook -> signal-hook-registry -> errno`, are gated on Windows
+    // targets, and appear in no dependency graph this plugin ever builds —
+    // `cargo tree --target x86_64-unknown-linux-gnu` does not mention them, and
+    // the manifest declares `platforms = ["linux", "macos"]`. They are Win32 API
+    // bindings, not a network stack.
+    const ALLOWED: [&str; 19] = [
+        "windows-link",
+        "windows-sys",
         "pulse",
         "serde",
         "serde_core",

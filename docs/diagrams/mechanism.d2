@@ -1,9 +1,12 @@
 # How one snapshot becomes one sparkline. Rendered to docs/img/mechanism.svg.
 #
+# Laid out downward on purpose: a left-to-right chain of six nodes renders at
+# about 9:1, which is illegible at README width.
+#
 # No unicode marks in labels — d2's bundled font has no glyph for them and they
 # render as tofu.
 
-direction: right
+direction: down
 
 classes: {
   node: {
@@ -35,62 +38,48 @@ classes: {
   }
 }
 
-herdr: {
+herdr: "herdr server" {
   class: node
-  label: "herdr server\nsession.snapshot"
+  tooltip: one session.snapshot per interval
 }
 
-sampler: {
-  class: node
-  label: "sampler\nevery 5s, one round trip"
-}
+sampler: "sampler daemon\nevery 5s, one round trip" {class: node}
 
-fold: {
-  class: node
-  label: "fold into the current bucket\nworking? blocked? did seq move?"
-}
+fold: "fold into this minute's bucket\nany agent working? blocked?\ndid state_change_seq move?" {class: node}
 
-store: {
-  class: store
-  label: "history.json\n240 x 60s ring per workspace\nwritten by atomic rename"
-}
+store: "history.json\n240 buckets x 60s per workspace\nreplaced by atomic rename" {class: store}
 
-badge: {
-  class: out
-  label: "sidebar badge\n8 columns, 64 minutes"
-}
+badge: "sidebar badge\n8 columns = 64 minutes" {class: out}
 
-pane: {
-  class: out
-  label: "activity pane\n32 columns, plus state and duration"
-}
+pane: "activity pane\n32 columns, state, duration" {class: out}
 
 herdr -> sampler: "workspaces, agents,\nagent_status, state_change_seq" {
   style.stroke: "#8b949e"
   style.font-color: "#57606a"
 }
 sampler -> fold {style.stroke: "#8b949e"}
-fold -> store: "one bucket per minute" {
-  style.stroke: "#8b949e"
-  style.font-color: "#57606a"
-}
+fold -> store {style.stroke: "#8b949e"}
 store -> badge: "workspace.report_metadata" {
   style.stroke: "#8b949e"
   style.font-color: "#57606a"
 }
-store -> pane {style.stroke: "#8b949e"}
+store -> pane: "pulse --once / --watch" {
+  style.stroke: "#8b949e"
+  style.font-color: "#57606a"
+}
 
-note: |md
-  A bucket the sampler never observed
-  stays empty and renders as a gap,
-  never as a quiet period.
-| {
+gap: "a bucket never observed stays empty\nand renders as a gap, never as quiet" {
+  shape: rectangle
   style: {
     stroke: "#8b949e"
     font-color: "#57606a"
     fill: transparent
     stroke-dash: 4
+    stroke-width: 2
   }
 }
 
-store -> note: {style.stroke-dash: 4; style.stroke: "#8b949e"}
+store -> gap {
+  style.stroke: "#8b949e"
+  style.stroke-dash: 4
+}

@@ -11,6 +11,7 @@
 //! full below.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use pulse::config::{self, Config, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
 use pulse::daemon::{self, BadgeOp, WorkspaceBadge};
-use pulse::model::Tone;
+use pulse::model::{AgentState, Level, Tone, WorkspaceActivity};
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
@@ -96,8 +97,6 @@ impl Drop for TempDirs {
     }
 }
 
-use std::os::unix::fs::PermissionsExt;
-
 fn write_pid_file(contents: &str) {
     std::fs::write(config::pid_file(), contents).expect("write pid file");
 }
@@ -172,7 +171,10 @@ impl Sleeper {
             ))
             .output()
             .ok()?;
-        let pid: i32 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+        let pid: i32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .ok()?;
 
         // `sh` reports the pid before the exec completes, so wait for the new
         // program to actually be in place before anyone reads its `comm`.
@@ -216,11 +218,20 @@ fn await_death(pid: i32, timeout: Duration) -> bool {
 
 /// Reaps whatever `--enable` / `--restore` detached, so a spawned child can
 /// never outlive the test that created it.
+///
+/// The `waitpid` is load-bearing *here* and nowhere else: the detached daemon is
+/// a direct child of whoever spawned it, and in production that parent exits
+/// immediately so init reaps the orphan. A test runner does not exit, so without
+/// this the dead child stays a zombie — and a zombie still answers
+/// `kill(pid, 0)`, which would make `clear_pid_file` treat it as a live
+/// successor and refuse to remove the marker.
 fn reap_spawned() {
     if let Some(pid) = daemon::read_pid() {
         if pid != std::process::id() as i32 {
             unsafe { libc::kill(pid, libc::SIGKILL) };
             await_death(pid, Duration::from_secs(2));
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
         }
     }
     daemon::clear_pid_file();
@@ -425,8 +436,7 @@ fn an_unwritable_state_dir_is_reported_and_never_fatal() {
         eprintln!("skipping: root ignores directory permissions");
         return;
     }
-    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o500))
-        .expect("chmod");
+    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o500)).expect("chmod");
 
     // Neither call may panic or abort the user's action; both warn on stderr.
     daemon::write_pid(std::process::id());
@@ -914,6 +924,84 @@ fn every_tone_maps_to_its_own_token_name() {
         );
     }
     assert_eq!(Tone::ALL_TOKENS.len(), 3);
+}
+
+/// One workspace's activity, as the store would hand it to the daemon.
+fn activity(workspace_id: &str, state: AgentState, series: &[Option<u8>]) -> WorkspaceActivity {
+    WorkspaceActivity {
+        workspace_id: workspace_id.to_string(),
+        label: format!("label-{workspace_id}"),
+        series: series.iter().map(|raw| raw.map(Level::new)).collect(),
+        state,
+        state_for: Some(90),
+        agent_count: 1,
+    }
+}
+
+#[test]
+fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
+    // `plan_for` is exercised in full above; this is the wiring between it and
+    // the two modules that decide what a badge says, which is the only part of
+    // `badge_plan` a pure test cannot see.
+    let config = Config::default();
+    for (state, token) in [
+        (AgentState::Blocked, "pulse_blocked"),
+        (AgentState::Working, "pulse_working"),
+        (AgentState::Idle, "pulse_quiet"),
+        (AgentState::Done, "pulse_quiet"),
+        (AgentState::Unknown, "pulse_quiet"),
+    ] {
+        let activity = activity("w6", state, &[Some(0), Some(4), None, Some(8)]);
+        let expected = pulse::render::badge(&activity, &config);
+        assert!(!expected.is_empty(), "the fixture must draw something");
+
+        let plan = daemon::badge_plan(&HashMap::new(), std::slice::from_ref(&activity), &config);
+
+        assert_eq!(
+            plan,
+            vec![BadgeOp::Set {
+                workspace_id: "w6".to_string(),
+                token,
+                text: expected,
+            }],
+            "state {state}"
+        );
+    }
+}
+
+#[test]
+fn badge_plan_clears_a_workspace_the_renderer_draws_nothing_for() {
+    let config = Config::default();
+    // Never observed: every column is a gap, which `render::badge` renders as
+    // the empty string rather than as a row of blanks in the sidebar.
+    let unobserved = activity("w6", AgentState::Unknown, &[None, None, None]);
+    assert!(pulse::render::badge(&unobserved, &config).is_empty());
+
+    let plan = daemon::badge_plan(&lit(&[("w6", "pulse_working")]), &[unobserved], &config);
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Clear {
+            workspace_id: "w6".to_string(),
+            token: "pulse_working".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn a_quiet_workspace_still_draws_because_quiet_is_an_answer() {
+    // The one case worth pinning down across the module boundary: a workspace
+    // that was observed and did nothing is *not* the same as one we never
+    // watched, and only the second may vanish from the sidebar.
+    let config = Config::default();
+    let quiet = activity("w6", AgentState::Idle, &[Some(0), Some(0), Some(0)]);
+
+    let plan = daemon::badge_plan(&HashMap::new(), &[quiet], &config);
+
+    assert!(
+        matches!(plan.as_slice(), [BadgeOp::Set { token, .. }] if *token == "pulse_quiet"),
+        "an observed-and-idle workspace must keep its row: {plan:?}"
+    );
 }
 
 #[test]

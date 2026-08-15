@@ -635,7 +635,15 @@ fn same_program(_pid: i32) -> bool {
 /// `/proc/<pid>/comm` against our own on Linux and degrade to a bare liveness
 /// probe elsewhere.
 pub fn live_pid() -> Option<i32> {
-    let recorded = read_pid()?;
+    let Some(recorded) = read_pid() else {
+        // An unparseable marker names no process at all, so it is swept for the
+        // same reason a stale one is: the next verb has to start from a clean
+        // state. Leaving it would park a file in the state dir that no verb ever
+        // removes and that reads, to anyone inspecting the directory, as a
+        // daemon that is still running.
+        clear_pid_file();
+        return None;
+    };
     if is_alive(recorded) && same_program(recorded) {
         return Some(recorded);
     }

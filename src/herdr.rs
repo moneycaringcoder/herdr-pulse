@@ -194,10 +194,7 @@ impl Herdr {
             params.insert("source".into(), json!(config::plugin_id()));
             params.insert("tokens".into(), Value::Object(patch));
             if sets_anything {
-                params.insert(
-                    "ttl_ms".into(),
-                    json!(ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS)),
-                );
+                params.insert("ttl_ms".into(), json!(ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS)));
             }
             self.call("workspace.report_metadata", Value::Object(params))?;
         }
@@ -343,7 +340,12 @@ pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
             // An unrecognised or absent status becomes `Unknown`, which still
             // counts as "an agent is here". Dropping the agent instead would
             // make a future sixth herdr state read as an empty workspace.
-            state: AgentState::parse(agent.get("agent_status").and_then(Value::as_str).unwrap_or("")),
+            state: AgentState::parse(
+                agent
+                    .get("agent_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
             // Absent seq is 0, which compares equal to itself and so records no
             // transition. Inventing a value would manufacture activity.
             state_change_seq: agent

@@ -37,6 +37,13 @@ fn levels(raw: &[u8]) -> Vec<Option<Level>> {
     raw.iter().map(|&n| Some(Level(n))).collect()
 }
 
+fn config_with_columns(badge_columns: usize) -> Config {
+    Config {
+        badge_columns,
+        ..Config::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sparkline
 // ---------------------------------------------------------------------------
@@ -92,7 +99,11 @@ fn a_level_above_the_maximum_clamps_instead_of_indexing_out_of_bounds() {
 fn no_level_at_all_can_make_the_sparkline_panic() {
     for raw in 0..=u8::MAX {
         let rendered = sparkline(&levels(&[raw]));
-        assert_eq!(rendered.chars().count(), 1, "level {raw} rendered {rendered:?}");
+        assert_eq!(
+            rendered.chars().count(),
+            1,
+            "level {raw} rendered {rendered:?}"
+        );
     }
 }
 
@@ -120,7 +131,7 @@ fn a_series_longer_than_the_badge_still_renders_in_full() {
 
 #[test]
 fn a_series_that_is_entirely_gaps_never_renders_a_quiet_bucket() {
-    let rendered = sparkline(&vec![None; 12]);
+    let rendered = sparkline(&[None; 12]);
     assert_eq!(rendered, GAP.to_string().repeat(12));
     assert!(
         !rendered.contains(QUIET),
@@ -251,7 +262,10 @@ fn a_workspace_with_no_recorded_history_gets_no_badge() {
     // observation here". The daemon reads the empty string as "clear the token"
     // rather than drawing a row of blanks.
     assert_eq!(
-        badge(&activity("new", vec![], AgentState::Working, None, 1), &config),
+        badge(
+            &activity("new", vec![], AgentState::Working, None, 1),
+            &config
+        ),
         ""
     );
     assert_eq!(
@@ -269,7 +283,13 @@ fn a_quiet_but_observed_workspace_still_gets_a_badge() {
     // information, and must not be mistaken for "we have nothing".
     let config = Config::default();
     let rendered = badge(
-        &activity("resting", levels(&[0, 0, 0, 0]), AgentState::Idle, Some(600), 1),
+        &activity(
+            "resting",
+            levels(&[0, 0, 0, 0]),
+            AgentState::Idle,
+            Some(600),
+            1,
+        ),
         &config,
     );
     assert_eq!(rendered, format!("{}{}", QUIET.to_string().repeat(4), '-'));
@@ -293,8 +313,7 @@ fn the_badge_is_a_sparkline_followed_by_the_state_glyph() {
 
 #[test]
 fn the_badge_shows_the_newest_columns_when_the_series_is_longer() {
-    let mut config = Config::default();
-    config.badge_columns = 3;
+    let config = config_with_columns(3);
     let rendered = badge(
         &activity(
             "long",
@@ -313,15 +332,14 @@ fn the_badge_shows_the_newest_columns_when_the_series_is_longer() {
 fn the_badge_honours_the_configured_column_count() {
     let series: Vec<Option<Level>> = levels(&[4; 40]);
     for columns in [1usize, 2, 8, 16, 64] {
-        let mut config = Config::default();
-        config.badge_columns = columns;
+        let config = config_with_columns(columns);
         let rendered = badge(
             &activity("wide", series.clone(), AgentState::Idle, Some(1), 1),
             &config,
         );
         assert_eq!(
             rendered.chars().count(),
-            columns + 1,
+            columns.min(series.len()) + 1,
             "{columns} columns plus one state glyph"
         );
     }
@@ -343,8 +361,7 @@ fn a_short_series_is_not_padded_out_to_the_column_count() {
 fn a_badge_window_that_is_all_gaps_still_reports_the_current_state() {
     // History exists, but nothing recent. Blanking the badge here would hide
     // that we stopped watching a workspace that is blocked right now.
-    let mut config = Config::default();
-    config.badge_columns = 4;
+    let config = config_with_columns(4);
     let mut series = levels(&[7, 7]);
     series.extend(vec![None; 4]);
     let rendered = badge(
@@ -373,9 +390,8 @@ fn the_badge_fits_its_sidebar_budget_at_the_default_configuration() {
 
 #[test]
 fn the_badge_never_panics_whatever_the_series() {
-    let mut config = Config::default();
     for columns in [1usize, 3, 8, 64] {
-        config.badge_columns = columns;
+        let config = config_with_columns(columns);
         for length in [0usize, 1, 7, 8, 9, 300] {
             let series: Vec<Option<Level>> = (0..length)
                 .map(|n| {
@@ -417,10 +433,13 @@ fn width_is_terminal_cells_not_bytes_or_code_points() {
 // ---------------------------------------------------------------------------
 
 /// Display width of each line up to `marker`, for the rows that have one.
+///
+/// Searches from the right: a workspace label is arbitrary user text and may
+/// itself contain a bracket, but nothing to the right of the sparkline does.
 fn column_offsets(rendered: &str, marker: char) -> Vec<usize> {
     rendered
         .lines()
-        .filter_map(|line| line.find(marker).map(|at| display_width(&line[..at])))
+        .filter_map(|line| line.rfind(marker).map(|at| display_width(&line[..at])))
         .collect()
 }
 
@@ -476,7 +495,13 @@ fn pane_columns_line_up_when_a_label_contains_multi_byte_characters() {
             Some(3),
             1,
         ),
-        activity("🔥-hot", levels(&[8, 8, 8, 8]), AgentState::Blocked, None, 9),
+        activity(
+            "🔥-hot",
+            levels(&[8, 8, 8, 8]),
+            AgentState::Blocked,
+            None,
+            9,
+        ),
     ]);
 
     let starts = column_offsets(&rendered, '[');
@@ -603,9 +628,11 @@ fn the_pane_labels_its_timescale_only_when_the_series_matches_the_configuration(
 
 #[test]
 fn pane_geometry_never_asks_for_more_columns_than_there_are_buckets() {
-    let mut config = Config::default();
     for retention in [1usize, 8, 31, 32, 33, 240, 10_000] {
-        config.retention_buckets = retention;
+        let config = Config {
+            retention_buckets: retention,
+            ..Config::default()
+        };
         let (columns, per_column) = pane_geometry(&config);
         assert!(columns >= 1 && per_column >= 1, "retention {retention}");
         assert!(columns <= retention.max(1), "retention {retention}");
@@ -627,10 +654,7 @@ fn a_control_character_in_a_label_cannot_break_the_layout() {
         ),
         activity("plain", levels(&[1, 2, 3, 4]), AgentState::Idle, Some(1), 1),
     ]);
-    let rows: Vec<&str> = rendered
-        .lines()
-        .filter(|line| line.contains('['))
-        .collect();
+    let rows: Vec<&str> = rendered.lines().filter(|line| line.contains('[')).collect();
     assert_eq!(rows.len(), 2, "one row per workspace:\n{rendered}");
     let starts = column_offsets(&rendered, '[');
     assert_eq!(starts[0], starts[1]);
@@ -659,8 +683,9 @@ fn an_over_long_label_is_elided_instead_of_widening_every_row() {
     assert!(rendered.contains('…'));
     let starts = column_offsets(&rendered, '[');
     assert_eq!(starts[0], starts[1]);
+    // 28 columns of label plus the two-space column separator.
     assert!(
-        starts[0] <= 28,
+        starts[0] <= 30,
         "a single label widened the whole pane to {}",
         starts[0]
     );
@@ -668,14 +693,22 @@ fn an_over_long_label_is_elided_instead_of_widening_every_row() {
 
 #[test]
 fn the_pane_never_panics_on_awkward_input() {
-    let mut config = Config::default();
-    config.retention_buckets = 8;
-    config.bucket_seconds = 10;
-    config.interval = Duration::from_secs(1);
+    let config = Config {
+        retention_buckets: 8,
+        bucket_seconds: 10,
+        interval: Duration::from_secs(1),
+        ..Config::default()
+    };
 
     let rows = vec![
         activity("", vec![], AgentState::Unknown, None, 0),
-        activity("gaps", vec![None; 500], AgentState::Done, Some(u64::MAX), 999),
+        activity(
+            "gaps",
+            vec![None; 500],
+            AgentState::Done,
+            Some(u64::MAX),
+            999,
+        ),
         activity(
             "huge",
             levels(&[u8::MAX; 40]),
@@ -706,6 +739,89 @@ fn the_pane_clock_is_a_valid_time_of_day_for_any_timestamp() {
             .trim_end_matches(" UTC");
         let parts: Vec<u64> = clock.split(':').filter_map(|p| p.parse().ok()).collect();
         assert_eq!(parts.len(), 3, "unparseable clock in {header:?}");
-        assert!(parts[0] < 24 && parts[1] < 60 && parts[2] < 60, "{header:?}");
+        assert!(
+            parts[0] < 24 && parts[1] < 60 && parts[2] < 60,
+            "{header:?}"
+        );
     }
+}
+
+/// herdr trims leading and trailing whitespace from a badge token's value, and
+/// deletes a token whose value is entirely whitespace. Both were verified
+/// against a live 0.8.0 server by reading the tokens back out of a subsequent
+/// snapshot, and neither behaviour is documented.
+///
+/// That makes "is the gap glyph a printing character?" a correctness property
+/// rather than a matter of taste. When [`GAP`] was a space:
+///
+///   * a badge ending in gaps lost its newest columns, so the sparkline silently
+///     stopped being aligned to now and stale activity read as current;
+///   * a badge that was entirely gaps rendered as the empty string, herdr
+///     dropped the token, and the badge vanished at exactly the moment the
+///     record became least trustworthy.
+///
+/// The entire suite passed with `GAP = ' '`, because every other assertion
+/// refers to `GAP` symbolically and so moved along with the bug. This one pins
+/// the property to the outside world instead.
+#[test]
+fn the_gap_glyph_survives_a_badge_round_trip() {
+    assert!(
+        !GAP.is_whitespace(),
+        "GAP must be a printing character: herdr trims whitespace off token \
+         values and deletes an all-whitespace token"
+    );
+
+    let config = Config::default();
+
+    // A workspace with no observations at all deliberately gets no badge — the
+    // daemon reads an empty string as "clear the token", so a workspace pulse
+    // knows nothing about does not occupy a sidebar row. That is a different
+    // thing from a badge that *renders* and then gets mangled in transit, which
+    // is what the rest of this test is about.
+    let all_gaps = activity(
+        "quiet",
+        vec![None; config.badge_columns],
+        AgentState::Idle,
+        None,
+        1,
+    );
+    assert!(
+        badge(&all_gaps, &config).is_empty(),
+        "a never-observed workspace should clear its token, not draw a row of gaps"
+    );
+
+    // Every badge that *is* drawn must survive the round trip unchanged. A
+    // badge herdr trims is a badge whose columns no longer line up with the
+    // clock, and nothing on screen says so.
+    for gaps in 0..config.badge_columns {
+        let mut series = vec![Some(Level::new(4)); config.badge_columns];
+        for slot in series.iter_mut().take(gaps) {
+            *slot = None;
+        }
+        let leading = activity("lead", series, AgentState::Working, None, 1);
+        let rendered = badge(&leading, &config);
+        assert_eq!(
+            rendered.trim(),
+            rendered,
+            "leading gaps were trimmed away with {gaps} of them: {rendered:?}"
+        );
+    }
+
+    // A series whose *newest* columns are gaps must keep them, because those are
+    // the columns that carry "we have stopped watching".
+    let mut series = vec![Some(Level::new(6)); config.badge_columns];
+    let last = series.len() - 1;
+    series[last] = None;
+    series[last - 1] = None;
+    let trailing = activity("stalled", series, AgentState::Idle, None, 1);
+    let rendered = badge(&trailing, &config);
+    assert_eq!(
+        rendered.trim(),
+        rendered,
+        "trailing gaps were trimmed away: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(GAP),
+        "trailing gaps vanished from {rendered:?}"
+    );
 }

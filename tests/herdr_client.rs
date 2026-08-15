@@ -19,10 +19,10 @@
 //! No running herdr is required, and nothing here touches the user's state.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::os::unix::net::UnixListener;
 use std::time::Duration;
 
 use pulse::herdr::{error_code, reduce_snapshot, socket_path, Herdr};
@@ -231,18 +231,6 @@ fn live_reply() -> Reply {
     Reply::Line(live_response().to_string())
 }
 
-/// A snapshot reply in the real envelope, with a substituted `snapshot` body for
-/// the degenerate cases the live capture does not contain.
-fn snapshot_reply(snapshot: Value) -> Reply {
-    Reply::Line(
-        json!({
-            "id": "pulse:1",
-            "result": {"type": "session_snapshot", "snapshot": snapshot}
-        })
-        .to_string(),
-    )
-}
-
 /// An error envelope, captured verbatim from a live server.
 fn error_reply(id: &str, code: &str, message: &str) -> Reply {
     Reply::Line(json!({"id": id, "error": {"code": code, "message": message}}).to_string())
@@ -296,7 +284,9 @@ fn the_retry_reuses_the_same_request_id() {
     let server = TestServer::start(vec![Reply::Eof, ok_reply()]);
     let mut client = server.client();
 
-    client.set_badge("wM", "pulse_working", "x", 15_000).expect("set");
+    client
+        .set_badge("wM", "pulse_working", "x", 15_000)
+        .expect("set");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
@@ -431,7 +421,9 @@ fn an_error_envelope_with_no_code_still_reads_as_a_rejection() {
     )]);
     let mut client = server.client();
 
-    let err = client.clear_badge("wM", "pulse_quiet").expect_err("rejected");
+    let err = client
+        .clear_badge("wM", "pulse_quiet")
+        .expect_err("rejected");
 
     // Not `None`: a caller that reads `None` as "transport failure" would
     // redial a server that is answering us perfectly well.
@@ -481,7 +473,9 @@ fn arrays_at_the_wrong_level_are_a_loud_error_and_not_an_idle_session() {
     // client read them from.
     let flattened = live_result()["snapshot"].clone();
     assert!(
-        flattened["workspaces"].as_array().is_some_and(|w| !w.is_empty()),
+        flattened["workspaces"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty()),
         "the flattened payload must still carry the data, or this proves nothing"
     );
     let mut result = flattened;
@@ -548,9 +542,7 @@ fn the_captured_session_reduces_to_its_recorded_workspaces() {
             .iter()
             .map(|w| w.workspace_id.as_str())
             .collect::<Vec<_>>(),
-        [
-            "wM", "w3", "w6", "wE", "wY", "w15", "w16", "w1B", "w1C", "w1D"
-        ],
+        ["wM", "w3", "w6", "wE", "wY", "w15", "w16", "w1B", "w1C", "w1D"],
         "workspace order follows the wire, so the plan built from it is stable"
     );
     assert_eq!(
@@ -1044,12 +1036,18 @@ fn unicode_block_elements_survive_the_round_trip_byte_for_byte() {
     let server = TestServer::start(vec![ok_reply()]);
     let mut client = server.client();
 
-    client.set_badge("w6", "pulse_blocked", badge, 15_000).expect("set");
+    client
+        .set_badge("w6", "pulse_blocked", badge, 15_000)
+        .expect("set");
 
     let params = server.only_request()["params"].clone();
     assert_eq!(params["tokens"]["pulse_blocked"], json!(badge));
     assert_eq!(
-        params["tokens"]["pulse_blocked"].as_str().expect("string").chars().count(),
+        params["tokens"]["pulse_blocked"]
+            .as_str()
+            .expect("string")
+            .chars()
+            .count(),
         badge.chars().count()
     );
 }
@@ -1069,7 +1067,10 @@ fn set_badge_clamps_ttl_into_the_protocol_range() {
     // herdr rejects a TTL outside 1..=86_400_000, and a rejected report renders
     // nothing at all — clamping loses far less than the push does.
     assert_eq!(parse_framed(&requests[0])["params"]["ttl_ms"], 1);
-    assert_eq!(parse_framed(&requests[1])["params"]["ttl_ms"], 86_400_000u64);
+    assert_eq!(
+        parse_framed(&requests[1])["params"]["ttl_ms"],
+        86_400_000u64
+    );
 }
 
 #[test]

@@ -174,6 +174,33 @@ since there is nothing for it to apply to.
 Readback also confirmed that Unicode block elements survive intact: `·▃▆█` came
 back byte-identical, so the sparkline can use the full ramp.
 
+### Token values are trimmed, and an all-whitespace value is a delete
+
+Undocumented, and it cost this plugin a real bug. Verified by readback:
+
+| sent | read back |
+|---|---|
+| `"   ab"` | `"ab"` — leading whitespace trimmed |
+| `"ab   "` | `"ab"` — trailing whitespace trimmed |
+| `"a   b"` | `"a   b"` — interior whitespace survives |
+| `"\u{a0}\u{a0}ab"` | `"ab"` — the trim is Unicode-aware, so NBSP is no escape |
+| `"     "` | *token absent* — an all-whitespace value **deletes** the token |
+
+The consequence for anything drawing a fixed-width sparkline is severe, because
+the failure is entirely silent. With a space as the "no data" glyph:
+
+- trailing gaps — the **newest** columns — are stripped, so the sparkline stops
+  being aligned to the present and older activity reads as current;
+- leading gaps are stripped, so badge widths vary down the sidebar;
+- a series that is *entirely* gaps renders as an empty string, herdr deletes the
+  token, and the badge disappears at exactly the moment the record is least
+  trustworthy.
+
+So the gap glyph is a printing character (`╌`), not a blank, and
+`tests/render.rs` pins that as a correctness property rather than a style
+choice. The whole render suite passed with a space, because every assertion
+referred to the glyph symbolically and moved along with the bug.
+
 ### Colour by token name
 
 herdr renders a token's value as flat text and cannot colour by content. Severity

@@ -72,7 +72,9 @@ fn newest_bucket(history: &History, index: usize) -> Bucket {
 /// One column per bucket, ending at `as_of`. The shape most of the projection
 /// assertions want.
 fn series(history: &History, as_of: u64, columns: usize, config: &Config) -> Vec<Option<Level>> {
-    history.activity(as_of, columns, 1, config)[0].series.clone()
+    history.activity(as_of, columns, 1, config)[0]
+        .series
+        .clone()
 }
 
 /// A throwaway directory that removes itself, so persistence tests never share
@@ -192,7 +194,10 @@ fn one_sample_lights_one_column_and_leaves_the_rest_gaps() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     let series = series(&history, T0, 8, &config);
     assert_eq!(series.len(), 8);
@@ -210,7 +215,10 @@ fn a_zero_length_ring_is_all_gaps_rather_than_a_panic() {
     let config = config(60, 0, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
     history.record(
         &one(T0 + 600, "w1", "alpha", &[("w1:p1", "working", 11)]),
         &config,
@@ -225,7 +233,10 @@ fn a_zero_length_ring_is_all_gaps_rather_than_a_panic() {
 fn zero_columns_is_an_empty_series() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     assert!(history.activity(T0, 0, 1, &config)[0].series.is_empty());
 }
@@ -234,7 +245,10 @@ fn zero_columns_is_an_empty_series() {
 fn zero_buckets_per_column_behaves_as_one() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     let widened = history.activity(T0, 8, 0, &config)[0].series.clone();
     assert_eq!(widened, series(&history, T0, 8, &config));
@@ -281,7 +295,10 @@ fn a_gap_in_the_middle_of_a_series_stays_a_gap() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
     // Five minutes of the daemon being down.
     history.record(
         &one(T0 + 5 * 60, "w1", "alpha", &[("w1:p1", "working", 11)]),
@@ -302,7 +319,10 @@ fn a_gap_in_the_middle_of_a_series_stays_a_gap() {
 fn a_window_with_nothing_recorded_in_it_is_entirely_gaps() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     // Forty minutes later, with a ring only eight buckets long: everything in
     // the window predates nothing and postdates everything, and every ring slot
@@ -333,7 +353,10 @@ fn a_partially_observed_column_is_data_not_a_gap() {
     let config = config(60, 240, 4);
     let mut history = History::empty(&config);
     // One observed minute inside a four-minute column.
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     let activity = &history.activity(T0 + 3 * 60, 2, 4, &config)[0];
     assert!(
@@ -348,7 +371,10 @@ fn a_column_averages_only_its_observed_buckets() {
     let mut history = History::empty(&config);
     // Two minutes of a four-minute column, both fully busy. Averaging over four
     // would halve a genuinely busy column because the daemon started late.
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
     history.record(
         &one(T0 + 60, "w1", "alpha", &[("w1:p1", "working", 10)]),
         &config,
@@ -488,9 +514,14 @@ fn ring_slots_from_a_previous_lap_are_stale_not_data() {
         );
     }
     // Then jump a whole lap forward, so every slot the walk passes over holds a
-    // busy minute from the previous lap.
+    // busy minute from the previous lap. The seq is the one last seen, so the
+    // newest minute is genuinely quiet and any bar in the series is stale data
+    // rather than churn.
     let jumped = T0 + 7 * 60;
-    history.record(&one(jumped, "w1", "alpha", &[("w1:p1", "idle", 20)]), &config);
+    history.record(
+        &one(jumped, "w1", "alpha", &[("w1:p1", "idle", 13)]),
+        &config,
+    );
 
     let series = series(&history, jumped, 4, &config);
     assert_eq!(
@@ -562,7 +593,10 @@ fn counters_saturate_rather_than_wrap() {
     let mut history = History::empty(&config);
 
     for step in 0..70_000u64 {
-        history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", step)]), &config);
+        history.record(
+            &one(T0, "w1", "alpha", &[("w1:p1", "working", step)]),
+            &config,
+        );
     }
 
     let bucket = newest_bucket(&history, 0);
@@ -715,7 +749,10 @@ fn a_workspace_introduced_by_this_sample_is_never_the_one_evicted() {
         &config,
     );
 
-    history.record(&one(T0 + 60, "wC", "gamma", &[("wC:p1", "idle", 3)]), &config);
+    history.record(
+        &one(T0 + 60, "wC", "gamma", &[("wC:p1", "idle", 3)]),
+        &config,
+    );
 
     let ids: Vec<&str> = history
         .workspaces
@@ -783,7 +820,10 @@ fn an_evicted_workspace_that_returns_starts_from_nothing() {
     let mut history = History::empty(&config);
 
     history.record(&one(T0, "wA", "alpha", &[("wA:p1", "working", 1)]), &config);
-    history.record(&one(T0 + 60, "wB", "beta", &[("wB:p1", "working", 2)]), &config);
+    history.record(
+        &one(T0 + 60, "wB", "beta", &[("wB:p1", "working", 2)]),
+        &config,
+    );
     history.record(
         &one(T0 + 120, "wA", "alpha", &[("wA:p1", "working", 3)]),
         &config,
@@ -937,7 +977,10 @@ fn workspaces_are_reported_in_the_order_they_were_first_seen() {
     let mut history = History::empty(&config);
 
     history.record(&one(T0, "wZ", "zulu", &[("wZ:p1", "idle", 1)]), &config);
-    history.record(&one(T0 + 60, "wA", "alpha", &[("wA:p1", "idle", 2)]), &config);
+    history.record(
+        &one(T0 + 60, "wA", "alpha", &[("wA:p1", "idle", 2)]),
+        &config,
+    );
 
     let labels: Vec<&str> = history
         .activity(T0 + 60, 4, 1, &config)
@@ -960,7 +1003,10 @@ fn a_moved_seq_is_a_transition_even_when_the_state_is_unchanged() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]),
+        &config,
+    );
     history.record(
         &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 799)]),
         &config,
@@ -977,7 +1023,10 @@ fn a_delta_in_the_global_seq_is_not_a_transition_count() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 700)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 700)]),
+        &config,
+    );
     history.record(
         &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 740)]),
         &config,
@@ -1006,7 +1055,10 @@ fn a_first_sighting_is_not_a_transition() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]),
+        &config,
+    );
     assert_eq!(newest_bucket(&history, 0).transitions, 0);
 
     // A second agent appearing is also a first sighting, not a transition.
@@ -1030,8 +1082,14 @@ fn a_seq_that_went_backwards_is_still_a_transition() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
 
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]), &config);
-    history.record(&one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 3)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 3)]),
+        &config,
+    );
 
     assert_eq!(newest_bucket(&history, 0).transitions, 1);
 }
@@ -1200,7 +1258,11 @@ fn levels_rise_with_occupancy() {
         );
         previous = level;
     }
-    assert_eq!(previous, Level(6), "a fully busy bucket leaves churn headroom");
+    assert_eq!(
+        previous,
+        Level(6),
+        "a fully busy bucket leaves churn headroom"
+    );
 }
 
 #[test]
@@ -1211,7 +1273,12 @@ fn churn_lifts_a_bucket_that_never_caught_an_agent_working() {
     let mut history = History::empty(&config);
     for step in 0..12u64 {
         history.record(
-            &one(T0 + step * 5, "w1", "alpha", &[("w1:p1", "idle", 10 + step)]),
+            &one(
+                T0 + step * 5,
+                "w1",
+                "alpha",
+                &[("w1:p1", "idle", 10 + step)],
+            ),
             &config,
         );
     }
@@ -1248,7 +1315,10 @@ fn the_last_column_contains_as_of_and_the_first_is_oldest() {
     let config = config(60, 240, 4);
     let mut history = History::empty(&config);
     // Only the oldest minute of an eight-minute window is busy.
-    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
     for minute in 1..8u64 {
         history.record(
             &one(T0 + minute * 60, "w1", "alpha", &[("w1:p1", "idle", 10)]),
@@ -1283,7 +1353,10 @@ fn wide_columns_aggregate_consecutive_buckets() {
 fn a_window_reaching_before_the_epoch_does_not_underflow() {
     let config = config(60, 240, 4);
     let mut history = History::empty(&config);
-    history.record(&one(120, "w1", "alpha", &[("w1:p1", "working", 10)]), &config);
+    history.record(
+        &one(120, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
 
     let series = series(&history, 120, 8, &config);
     assert_eq!(series.len(), 8);
@@ -1708,7 +1781,9 @@ fn the_live_snapshot_records_every_workspace() {
         "every workspace in the snapshot was observed"
     );
     assert!(
-        activity.iter().all(|a| a.series[..7].iter().all(Option::is_none)),
+        activity
+            .iter()
+            .all(|a| a.series[..7].iter().all(Option::is_none)),
         "and nothing before it was"
     );
 }
@@ -1824,7 +1899,9 @@ fn a_live_session_replayed_for_an_hour_stays_bounded_and_full() {
     }
     let activity = history.activity(T0 + 719 * 5, 8, 8, &config);
     assert!(
-        activity.iter().all(|a| a.series.iter().all(Option::is_some)),
+        activity
+            .iter()
+            .all(|a| a.series.iter().all(Option::is_some)),
         "an hour of continuous sampling has no gaps"
     );
     let busy = activity.iter().find(|a| a.workspace_id == "w16").unwrap();
@@ -1843,8 +1920,10 @@ fn a_live_workspace_that_closes_leaves_a_gap_not_a_quiet_stretch() {
     for minute in 0..6u64 {
         let mut sample = base.clone();
         sample.taken_at = T0 + minute * 60;
-        if minute >= 2 && minute <= 4 {
-            sample.workspaces.retain(|w| w.workspace_id != closing.workspace_id);
+        if (2..=4).contains(&minute) {
+            sample
+                .workspaces
+                .retain(|w| w.workspace_id != closing.workspace_id);
         }
         history.record(&sample, &config);
     }

@@ -38,7 +38,26 @@ pub const RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '�
 pub const QUIET: char = '·';
 
 /// Not observed. The sampler was not running for this column.
-pub const GAP: char = ' ';
+///
+/// A broken line rather than a blank, and that is not a cosmetic preference —
+/// a blank is actively unsafe here. Verified against a live herdr 0.8.0 server:
+/// it **trims leading and trailing whitespace from a badge token's value**, and
+/// treats an all-whitespace value as a *delete*. With a space, three things went
+/// silently wrong:
+///
+///   * trailing gaps — the newest columns, the ones the badge exists to show —
+///     were stripped, so the sparkline stopped being aligned to "now" and older
+///     activity read as current;
+///   * leading gaps were stripped, so badges had ragged widths down the sidebar;
+///   * a series that was *entirely* gaps became an empty string, which herdr
+///     deleted, so a workspace nobody had been watching lost its badge instead
+///     of showing that nobody had been watching.
+///
+/// That last one is the exact failure this plugin is built to avoid: the moment
+/// the record is least trustworthy is the moment the warning disappears. Interior
+/// spaces do survive the round trip, which is why the bug only ever showed up at
+/// the ends.
+pub const GAP: char = '╌';
 
 /// Sparkline columns in the activity pane. Wider than the badge because the pane
 /// is an overlay rather than a sidebar cell, and narrow enough that a row still
@@ -182,10 +201,10 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
     for workspace in activity {
         rows.push(vec![
             clean_label(&workspace.label),
-            // Bracketed because [`GAP`] is a space: without a delimiter a series
-            // that begins or ends unobserved is indistinguishable from column
-            // padding, and the gap would be invisible in the one view whose job
-            // is to show it.
+            // Bracketed so the series has visible ends. [`GAP`] is a printing
+            // character rather than a blank, so this is no longer load-bearing
+            // for legibility, but the delimiters still make the column width
+            // obvious when every glyph in a row is the same.
             format!("[{}]", sparkline(&workspace.series)),
             format!("{} {}", state_glyph(workspace.state), workspace.state),
             duration(workspace.state_for),
@@ -288,7 +307,9 @@ pub fn run_watch(config: &Config) -> Result<()> {
         if daemon::live_pid().is_none() {
             write!(out, "{CLEAR}")?;
             out.flush()?;
-            return Err(format!("the sampler stopped while watching. {}", no_sampler_error()).into());
+            return Err(
+                format!("the sampler stopped while watching. {}", no_sampler_error()).into(),
+            );
         }
 
         let as_of = crate::now_unix();
