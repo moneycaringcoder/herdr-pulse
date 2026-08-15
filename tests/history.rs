@@ -450,7 +450,7 @@ fn occupancy_counts_samples_not_agents() {
 }
 
 #[test]
-fn a_sample_older_than_the_newest_bucket_is_dropped_not_written() {
+fn a_sample_a_bucket_or_two_behind_is_dropped_as_ordinary_jitter() {
     let config = config(60, 8, 4);
     let mut history = History::empty(&config);
     for minute in 0..4 {
@@ -466,7 +466,9 @@ fn a_sample_older_than_the_newest_bucket_is_dropped_not_written() {
     }
 
     let before = history.clone();
-    // The clock steps back two minutes: an NTP correction, a resumed laptop.
+    // Two buckets behind the newest: the sample straddled a boundary, or the
+    // snapshot round trip was slow. Re-opening a minute we have finished
+    // reporting is not worth it, and nothing is frozen by declining to.
     history.record(
         &one(T0 + 60, "w1", "alpha", &[("w1:p1", "idle", 99)]),
         &config,
@@ -474,7 +476,7 @@ fn a_sample_older_than_the_newest_bucket_is_dropped_not_written() {
 
     assert_eq!(
         history, before,
-        "a backwards sample must change nothing at all"
+        "a sample within the jitter window must change nothing at all"
     );
 }
 
@@ -1182,13 +1184,20 @@ fn how_long_a_state_has_held_is_unknown_until_a_change_is_watched() {
         "this agent may have been idle since breakfast; we started watching now"
     );
 
+    // The transition is watched at T0+120, and the workspace is then watched
+    // holding that state until T0+180: one observed minute of working.
     history.record(
         &one(T0 + 120, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 180, "w1", "alpha", &[("w1:p1", "working", 11)]),
         &config,
     );
     let activity = &history.activity(T0 + 180, 4, 1, &config)[0];
     assert_eq!(activity.state, AgentState::Working);
     assert_eq!(activity.state_for, Some(60));
+    assert_eq!(activity.last_seen, Some(T0 + 180));
 }
 
 #[test]
@@ -1221,17 +1230,26 @@ fn a_state_that_holds_keeps_its_original_start() {
 
 #[test]
 fn a_state_duration_never_runs_backwards() {
-    let config = config(60, 16, 4);
+    // A `state_since` after `last_seen` is only reachable through a hand-edited
+    // file, and an unchecked subtraction there reports a duration of several
+    // hundred billion years with complete confidence.
+    let dir = TempDir::new("impossible-duration");
+    let config = config(60, 16, 8);
     let mut history = History::empty(&config);
     history.record(&one(T0, "w1", "alpha", &[("w1:p1", "idle", 10)]), &config);
     history.record(
         &one(T0 + 60, "w1", "alpha", &[("w1:p1", "working", 11)]),
         &config,
     );
+    let mut value = serde_json::to_value(&history).unwrap();
+    value["workspaces"][0]["state_since"] = serde_json::json!(T0 + 10 * 60);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
 
-    // Rendering with an `as_of` behind the transition would underflow into a
-    // duration of several hundred billion years.
-    assert_eq!(history.activity(T0, 4, 1, &config)[0].state_for, Some(0));
+    let loaded = history::load_from(dir.path(), &config);
+    assert_eq!(
+        loaded.activity(T0 + 60, 4, 1, &config)[0].state_for,
+        Some(0)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,4 +1952,582 @@ fn a_live_workspace_that_closes_leaves_a_gap_not_a_quiet_stretch() {
     assert!(closed.series[1].is_some());
     assert_eq!(closed.series[2..5], [None, None, None]);
     assert!(closed.series[5].is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Hostile and misconfigured input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_file_recorded_by_a_clock_ahead_of_this_one_reads_as_gaps() {
+    // The machine's clock was a day fast when the history was written, and has
+    // since been corrected. Every recorded bucket is in this run's future, and
+    // `number % len` would happily hand those slots back for today's minutes.
+    let dir = TempDir::new("future-clock");
+    let config = config(60, 240, 8);
+    let mut history = History::empty(&config);
+    history.record(
+        &one(
+            T0 + 24 * 60 * 60,
+            "w1",
+            "alpha",
+            &[("w1:p1", "working", 10)],
+        ),
+        &config,
+    );
+    history::save_to(dir.path(), &history).expect("save");
+
+    let mut loaded = history::load_from(dir.path(), &config);
+    let stale = series(&loaded, T0, 8, &config);
+    assert!(
+        stale.iter().all(Option::is_none),
+        "tomorrow's buckets are not today's data: {stale:?}"
+    );
+
+    // Rendering gaps is only half of it. Asserting nothing more than that is how
+    // this file's own permanent-freeze bug passed a green suite: the store must
+    // also still be able to *record*, or every sample for the next twenty-four
+    // hours is discarded and the anchor keeps the freeze across restarts.
+    for minute in 0..4u64 {
+        loaded.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 20 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    let resumed = series(&loaded, T0 + 3 * 60, 4, &config);
+    assert!(
+        resumed.iter().all(Option::is_some),
+        "the corrected clock's samples must be recorded, not discarded: {resumed:?}"
+    );
+    let activity = &loaded.activity(T0 + 3 * 60, 4, 1, &config)[0];
+    assert_eq!(
+        activity.last_seen,
+        Some(T0 + 3 * 60),
+        "the fast clock's timestamp must not survive as the freshness stamp"
+    );
+    assert!(activity.is_current(T0 + 3 * 60, 15));
+}
+
+#[test]
+fn a_bucket_claiming_more_working_samples_than_samples_is_clamped() {
+    // Only reachable through a hand-edited or corrupt file, but an unclamped
+    // occupancy would multiply out past the ramp and wrap into a small number —
+    // a busy workspace drawn as a quiet one.
+    let dir = TempDir::new("impossible-bucket");
+    let config = config(60, 16, 8);
+    let mut value = serde_json::to_value(recorded(&config)).unwrap();
+    let overfull = serde_json::json!({
+        "samples": 1,
+        "working": 9_999,
+        "blocked": 0,
+        "transitions": 0,
+    });
+    let buckets = value["workspaces"][0]["buckets"].as_array().unwrap().len();
+    value["workspaces"][0]["buckets"] = serde_json::json!(vec![overfull; buckets]);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let loaded = history::load_from(dir.path(), &config);
+    let level = series(&loaded, T0 + 3 * 60, 1, &config)[0].expect("observed");
+    assert!(level.0 <= Level::MAX);
+    assert_eq!(level, Level(6));
+}
+
+#[test]
+fn a_directory_where_the_history_file_belongs_is_an_empty_history() {
+    let dir = TempDir::new("file-is-a-directory");
+    let config = config(60, 16, 8);
+    std::fs::create_dir(dir.file("history.json")).unwrap();
+
+    // An unreadable path is not a missing one, and must be reported rather than
+    // passed off as a first run — but it still must not stop the sampler.
+    assert_eq!(
+        history::load_from(dir.path(), &config),
+        History::empty(&config)
+    );
+}
+
+#[test]
+fn a_save_that_cannot_happen_reports_rather_than_pretending() {
+    let dir = TempDir::new("unwritable");
+    let config = config(60, 16, 8);
+    std::fs::write(dir.file("in-the-way"), b"not a directory").unwrap();
+
+    let failed = history::save_to(&dir.file("in-the-way/state"), &recorded(&config));
+
+    assert!(failed.is_err(), "a save into a file is not a save");
+}
+
+#[test]
+fn a_zero_bucket_width_does_not_divide_by_zero() {
+    // `config::load` clamps this away; a hand-built config in another module's
+    // test would not.
+    let config = config(0, 8, 4);
+    let mut history = History::empty(&config);
+
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 600, "w1", "alpha", &[("w1:p1", "idle", 11)]),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(series(&history, T0 + 600, 4, &config).len(), 4);
+}
+
+#[test]
+fn a_column_wider_than_the_whole_ring_still_reports_its_data() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..4u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    let activity = &history.activity(T0 + 3 * 60, 1, 10_000, &config)[0];
+    assert_eq!(activity.series.len(), 1);
+    assert!(activity.series[0].is_some());
+}
+
+#[test]
+fn an_agent_that_left_and_came_back_is_a_first_sighting_again() {
+    // A deliberate limit, pinned here so it cannot change by accident. Seqs are
+    // kept only for the agents present at the last observation, because keeping
+    // them for departed panes is unbounded growth in a workspace that churns
+    // panes. The cost is that a pane which vanished for one sample and returned
+    // with a moved seq is not counted — one missed transition, against a size
+    // bound that has to hold for weeks.
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+
+    history.record(
+        &one(
+            T0,
+            "w1",
+            "alpha",
+            &[("w1:p1", "working", 10), ("w1:p2", "idle", 20)],
+        ),
+        &config,
+    );
+    history.record(
+        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
+    history.record(
+        &one(
+            T0 + 10,
+            "w1",
+            "alpha",
+            &[("w1:p1", "working", 10), ("w1:p2", "idle", 30)],
+        ),
+        &config,
+    );
+
+    assert_eq!(newest_bucket(&history, 0).transitions, 0);
+    assert_eq!(newest_bucket(&history, 0).samples, 3);
+}
+
+#[test]
+fn the_order_workspaces_arrive_in_does_not_change_their_series() {
+    let config = config(60, 16, 8);
+    let build = |reversed: bool| {
+        let mut history = History::empty(&config);
+        for minute in 0..4u64 {
+            let mut workspaces = vec![
+                workspace("wA", "alpha", &[("wA:p1", "working", 10 + minute)]),
+                workspace("wB", "beta", &[("wB:p1", "idle", 500)]),
+                workspace("wC", "gamma", &[("wC:p1", "blocked", 700 + minute)]),
+            ];
+            if reversed {
+                workspaces.reverse();
+            }
+            history.record(&sample(T0 + minute * 60, workspaces), &config);
+        }
+        let mut activity = history.activity(T0 + 3 * 60, 8, 1, &config);
+        activity.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
+        activity
+    };
+
+    assert_eq!(build(false), build(true));
+}
+
+#[test]
+fn a_forgotten_history_starts_a_new_series_rather_than_resuming() {
+    let dir = TempDir::new("forget-then-record");
+    let config = config(60, 16, 8);
+    history::save_to(dir.path(), &recorded(&config)).expect("save");
+    history::forget_in(dir.path()).expect("forget");
+
+    let mut resumed = history::load_from(dir.path(), &config);
+    assert!(resumed.workspaces.is_empty());
+    resumed.record(
+        &one(T0 + 60, "wA", "alpha", &[("wA:p1", "working", 10)]),
+        &config,
+    );
+
+    let series = series(&resumed, T0 + 60, 4, &config);
+    assert_eq!(series[..3], [None, None, None]);
+    assert!(series[3].is_some());
+}
+
+// ---------------------------------------------------------------------------
+// A clock that stepped forward and came back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_forward_clock_step_does_not_deafen_the_store() {
+    // The shape the daemon actually produces: one snapshot stamped by a clock
+    // that was ninety minutes fast — a machine booting on a fast RTC before
+    // chronyd corrects it — and then an hour of correct once-a-minute sampling.
+    // Every one of those correct samples used to be discarded, silently, because
+    // the anchor the bogus sample left behind was never revised downward.
+    let config = config(60, 240, 8);
+    let mut history = History::empty(&config);
+
+    history.record(
+        &one(T0 + 90 * 60, "w1", "alpha", &[("w1:p1", "working", 700)]),
+        &config,
+    );
+    for minute in 0..60u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 701 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    let observed = history.workspaces[0]
+        .buckets
+        .iter()
+        .filter(|bucket| bucket.observed())
+        .count();
+    assert_eq!(
+        observed, 60,
+        "every corrected sample must have been recorded"
+    );
+    let recent = series(&history, T0 + 59 * 60, 8, &config);
+    assert!(
+        recent.iter().all(Option::is_some),
+        "the last eight minutes were sampled without interruption: {recent:?}"
+    );
+    assert_eq!(history.workspaces[0].newest_bucket, (T0 + 59 * 60) / 60);
+}
+
+#[test]
+fn a_sample_far_behind_re_anchors_and_discards_the_unreachable_buckets() {
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..4u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    // Three buckets back: past the jitter window, so the anchor is the value
+    // that cannot be believed.
+    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "idle", 20)]), &config);
+
+    assert_eq!(history.workspaces[0].newest_bucket, T0 / 60);
+    assert_eq!(
+        newest_bucket(&history, 0).samples,
+        2,
+        "the re-anchored sample shares the minute it was recorded in"
+    );
+    let series = series(&history, T0, 4, &config);
+    assert_eq!(
+        series[..3],
+        [None, None, None],
+        "the buckets the stepped clock wrote are discarded, not left as data"
+    );
+    assert!(series[3].is_some());
+}
+
+#[test]
+fn re_anchoring_forgets_a_state_duration_it_cannot_justify() {
+    let config = config(60, 240, 8);
+    let mut history = History::empty(&config);
+    // Two samples an hour into the future, the second a transition — so
+    // `state_since` is stamped with a time that has not happened.
+    history.record(
+        &one(T0 + 60 * 60, "w1", "alpha", &[("w1:p1", "idle", 10)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 61 * 60, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+    assert!(history.workspaces[0].state_since.is_some());
+
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+
+    let activity = &history.activity(T0, 4, 1, &config)[0];
+    assert_eq!(activity.state, AgentState::Working);
+    assert_eq!(
+        activity.state_for, None,
+        "the only stamp we had for this state was a time that never happened"
+    );
+    assert_eq!(activity.last_seen, Some(T0));
+    assert_eq!(activity.observed_ago(T0), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Freshness: `state` is a past observation, and says how old it is
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_state_nobody_has_watched_for_hours_is_not_reported_as_hours_of_work() {
+    let config = config(60, 240, 8);
+    let mut history = History::empty(&config);
+    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "idle", 10)]), &config);
+    history.record(
+        &one(T0 + 60, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 120, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+
+    // The daemon stops. Five hours later the user runs `pulse --once`.
+    let as_of = T0 + 5 * 60 * 60;
+    let activity = &history.activity(as_of, 8, 1, &config)[0];
+
+    assert!(
+        activity.series.iter().all(Option::is_none),
+        "nothing was observed in the last eight minutes"
+    );
+    assert_eq!(
+        activity.state_for,
+        Some(60),
+        "one minute of working was observed; the other five hours were not"
+    );
+    assert_eq!(activity.last_seen, Some(T0 + 120));
+    assert_eq!(activity.observed_ago(as_of), Some(5 * 60 * 60 - 120));
+    assert!(
+        !activity.is_current(as_of, 15),
+        "a five-hour-old observation is not a present-tense fact"
+    );
+    assert!(activity.is_current(T0 + 125, 15), "and a fresh one is");
+}
+
+#[test]
+fn a_state_duration_does_not_grow_while_nobody_is_looking() {
+    let config = config(60, 240, 8);
+    let mut history = History::empty(&config);
+    history.record(&one(T0, "w1", "alpha", &[("w1:p1", "idle", 10)]), &config);
+    history.record(
+        &one(T0 + 60, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 120, "w1", "alpha", &[("w1:p1", "working", 11)]),
+        &config,
+    );
+
+    let at_the_time = history.activity(T0 + 120, 8, 1, &config)[0].state_for;
+    let much_later = history.activity(T0 + 9 * 60 * 60, 8, 1, &config)[0].state_for;
+
+    assert_eq!(at_the_time, Some(60));
+    assert_eq!(
+        much_later, at_the_time,
+        "an observed duration is a fact about the past and cannot grow"
+    );
+}
+
+#[test]
+fn a_workspace_that_was_never_observed_reports_no_last_seen() {
+    // Unreachable from `record`, which always stamps the observation that
+    // created the workspace — but a hand-edited file can carry a zero, and
+    // reporting that as a 1970 sighting would make every freshness check read
+    // "observed, just very long ago" rather than "never observed".
+    let dir = TempDir::new("never-observed");
+    let config = config(60, 16, 8);
+    let mut value = serde_json::to_value(recorded(&config)).unwrap();
+    value["workspaces"][0]["last_seen"] = serde_json::json!(0);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let loaded = history::load_from(dir.path(), &config);
+    let activity = &loaded.activity(T0 + 3 * 60, 8, 1, &config)[0];
+    assert_eq!(activity.last_seen, None);
+    assert_eq!(activity.observed_ago(T0 + 3 * 60), None);
+    assert!(!activity.is_current(T0 + 3 * 60, 15));
+}
+
+// ---------------------------------------------------------------------------
+// Column geometry against the live lap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_column_wider_than_the_ring_still_finds_the_live_lap() {
+    // Eight buckets of a ring that holds eight, all observed and busy, drawn in
+    // one twenty-bucket column. Clamping the walk a ring length back from the
+    // *column's* newest bucket starts it past every live slot the moment `as_of`
+    // runs ahead of the last observation.
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..8u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    for ahead in [0u64, 1, 8, 13] {
+        let as_of = T0 + (7 + ahead) * 60;
+        let column = history.activity(as_of, 1, 20, &config)[0].series[0];
+        assert!(
+            column.is_some(),
+            "eight busy minutes are inside this column, {ahead} buckets after the last one"
+        );
+    }
+}
+
+#[test]
+fn the_badge_geometry_never_asks_for_more_than_the_ring_holds() {
+    // The cross-module invariant that keeps the badge off the wide-column path
+    // above: `--bucket-seconds 10 --columns 1` derives 384 buckets per column
+    // from the 64-minute window, which `config` now clamps down to what the ring
+    // can afford. Pinned here because the two halves live in different modules
+    // and neither one alone shows the mismatch.
+    for bucket_seconds in [10u64, 30, 60, 3_600] {
+        for badge_columns in [1usize, 8, 64] {
+            let config = Config {
+                bucket_seconds,
+                badge_columns,
+                ..Config::default()
+            };
+            let per_column = config.buckets_per_badge_column();
+            assert!(
+                per_column * badge_columns <= config.retention_buckets,
+                "a {badge_columns}-column badge at {bucket_seconds}s asks for \
+                 {per_column} buckets per column against a {}-bucket ring",
+                config.retention_buckets
+            );
+        }
+    }
+
+    // And with that geometry the store's answer for a fully sampled window has
+    // no gaps in it.
+    let config = Config {
+        bucket_seconds: 10,
+        badge_columns: 1,
+        ..Config::default()
+    };
+    let per_column = config.buckets_per_badge_column();
+    let mut history = History::empty(&config);
+    for step in 0..240u64 {
+        history.record(
+            &one(
+                T0 + step * 10,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    let badge = history.activity(T0 + 239 * 10, config.badge_columns, per_column, &config);
+    assert!(badge[0].series.iter().all(Option::is_some));
+}
+
+#[test]
+fn a_wide_column_entirely_past_the_live_lap_is_still_a_gap() {
+    // The counterweight to the test above: clamping the walk onto the live lap
+    // must intersect the column with it, never replace it. A column covering
+    // only minutes after the last observation contains no observation.
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..8u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w1",
+                "alpha",
+                &[("w1:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    // Two columns twenty buckets wide, ending forty buckets past the newest
+    // recorded one: both cover only unobserved minutes.
+    let as_of = T0 + (7 + 40) * 60;
+    let series = history.activity(as_of, 2, 20, &config)[0].series.clone();
+    assert_eq!(series, vec![None, None], "{series:?}");
+}
+
+#[test]
+fn an_absurdly_distant_as_of_neither_hangs_nor_invents_data() {
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", 10)]),
+        &config,
+    );
+
+    // The walk is bounded by the ring, not by the distance to `as_of`.
+    let series = history.activity(u64::MAX / 2, 8, 10_000, &config)[0]
+        .series
+        .clone();
+    assert!(series.iter().all(Option::is_none), "{series:?}");
+}
+
+#[test]
+fn a_history_file_with_an_impossible_anchor_does_not_panic() {
+    // `newest_bucket` comes straight out of the file, and `number + len`
+    // overflows for one near u64::MAX — a panic on the `pulse --once` path,
+    // which the module header promises can never happen for a corrupt file.
+    let dir = TempDir::new("impossible-anchor");
+    let written = config(60, 16, 8);
+    let relaid = config(60, 32, 8);
+    let mut value = serde_json::to_value(recorded(&written)).unwrap();
+    value["workspaces"][0]["newest_bucket"] = serde_json::json!(u64::MAX);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    // Same ring length: `reshape` is a no-op and the overflow is reached through
+    // the projection.
+    let loaded = history::load_from(dir.path(), &written);
+    let projected = series(&loaded, T0 + 3 * 60, 8, &written);
+    assert!(projected.iter().all(Option::is_none), "{projected:?}");
+
+    // A different ring length: reached through `reshape` on load instead.
+    let loaded = history::load_from(dir.path(), &relaid);
+    assert_eq!(loaded.workspaces[0].buckets.len(), 32);
+    assert!(series(&loaded, T0 + 3 * 60, 8, &relaid)
+        .iter()
+        .all(Option::is_none));
 }

@@ -76,12 +76,27 @@ fn already_configured(text: &str) -> bool {
 
 /// Splices the token entries into an existing `[ui.sidebar.spaces]` rows array,
 /// or appends a complete section when the user has none.
-///
-/// Returns `None` when the file already mentions our tokens, so a second run is a
-/// no-op rather than a duplicate insert.
-pub fn plan_edit(text: &str) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    /// The file already names our tokens. A second run is a no-op rather than a
+    /// duplicate insert.
+    AlreadyConfigured,
+    /// The updated file.
+    Edit(String),
+    /// `[ui.sidebar.spaces]` is present but there is nowhere safe to splice into.
+    ///
+    /// Distinguished from [`Plan::AlreadyConfigured`] because conflating the two
+    /// is how `--setup` came to print "already configured; nothing to do",
+    /// exit 0, and leave a file that named none of our tokens — after which the
+    /// badge silently never appears and the user has been told everything is
+    /// fine. A refusal has to look like a refusal.
+    NoRowToEdit,
+}
+
+/// Plans the edit. See [`Plan`] for the three outcomes.
+pub fn plan_edit(text: &str) -> Plan {
     if already_configured(text) {
-        return None;
+        return Plan::AlreadyConfigured;
     }
 
     let lines: Vec<&str> = text.lines().collect();
@@ -90,7 +105,7 @@ pub fn plan_edit(text: &str) -> Option<String> {
         .position(|line| line.trim_start().starts_with(SECTION));
 
     let Some(section_start) = section_start else {
-        return Some(append_section(text));
+        return Plan::Edit(append_section(text));
     };
 
     // Find the LAST row inside this section's rows array, and its final line.
@@ -104,24 +119,41 @@ pub fn plan_edit(text: &str) -> Option<String> {
     // Depth 1 is inside `rows`, depth 2 is inside a row.
     let mut depth = 0usize;
     let mut in_rows = false;
-    let mut row_span: Option<(usize, usize)> = None;
+    // (first line of the last row, last line of it, byte offset of the `]` that
+    // closes it). The byte offset is carried rather than re-derived: on a rows
+    // array written entirely on one line, `rfind(']')` finds the bracket closing
+    // `rows` itself, and splicing there would put our entries *beside* the last
+    // row instead of inside it — valid TOML that herdr accepts and then renders
+    // nothing from, which is the exact invisible failure this function's comment
+    // warns about.
+    let mut row_span: Option<(usize, usize, usize)> = None;
     let mut row_start: Option<usize> = None;
 
     for (offset, line) in lines.iter().enumerate().skip(section_start + 1) {
         let trimmed = line.trim_start();
-        if !in_rows {
+        // Where on this line the bracket scan should begin. For the `rows = [`
+        // line itself the scan starts at its first `[`; for every later line it
+        // starts at the beginning.
+        let scan_from = if in_rows {
+            0
+        } else {
             if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
                 break; // next table; this section has no rows array
             }
-            if trimmed.starts_with("rows") && trimmed.contains('[') {
-                in_rows = true;
-                depth = line.matches('[').count() - line.matches(']').count();
+            let Some(open) = line.find('[').filter(|_| trimmed.starts_with("rows")) else {
                 continue;
-            }
-            continue;
-        }
+            };
+            in_rows = true;
+            open
+        };
 
-        for ch in line.chars() {
+        // Scanned character by character *including* the `rows = [` line, rather
+        // than counting brackets on it and skipping ahead. Counting was wrong for
+        // a rows array written on one line: `rows = [["a"],["b"]]` has three
+        // opens and three closes, so the count came to zero, the line was
+        // skipped, and no row was ever found — leaving a perfectly ordinary
+        // config shape silently unconfigurable.
+        for (column, ch) in line[scan_from..].char_indices() {
             match ch {
                 '[' => {
                     depth += 1;
@@ -133,7 +165,7 @@ pub fn plan_edit(text: &str) -> Option<String> {
                     depth = depth.saturating_sub(1);
                     if depth == 1 {
                         if let Some(start) = row_start.take() {
-                            row_span = Some((start, offset));
+                            row_span = Some((start, offset, scan_from + column));
                         }
                     }
                 }
@@ -145,13 +177,16 @@ pub fn plan_edit(text: &str) -> Option<String> {
         }
     }
 
-    let (row_start, row_end) = row_span?;
+    let Some((row_start, row_end, close)) = row_span else {
+        return Plan::NoRowToEdit;
+    };
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
 
     if row_start == row_end {
-        // A single-line row: splice the entries in before its closing bracket.
+        // The last row begins and ends on one line: splice the entries in just
+        // before the bracket that closes *that row*, whose position the scan
+        // recorded.
         let line = out[row_end].clone();
-        let close = line.rfind(']')?;
         let (head, tail) = line.split_at(close);
         let head = head.trim_end();
         let separator = if head.ends_with('[') { "" } else { "," };
@@ -167,7 +202,21 @@ pub fn plan_edit(text: &str) -> Option<String> {
             out.insert(row_end + n, line);
         }
     }
-    Some(finish(out, text))
+    Plan::Edit(finish(out, text))
+}
+
+/// The rows a user has to add by hand when the splice cannot find a safe place.
+///
+/// Shown as part of the error rather than pointing at the README: someone whose
+/// config we just refused to edit should not have to go and look the snippet up.
+fn manual_snippet() -> String {
+    let mut out = String::from("  [\"branch\",\n");
+    for line in token_lines() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("  ],\n");
+    out
 }
 
 fn append_section(text: &str) -> String {
@@ -198,9 +247,25 @@ pub fn run_setup() -> Result<()> {
     let text = std::fs::read_to_string(&config)
         .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
 
-    let Some(updated) = plan_edit(&text) else {
-        println!("pulse: sidebar tokens are already configured; nothing to do.");
-        return Ok(());
+    let updated = match plan_edit(&text) {
+        Plan::AlreadyConfigured => {
+            println!("pulse: sidebar tokens are already configured; nothing to do.");
+            return Ok(());
+        }
+        // An error, not a cheerful no-op. The user asked for the badge to be set
+        // up; if we cannot do it, saying "nothing to do" and exiting 0 leaves
+        // them waiting for a badge that will never appear, with no way to find
+        // out why.
+        Plan::NoRowToEdit => {
+            return Err(format!(
+                "{} has a {SECTION} section but no row this could be added to safely.\n\
+                 Add the three entries by hand, inside one of the rows:\n\n{}",
+                config.display(),
+                manual_snippet()
+            )
+            .into());
+        }
+        Plan::Edit(updated) => updated,
     };
 
     let backup = backup_path(&config);

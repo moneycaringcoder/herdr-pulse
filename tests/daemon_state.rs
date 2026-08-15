@@ -5,10 +5,13 @@
 //! orphaned helper process — never a real sampler, and never a `--disable`
 //! aimed at ourselves, which would deliver SIGTERM to the test runner.
 //!
-//! `badge_plan` itself is not called here: it renders through `render::badge`,
-//! which the presenter has not implemented yet. The ordering rules it depends on
-//! live in `plan_for`, which takes already-rendered badges and is exercised in
-//! full below.
+//! The badge plan is covered at two levels. `plan_for` takes already-rendered
+//! badges, so the clear-before-set ordering rules can be enumerated without a
+//! store, a renderer or a socket. `badge_plan` is then exercised over activity
+//! built by driving the **real** store at the **real** geometry `daemon::cycle`
+//! asks for, because the seam where store geometry meets renderer geometry is
+//! the one thing the pure tests cannot see — and a hand-built series is free to
+//! have a width the store could never emit.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -20,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use pulse::config::{self, Config, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
 use pulse::daemon::{self, BadgeOp, WorkspaceBadge};
-use pulse::model::{AgentState, Level, Tone, WorkspaceActivity};
+use pulse::history::History;
+use pulse::model::WorkspaceObservation;
+use pulse::model::{AgentObservation, AgentState, Sample, Tone, WorkspaceActivity};
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
@@ -926,15 +931,97 @@ fn every_tone_maps_to_its_own_token_name() {
     assert_eq!(Tone::ALL_TOKENS.len(), 3);
 }
 
-/// One workspace's activity, as the store would hand it to the daemon.
-fn activity(workspace_id: &str, state: AgentState, series: &[Option<u8>]) -> WorkspaceActivity {
-    WorkspaceActivity {
-        workspace_id: workspace_id.to_string(),
-        label: format!("label-{workspace_id}"),
-        series: series.iter().map(|raw| raw.map(Level::new)).collect(),
-        state,
-        state_for: Some(90),
-        agent_count: 1,
+// ---------------------------------------------------------------------------
+// The store-geometry-meets-renderer-geometry seam
+//
+// Everything below builds its `WorkspaceActivity` by driving the real store and
+// then asking it for activity with **exactly the arguments `daemon::cycle`
+// passes**, rather than by hand-assembling a series. That is the whole point of
+// these tests: they are the only cover for the seam where the store's geometry
+// meets the renderer's, and a hand-built series is free to have a length the
+// store can never emit. An earlier version of these tests used 3- and 4-column
+// series against the default `badge_columns = 8` — a shape `cycle` cannot
+// produce, which made them evidence for nothing.
+// ---------------------------------------------------------------------------
+
+/// One sample of one workspace, in the shape `herdr::reduce_snapshot` builds.
+fn sample_of(workspace_id: &str, state: AgentState, taken_at: u64, seq: u64) -> Sample {
+    Sample {
+        taken_at,
+        workspaces: vec![WorkspaceObservation {
+            workspace_id: workspace_id.to_string(),
+            label: format!("label-{workspace_id}"),
+            agents: vec![AgentObservation {
+                pane_id: format!("{workspace_id}:p1"),
+                workspace_id: workspace_id.to_string(),
+                program: Some("claude".to_string()),
+                state,
+                state_change_seq: seq,
+            }],
+        }],
+    }
+}
+
+/// Records `count` samples one `config.interval` apart, ending at `until`.
+///
+/// `moving` chooses whether the agent's `state_change_seq` advances between
+/// samples, which is what separates a bucket with churn in it from a genuinely
+/// quiet one.
+fn recorded(
+    config: &Config,
+    workspace_id: &str,
+    state: AgentState,
+    until: u64,
+    count: u64,
+    moving: bool,
+) -> History {
+    let mut history = History::empty(config);
+    let step = config.interval.as_secs().max(1);
+    for index in 0..count {
+        let taken_at = until - (count - 1 - index) * step;
+        let seq = if moving { 700 + index } else { 700 };
+        history.record(&sample_of(workspace_id, state, taken_at, seq), config);
+    }
+    history
+}
+
+/// The store's answer at exactly the geometry `daemon::cycle` asks for.
+fn production_activity(history: &History, config: &Config, as_of: u64) -> Vec<WorkspaceActivity> {
+    history.activity(
+        as_of,
+        config.badge_columns,
+        config.buckets_per_badge_column(),
+        config,
+    )
+}
+
+#[test]
+fn the_series_the_store_hands_the_daemon_is_exactly_as_wide_as_the_badge() {
+    // The invariant the other seam tests rest on, and the one that made
+    // `render::badge`'s truncation branch unreachable in production: `cycle`
+    // asks for `badge_columns` columns, so the series *is* the window and
+    // `badge` never has anything to trim.
+    for columns in [1usize, 4, 8, 13, 64] {
+        let config = Config {
+            badge_columns: columns,
+            ..Config::default()
+        };
+        let as_of = 1_700_000_000;
+        let history = recorded(&config, "w6", AgentState::Working, as_of, 12, true);
+
+        let activity = production_activity(&history, &config, as_of);
+
+        assert_eq!(activity.len(), 1);
+        assert_eq!(
+            activity[0].series.len(),
+            config.badge_columns,
+            "the store must answer at the width the badge draws"
+        );
+        // And the badge spends exactly that many columns plus the state glyph.
+        assert_eq!(
+            pulse::render::badge(&activity[0], &config).chars().count(),
+            config.badge_columns + 1
+        );
     }
 }
 
@@ -944,6 +1031,7 @@ fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
     // the two modules that decide what a badge says, which is the only part of
     // `badge_plan` a pure test cannot see.
     let config = Config::default();
+    let as_of = 1_700_000_000;
     for (state, token) in [
         (AgentState::Blocked, "pulse_blocked"),
         (AgentState::Working, "pulse_working"),
@@ -951,11 +1039,15 @@ fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
         (AgentState::Done, "pulse_quiet"),
         (AgentState::Unknown, "pulse_quiet"),
     ] {
-        let activity = activity("w6", state, &[Some(0), Some(4), None, Some(8)]);
-        let expected = pulse::render::badge(&activity, &config);
-        assert!(!expected.is_empty(), "the fixture must draw something");
+        let history = recorded(&config, "w6", state, as_of, 12, true);
+        let activity = production_activity(&history, &config, as_of);
+        let expected = pulse::render::badge(&activity[0], &config);
+        assert!(
+            !expected.is_empty(),
+            "a workspace observed for a whole bucket must draw something: {state}"
+        );
 
-        let plan = daemon::badge_plan(&HashMap::new(), std::slice::from_ref(&activity), &config);
+        let plan = daemon::badge_plan(&HashMap::new(), &activity, &config);
 
         assert_eq!(
             plan,
@@ -970,37 +1062,80 @@ fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
 }
 
 #[test]
-fn badge_plan_clears_a_workspace_the_renderer_draws_nothing_for() {
+fn badge_plan_clears_a_workspace_whose_whole_window_predates_the_badge() {
     let config = Config::default();
-    // Never observed: every column is a gap, which `render::badge` renders as
-    // the empty string rather than as a row of blanks in the sidebar.
-    let unobserved = activity("w6", AgentState::Unknown, &[None, None, None]);
-    assert!(pulse::render::badge(&unobserved, &config).is_empty());
+    let as_of = 1_700_000_000;
+    // Recorded three hours ago: still inside the four-hour ring, so the store
+    // keeps reporting the workspace, but entirely outside the 64-minute badge
+    // window, so every column of the series is a gap. This is the one route to
+    // an empty badge that production can actually take.
+    let history = recorded(
+        &config,
+        "w6",
+        AgentState::Working,
+        as_of - 3 * 3_600,
+        12,
+        true,
+    );
 
-    let plan = daemon::badge_plan(&lit(&[("w6", "pulse_working")]), &[unobserved], &config);
+    let activity = production_activity(&history, &config, as_of);
+
+    assert_eq!(activity.len(), 1, "the store still tracks the workspace");
+    assert!(
+        activity[0].series.iter().all(Option::is_none),
+        "every column older than anything recorded is a gap: {:?}",
+        activity[0].series
+    );
+    assert!(pulse::render::badge(&activity[0], &config).is_empty());
+
+    let plan = daemon::badge_plan(&lit(&[("w6", "pulse_working")]), &activity, &config);
 
     assert_eq!(
         plan,
         vec![BadgeOp::Clear {
             workspace_id: "w6".to_string(),
             token: "pulse_working".to_string(),
-        }]
+        }],
+        "an empty badge is a clear, never a row of blanks"
     );
 }
 
 #[test]
 fn a_quiet_workspace_still_draws_because_quiet_is_an_answer() {
-    // The one case worth pinning down across the module boundary: a workspace
-    // that was observed and did nothing is *not* the same as one we never
-    // watched, and only the second may vanish from the sidebar.
+    // The case worth pinning down across the module boundary: a workspace that
+    // was observed and did nothing is *not* the same as one we never watched,
+    // and only the second may vanish from the sidebar.
     let config = Config::default();
-    let quiet = activity("w6", AgentState::Idle, &[Some(0), Some(0), Some(0)]);
+    let as_of = 1_700_000_000;
+    // Idle throughout and no sequence movement, so the newest bucket is observed
+    // with zero occupancy and zero churn — quiet, not absent.
+    let history = recorded(&config, "w6", AgentState::Idle, as_of, 12, false);
 
-    let plan = daemon::badge_plan(&HashMap::new(), &[quiet], &config);
+    let activity = production_activity(&history, &config, as_of);
+    let text = pulse::render::badge(&activity[0], &config);
 
     assert!(
-        matches!(plan.as_slice(), [BadgeOp::Set { token, .. }] if *token == "pulse_quiet"),
-        "an observed-and-idle workspace must keep its row: {plan:?}"
+        activity[0].series.last().expect("newest column").is_some(),
+        "the newest column was observed"
+    );
+    assert!(
+        text.contains(pulse::render::QUIET),
+        "an observed-and-idle column is the quiet glyph, not a gap: {text:?}"
+    );
+    assert!(
+        !text.is_empty(),
+        "an observed-and-idle workspace must keep its row"
+    );
+
+    let plan = daemon::badge_plan(&HashMap::new(), &activity, &config);
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Set {
+            workspace_id: "w6".to_string(),
+            token: "pulse_quiet",
+            text,
+        }]
     );
 }
 

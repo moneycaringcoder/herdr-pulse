@@ -112,33 +112,63 @@ pub fn sparkline(series: &[Option<Level>]) -> String {
 
 /// The sidebar badge for one workspace: a sparkline plus the current state.
 ///
-/// Budget is roughly eight display columns plus a glyph. Returns the **empty
-/// string** when there is nothing worth showing, which the daemon treats as
-/// "clear the token" rather than as an empty badge — so an untracked workspace
-/// does not occupy a sidebar row with blanks.
+/// Budget is roughly eight display columns plus a glyph.
 ///
-/// "Nothing worth showing" is judged over the *whole* series, not over the
-/// window we are about to draw. A workspace that was busy this morning and has
-/// been unobserved since is still tracked, and blanking its badge would hide the
-/// fact that we stopped watching it. A workspace we have never recorded a single
-/// observation for is a different thing, and is the only case that clears.
+/// # The rule
 ///
-/// A quiet workspace is emphatically *not* cleared: a flat row of `·` next to a
-/// burst that ended ten minutes ago is the most useful sentence this plugin
-/// says.
+/// Returns the **empty string** when the series contains no observation at all,
+/// which the daemon reads as "clear the token" rather than as a badge to draw.
+/// That is the whole rule, and it is deliberately narrow: a workspace that is
+/// merely *quiet* keeps its badge, because a flat row of `·` beside a burst that
+/// ended ten minutes ago is the most useful sentence this plugin says.
+///
+/// # What this comment used to claim
+///
+/// It said "nothing worth showing" was judged over the whole series rather than
+/// over the window being drawn, so that a workspace unobserved since this
+/// morning kept its badge. That distinction never existed. `daemon::cycle` asks
+/// the store for exactly `config.badge_columns` columns, so the series *is* the
+/// window, `start` is always 0, and no truncation happens in production. The
+/// only tests that demonstrated the difference built a series the store cannot
+/// produce, so the suite protected the disagreement instead of catching it.
+///
+/// The empty-string path is therefore a floor rather than a routine outcome: the
+/// store only builds a series for a workspace it has observed at least once, and
+/// a live sampler observes every workspace every cycle, so the newest column is
+/// a gap only when the store is asked for a window entirely older than anything
+/// it recorded.
+///
+/// The truncation below stays as a **width guard** — the badge must never exceed
+/// the configured sidebar budget, whoever calls it — and not as a semantic. It
+/// is the reason the width invariant is a property of this function rather than
+/// a convention between two modules.
 pub fn badge(activity: &WorkspaceActivity, config: &Config) -> String {
     if activity.series.iter().all(Option::is_none) {
         return String::new();
     }
 
-    // The store may hand us a longer series than the badge has room for — the
-    // pane and the badge read the same history at different resolutions. Take
-    // the newest columns, since the badge answers "recently", not "ever".
     let columns = config.badge_columns.max(1);
     let start = activity.series.len().saturating_sub(columns);
     let mut out = sparkline(&activity.series[start..]);
     out.push(state_glyph(activity.state));
     out
+}
+
+/// How far behind the last observation a workspace may be before the pane stops
+/// stating its state in the present tense.
+///
+/// Three sampling intervals, which is the same window [`Config::ttl_ms`] gives a
+/// badge and for the same reason: one missed cycle is ordinary jitter — a slow
+/// snapshot, a busy machine, a save that took longer than usual — and must not
+/// flip every row to the past tense, while a sampler that has genuinely stopped
+/// crosses the line within seconds.
+///
+/// Derived from `interval` rather than fixed, because the only meaningful unit
+/// of lateness here is "sampling cycles missed". A user sampling once a minute
+/// would otherwise be told their whole session was stale between two perfectly
+/// healthy cycles.
+pub fn staleness_tolerance(config: &Config) -> u64 {
+    config.interval.as_secs().saturating_mul(3).max(1)
 }
 
 /// A human duration in at most four characters: `12s`, `4m`, `1h20`, `3d`.
@@ -175,11 +205,24 @@ pub fn duration(seconds: Option<u64>) -> String {
     }
 }
 
-/// The full activity pane: every tracked workspace, its sparkline, its current
-/// state and how long that state has lasted.
+/// The full activity pane: every tracked workspace, its sparkline, the state we
+/// last saw it in, and when we saw it.
 ///
 /// Columns must line up regardless of label width or of multi-byte glyphs in the
 /// sparkline — pad by display width, not by byte length.
+///
+/// # Tense
+///
+/// Every state in here is a *past observation*. Most of the time the last
+/// observation is seconds old and reading it as the present is fair, so the row
+/// says `> working`. Once the last observation is older than
+/// [`staleness_tolerance`], it is not fair, and the row says `> was working`
+/// with a `seen` column giving the age.
+///
+/// Without that split the pane contradicts itself: a row whose sparkline is
+/// nothing but gap glyphs — "nobody looked for five hours" — used to sit beside
+/// the words `working  5h00`, which asserts the opposite about the same five
+/// hours. The sparkline was the honest half.
 pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> String {
     if activity.is_empty() {
         // Not an empty table. An empty table looks like a quiet session, and a
@@ -191,14 +234,20 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
         );
     }
 
+    let tolerance = staleness_tolerance(config);
+    let mut any_stale = false;
+
     let mut rows = vec![vec![
         "workspace".to_string(),
         "activity".to_string(),
         "state".to_string(),
         "for".to_string(),
+        "seen".to_string(),
         "agents".to_string(),
     ]];
     for workspace in activity {
+        let current = workspace.is_current(as_of, tolerance);
+        any_stale |= !current;
         rows.push(vec![
             clean_label(&workspace.label),
             // Bracketed so the series has visible ends. [`GAP`] is a printing
@@ -206,8 +255,17 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
             // for legibility, but the delimiters still make the column width
             // obvious when every glyph in a row is the same.
             format!("[{}]", sparkline(&workspace.series)),
-            format!("{} {}", state_glyph(workspace.state), workspace.state),
+            // The tense is the whole point. `was` costs four columns and is the
+            // difference between reporting a fact and inventing one.
+            if current {
+                format!("{} {}", state_glyph(workspace.state), workspace.state)
+            } else {
+                format!("{} was {}", state_glyph(workspace.state), workspace.state)
+            },
+            // Measured to `last_seen` by the store, so this is the duration we
+            // actually observed rather than one extrapolated to now.
             duration(workspace.state_for),
+            duration(workspace.observed_ago(as_of)),
             workspace.agent_count.to_string(),
         ]);
     }
@@ -220,7 +278,7 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
     );
     out.push_str(&table(&rows));
     out.push('\n');
-    out.push_str(&legend(config, activity));
+    out.push_str(&legend(config, activity, any_stale));
     out
 }
 
@@ -244,10 +302,18 @@ pub fn run_once(config: &Config) -> Result<()> {
 ///
 /// A gap must be representable and distinguishable from a zero — `null` in the
 /// series array, not `0`.
+///
+/// `state` carries the same freshness problem the pane solves with a tense, and
+/// a consumer cannot see a tense. So every workspace also carries `last_seen`,
+/// `observed_ago_seconds` and `state_is_current`, and the document carries the
+/// `staleness_tolerance_seconds` those were judged against. Without them a tool
+/// reading `"state":"working"` has no way to discover that nobody has looked in
+/// five hours, and would be right to treat it as current.
 pub fn run_json(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let (columns, buckets_per_column) = pane_geometry(config);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    let tolerance = staleness_tolerance(config);
 
     let workspaces: Vec<Value> = activity
         .iter()
@@ -256,7 +322,13 @@ pub fn run_json(config: &Config) -> Result<()> {
                 "workspace_id": workspace.workspace_id,
                 "label": workspace.label,
                 "state": workspace.state.as_str(),
+                // Measured to `last_seen`, not to `as_of`: the duration we
+                // observed, never one extrapolated across an outage.
                 "state_for_seconds": workspace.state_for,
+                // The three fields that make `state` falsifiable.
+                "last_seen": workspace.last_seen,
+                "observed_ago_seconds": workspace.observed_ago(as_of),
+                "state_is_current": workspace.is_current(as_of, tolerance),
                 "agent_count": workspace.agent_count,
                 // `null` is a gap and `0` is an observed quiet bucket. A
                 // consumer that flattens the two gets the same wrong answer the
@@ -283,6 +355,7 @@ pub fn run_json(config: &Config) -> Result<()> {
         "columns": columns,
         "buckets_per_column": buckets_per_column,
         "seconds_per_column": (buckets_per_column as u64).saturating_mul(config.bucket_seconds),
+        "staleness_tolerance_seconds": tolerance,
         "level_max": Level::MAX,
         "workspaces": workspaces,
     });
@@ -360,16 +433,36 @@ fn clock(as_of: u64) -> String {
     )
 }
 
-/// The key to the glyphs, including the one made of nothing.
+/// The key to the glyphs.
 ///
-/// A gap is a space, which is by definition invisible. Without this line a user
-/// reading a half-blank sparkline has no way to learn that the blank means "we
-/// were not watching", and would reasonably read it as "quiet" — the exact
-/// misreading the glyph split exists to prevent.
-fn legend(config: &Config, activity: &[WorkspaceActivity]) -> String {
-    let mut out = String::from(
-        "legend  ▁▂▃▄▅▆▇█ busier  |  · observed, nothing happened  |  blank not observed\n",
+/// The distinction between "observed and quiet" and "not observed" is the whole
+/// point of the plugin, and it is carried by two small characters that look
+/// broadly similar at a glance. Without this line a user reading a half-gapped
+/// sparkline would reasonably read it as quiet — the exact misreading the glyph
+/// split exists to prevent — so the key is not optional decoration.
+///
+/// Built from the constants rather than spelled out, so a glyph can never be
+/// changed without the legend following it. The previous version hard-coded the
+/// word "blank", and went stale the moment [`GAP`] stopped being a space.
+fn legend(config: &Config, activity: &[WorkspaceActivity], any_stale: bool) -> String {
+    let ramp: String = RAMP.iter().collect();
+    let mut out = format!(
+        "legend  {ramp} busier  |  {QUIET} observed, nothing happened  |  \
+         {GAP} not observed\n"
     );
+    out.push_str(
+        "        for = how long the state had held when last seen  |  \
+         seen = how long ago that was\n",
+    );
+    // Only when it applies. A reader whose rows are all fresh does not need to
+    // be taught a distinction none of them makes, and a line that is always
+    // there is a line nobody reads on the day it matters.
+    if any_stale {
+        out.push_str(
+            "        \"was X\" is the last observation and nothing has been seen since — \
+             not a claim about now\n",
+        );
+    }
 
     // Only claim a timescale when the series we were handed actually has the
     // shape this config implies. A caller that built the activity with different

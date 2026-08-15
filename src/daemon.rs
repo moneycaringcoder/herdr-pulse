@@ -21,9 +21,29 @@
 //! A daemon herdr spawned as a child would die with herdr, so `--enable`
 //! re-execs the binary as `--daemon`, detached with `setsid()` in `pre_exec`.
 //!
-//! The signal thread must clear badges over **its own connection**, so it never
-//! waits on the main loop's sleep or in-flight round trip, and the main loop must
-//! park rather than return so it cannot re-report into the race.
+//! # Shutdown ordering
+//!
+//! The signal thread clears badges over **its own connection**, so it never
+//! waits on the main loop's sleep or its in-flight round trip. That much is
+//! about latency. Correctness needs one more thing: the clear must be the *last*
+//! word on the wire, and a `stopping` flag read once at the top of the loop
+//! cannot promise that — a signal arriving mid-cycle leaves a push in flight
+//! that re-lights tokens behind the clears, and `shutdown` spends a round trip
+//! per workspace, which is ample wall clock for that to happen.
+//!
+//! So the two threads are ordered by the `active` map's mutex. [`push`] holds it
+//! across every round trip it makes, and `shutdown` takes it before it clears.
+//! Only two interleavings exist: the push wins the lock, runs to completion and
+//! records what it lit, and `shutdown` then clears exactly that; or `shutdown`
+//! wins, and the push — which re-reads `stopping` *after* acquiring — issues
+//! nothing at all. The main loop parks rather than returning, so it can never
+//! start a second push either way.
+//!
+//! What that does **not** cover, stated plainly rather than papered over: a
+//! `SIGKILL`, a clear the server rejects, and a push slow enough that
+//! `--disable` gives up waiting (`STOP_TIMEOUT`) and runs its own sweep before
+//! the daemon exits. In all three the only backstop is the token TTL — three
+//! sampling intervals, 15 s at the default — and nothing shorter.
 
 use std::collections::HashMap;
 use std::fs;
@@ -164,6 +184,7 @@ pub fn run(config: &Config) -> Result<()> {
                 config,
                 &mut history,
                 &active,
+                &stopping,
                 &mut reported_save_failure,
             ) {
                 eprintln!("pulse: sample failed: {err}");
@@ -183,13 +204,46 @@ pub fn run(config: &Config) -> Result<()> {
 ///
 /// Persisting sits *before* the push and happens every cycle, not on a timer and
 /// not at shutdown: a daemon that is SIGKILLed never gets to flush, and the
-/// whole point of the history is that it survives that. The cost is one small
-/// atomic rename per interval.
+/// whole point of the history is that it survives that.
+///
+/// # What that costs, measured
+///
+/// A full re-serialise and `fsync` of the whole store per interval. Ten
+/// workspaces encode to 131 KB, so at the default 5 s interval that is 17,280
+/// rewrites and about **2.3 GB written per day**. Bounded — the store is capped
+/// by construction — but not small.
+///
+/// It is kept anyway, because every cheaper cadence buys its bytes back with the
+/// one property this file exists for. `History::record` bumps the current
+/// bucket's `samples` on *every* sample, so "save only when something changed"
+/// is never false in a running sampler; and saving every N cycles turns "a
+/// SIGKILLed daemon loses at most one interval" into "loses up to N", which is a
+/// different promise to a user reading a sparkline.
+///
+/// # Where the bytes actually are
+///
+/// Worth stating precisely, because the obvious answer is only half right.
+/// `Bucket` serialises four `u16` fields unconditionally, so an *unobserved*
+/// ring slot spends 53 bytes saying nothing, and a `skip_serializing_if` in
+/// `history.rs` would be a large win — measured at **13.5×** (2,269 → 167
+/// MB/day) on a young store whose ring is mostly empty.
+///
+/// But a daemon spends almost all its life in steady state, with every slot in
+/// the four-hour ring observed, and there the same change measures **1.3×**
+/// (2,393 → 1,895 MB/day): the fields are no longer zero, so there is nothing to
+/// skip. Sparsity is the young case, not the standing one, and the standing one
+/// is where the daily figure comes from.
+///
+/// So the lever that would actually move steady state is a compact encoding, or
+/// dropping `sync_all` — which is stronger than this guarantee needs anyway,
+/// since a killed *process* does not lose the page cache, only a killed *kernel*
+/// does. Both live in `history.rs`, which this module does not own.
 fn cycle(
     client: &mut Herdr,
     config: &Config,
     history: &mut history::History,
     active: &Mutex<HashMap<String, String>>,
+    stopping: &AtomicBool,
     reported_save_failure: &mut bool,
 ) -> Result<()> {
     let sample = client.sample(crate::now_unix())?;
@@ -208,13 +262,18 @@ fn cycle(
         }
     }
 
+    // Exactly the geometry the badge draws: `badge_columns` columns, each
+    // aggregating `buckets_per_badge_column()` buckets. The store therefore
+    // hands back a series whose length *is* the badge's width, which is the
+    // seam `tests/daemon_state.rs` pins — a test built on any other shape is
+    // testing something the daemon cannot produce.
     let activity = history.activity(
         sample.taken_at,
         config.badge_columns,
         config.buckets_per_badge_column(),
         config,
     );
-    push(client, config, &activity, active);
+    push(client, config, &activity, active, stopping);
     Ok(())
 }
 
@@ -382,14 +441,32 @@ fn batch(plan: Vec<BadgeOp>) -> Vec<WorkspacePush> {
 /// Executes a badge plan. Errors are reported per workspace and the cycle
 /// continues: a swallowed push failure renders as a blank badge with nothing to
 /// debug, and one bad workspace must not cost every other one its badge.
+///
+/// The `active` lock is held across **every** round trip, not merely around the
+/// two touches of the map, and the `stopping` flag is re-read *after* acquiring
+/// it. That pair is the shutdown interlock described in the module header: it is
+/// what makes the signal thread's clears the last word on the wire instead of
+/// merely the most recent thing it tried. Holding a lock across blocking I/O is
+/// normally a smell; here the only other party wanting the lock is the thread
+/// that is trying to shut this one down, and making it wait is precisely the
+/// point.
 fn push(
     client: &mut Herdr,
     config: &Config,
     activity: &[WorkspaceActivity],
     active: &Mutex<HashMap<String, String>>,
+    stopping: &AtomicBool,
 ) {
+    let mut active = lock(active);
+    if stopping.load(Ordering::SeqCst) {
+        // `shutdown` got here first. Its clears have already gone out, and the
+        // map it read is authoritative — re-lighting anything now would leave a
+        // badge on a workspace nobody is watching any more.
+        return;
+    }
+
     let ttl_ms = config.ttl_ms();
-    let plan = badge_plan(&lock(active).clone(), activity, config);
+    let plan = badge_plan(&active.clone(), activity, config);
     let mut lit: HashMap<String, String> = HashMap::new();
 
     for entry in batch(plan) {
@@ -414,7 +491,9 @@ fn push(
         }
     }
 
-    *lock(active) = lit;
+    // Still under the same guard: `shutdown` cannot observe a half-updated view
+    // of what this push lit, so whatever it clears is exactly what is on screen.
+    *active = lit;
 }
 
 /// Logs a failed push. Returns whether the call succeeded. A workspace that
@@ -480,25 +559,32 @@ fn spawn_signal_thread(
 
 /// Clears everything this daemon lit, over its **own** connection so it never
 /// waits on the main loop's sleep or its in-flight round trip.
+///
+/// Taking the `active` lock here is the other half of the interlock in [`push`].
+/// It blocks until any push already on the wire has finished and written down
+/// what it lit, so the map read below is final rather than a snapshot of a race
+/// still in progress. The wait is bounded by that push, worst case one
+/// `herdr::IO_TIMEOUT` per workspace; if it outlasts `--disable`'s own
+/// `STOP_TIMEOUT`, disable stops waiting and sweeps every workspace itself, so
+/// the badges still come down — just from the other end.
 fn shutdown(active: &Mutex<HashMap<String, String>>) {
-    let tracked: Vec<(String, String)> = lock(active)
-        .iter()
-        .map(|(workspace_id, token)| (workspace_id.clone(), token.clone()))
-        .collect();
+    let mut active = lock(active);
     match Herdr::connect() {
         Ok(mut client) => {
-            for (workspace_id, token) in tracked {
-                report_error(
-                    client.clear_badge(&workspace_id, &token),
-                    &workspace_id,
-                    &token,
-                );
+            for (workspace_id, token) in active.iter() {
+                report_error(client.clear_badge(workspace_id, token), workspace_id, token);
             }
         }
         // Not silent: without this line a killed daemon looks like it cleaned
         // up, and the badge lingers until its TTL expires.
         Err(err) => eprintln!("pulse: shutdown could not reach herdr: {err}"),
     }
+    // A push that acquires the lock after this returns will bail on `stopping`,
+    // but empty the map anyway: nothing downstream should be able to read a list
+    // of tokens that have just been cleared as if they were still lit.
+    active.clear();
+    drop(active);
+
     clear_pid_file();
 }
 

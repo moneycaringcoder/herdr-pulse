@@ -324,21 +324,122 @@ fn no_verb_panics_without_a_server() {
     let state = temp.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
 
-    for args in [
-        vec!["--help"],
-        vec!["--version"],
-        vec!["--once"],
-        vec!["--json"],
-        vec!["--forget"],
-        vec!["--restore"],
-        vec!["--bogus-verb"],
-    ] {
+    for args in VERBS {
         let out = run_plugin(&args, temp.path(), &state);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("panicked at"),
-            "`pulse {}` panicked: {stderr}",
-            args.join(" ")
-        );
+        assert_clean_exit(&out, &args, "an empty state directory");
+    }
+}
+
+/// Every verb that needs no socket.
+const VERBS: [[&str; 1]; 7] = [
+    ["--help"],
+    ["--version"],
+    ["--once"],
+    ["--json"],
+    ["--forget"],
+    ["--restore"],
+    ["--bogus-verb"],
+];
+
+fn assert_clean_exit(out: &std::process::Output, args: &[&str], context: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "`pulse {}` panicked with {context}: {stderr}",
+        args.join(" ")
+    );
+    // A `panic = "abort"` release build produces no message at all, so the
+    // absence of "panicked at" is not by itself proof of a clean exit.
+    let code = out.status.code();
+    assert!(
+        code.is_some(),
+        "`pulse {}` was killed by a signal with {context} — a release build \
+         aborts rather than unwinding, so this is what a panic looks like there",
+        args.join(" ")
+    );
+}
+
+/// Every hostile-file path lives behind a `history.json` or a `config.json` that
+/// the plugin did not write, and the panic test above never put one there.
+///
+/// An adversarial review found exactly this gap: an unchecked add in the store's
+/// ring arithmetic panicked on a `newest_bucket` near `u64::MAX`, reachable from
+/// `pulse --once` — a verb that runs inside somebody's sidebar — and no test ever
+/// ran a verb with a state file present.
+#[test]
+fn no_verb_panics_on_a_hostile_state_file() {
+    // Each is a plausible corruption or a deliberate extreme, not random noise:
+    // a truncated write, a value at the type's boundary, a wrong-typed field, a
+    // future format, and a structurally valid file with absurd numbers.
+    let histories: [(&str, &str); 8] = [
+        ("empty", ""),
+        ("not-json", "this is not json at all"),
+        (
+            "truncated",
+            "{\"version\":1,\"bucket_seconds\":60,\"workspaces\":[{",
+        ),
+        ("null", "null"),
+        ("wrong-root-type", "[1, 2, 3]"),
+        (
+            "newest-bucket-at-u64-max",
+            "{\"version\":1,\"bucket_seconds\":60,\"workspaces\":[{\"workspace_id\":\"w1\",\
+             \"label\":\"a\",\"buckets\":[{\"samples\":1,\"working\":1,\"blocked\":0,\
+             \"transitions\":0}],\"newest_bucket\":18446744073709551615,\"state\":\"working\",\
+             \"state_since\":0,\"last_seen\":0,\"agent_seqs\":[]}]}",
+        ),
+        (
+            "counts-exceed-samples",
+            "{\"version\":1,\"bucket_seconds\":60,\"workspaces\":[{\"workspace_id\":\"w1\",\
+             \"label\":\"a\",\"buckets\":[{\"samples\":1,\"working\":65535,\"blocked\":65535,\
+             \"transitions\":65535}],\"newest_bucket\":1,\"state\":\"nonsense\",\
+             \"state_since\":18446744073709551615,\"last_seen\":18446744073709551615,\
+             \"agent_seqs\":[]}]}",
+        ),
+        (
+            "future-format-version",
+            "{\"version\":4294967295,\"bucket_seconds\":60,\"workspaces\":[]}",
+        ),
+    ];
+
+    // Config is the other file the plugin reads but does not write.
+    let configs: [(&str, &str); 4] = [
+        (
+            "all-u64-max",
+            "{\"interval_seconds\":18446744073709551615,\
+          \"bucket_seconds\":18446744073709551615,\
+          \"badge_window_minutes\":18446744073709551615,\
+          \"max_workspaces\":18446744073709551615,\
+          \"retention_buckets\":18446744073709551615,\
+          \"badge_columns\":18446744073709551615}",
+        ),
+        (
+            "all-zero",
+            "{\"interval_seconds\":0,\"bucket_seconds\":0,\"retention_buckets\":0,\
+          \"badge_columns\":0,\"badge_window_minutes\":0,\"max_workspaces\":0}",
+        ),
+        (
+            "wrong-types",
+            "{\"interval_seconds\":\"soon\",\"badge_columns\":[]}",
+        ),
+        ("not-json", "{{{"),
+    ];
+
+    for (history_name, history) in histories {
+        for (config_name, config) in &configs {
+            let temp = TempDir::new(&format!("hostile-{history_name}-{config_name}"));
+            let state = temp.path().join("state");
+            std::fs::create_dir_all(state.join("config")).unwrap();
+            std::fs::write(state.join("history.json"), history).unwrap();
+            std::fs::write(state.join("config").join("config.json"), config).unwrap();
+
+            for args in VERBS {
+                let out = run_plugin(&args, temp.path(), &state);
+                assert_clean_exit(
+                    &out,
+                    &args,
+                    &format!("history `{history_name}` and config `{config_name}`"),
+                );
+            }
+        }
     }
 }

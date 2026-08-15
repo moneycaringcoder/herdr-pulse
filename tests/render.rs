@@ -13,9 +13,15 @@ use std::time::Duration;
 use pulse::config::Config;
 use pulse::model::{AgentState, Level, WorkspaceActivity};
 use pulse::render::{
-    badge, display_width, duration, pane, pane_geometry, sparkline, state_glyph, GAP, QUIET, RAMP,
+    badge, display_width, duration, pane, pane_geometry, sparkline, staleness_tolerance,
+    state_glyph, GAP, QUIET, RAMP,
 };
 
+/// The `as_of` every pane test renders at. Fixed so a row's freshness is a
+/// property of the test rather than of the wall clock.
+const AS_OF: u64 = 1_723_000_000;
+
+/// A workspace observed at [`AS_OF`], i.e. one whose state is current.
 fn activity(
     label: &str,
     series: Vec<Option<Level>>,
@@ -29,8 +35,33 @@ fn activity(
         series,
         state,
         state_for,
+        last_seen: Some(AS_OF),
         agent_count,
     }
+}
+
+/// The same workspace, last observed `ago` seconds before [`AS_OF`].
+fn seen_ago(activity: WorkspaceActivity, ago: u64) -> WorkspaceActivity {
+    WorkspaceActivity {
+        last_seen: Some(AS_OF - ago),
+        ..activity
+    }
+}
+
+/// A workspace that has never been observed at all.
+fn never_seen(activity: WorkspaceActivity) -> WorkspaceActivity {
+    WorkspaceActivity {
+        last_seen: None,
+        ..activity
+    }
+}
+
+/// The row a workspace occupies in a rendered pane, found by its label.
+fn row_for<'a>(rendered: &'a str, label: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|line| line.starts_with(label))
+        .unwrap_or_else(|| panic!("no row for {label:?} in\n{rendered}"))
 }
 
 fn levels(raw: &[u8]) -> Vec<Option<Level>> {
@@ -281,7 +312,11 @@ fn a_workspace_with_no_recorded_history_gets_no_badge() {
 fn a_quiet_but_observed_workspace_still_gets_a_badge() {
     // The whole point of the plugin: "we watched, and nothing happened" is
     // information, and must not be mistaken for "we have nothing".
-    let config = Config::default();
+    //
+    // Series length matches `badge_columns`, which is the only shape
+    // `daemon::cycle` ever builds — it asks the store for exactly that many
+    // columns.
+    let config = config_with_columns(4);
     let rendered = badge(
         &activity(
             "resting",
@@ -297,7 +332,7 @@ fn a_quiet_but_observed_workspace_still_gets_a_badge() {
 
 #[test]
 fn the_badge_is_a_sparkline_followed_by_the_state_glyph() {
-    let config = Config::default();
+    let config = config_with_columns(4);
     let rendered = badge(
         &activity(
             "busy",
@@ -312,67 +347,80 @@ fn the_badge_is_a_sparkline_followed_by_the_state_glyph() {
 }
 
 #[test]
-fn the_badge_shows_the_newest_columns_when_the_series_is_longer() {
-    let config = config_with_columns(3);
-    let rendered = badge(
-        &activity(
-            "long",
-            levels(&[1, 1, 1, 1, 1, 6, 7, 8]),
-            AgentState::Working,
-            Some(5),
-            1,
-        ),
-        &config,
-    );
-    // The badge answers "recently", so it keeps the tail, not the head.
-    assert_eq!(rendered, "▆▇█>");
-}
-
-#[test]
-fn the_badge_honours_the_configured_column_count() {
-    let series: Vec<Option<Level>> = levels(&[4; 40]);
-    for columns in [1usize, 2, 8, 16, 64] {
+fn a_series_with_no_observations_at_all_clears_the_badge() {
+    // The actual clearing rule, at the shape the store produces: one column per
+    // configured badge column, none of them observed. The daemon reads the empty
+    // string as "clear the token".
+    //
+    // This is a floor rather than a routine path — the store only builds a series
+    // for a workspace it has observed at least once, and a live sampler observes
+    // every workspace every cycle — but `daemon::badge_plan` depends on it, so it
+    // is pinned here.
+    for columns in [1usize, 8, 64] {
         let config = config_with_columns(columns);
         let rendered = badge(
-            &activity("wide", series.clone(), AgentState::Idle, Some(1), 1),
+            &activity(
+                "never",
+                vec![None; columns],
+                AgentState::Blocked,
+                Some(4_000),
+                1,
+            ),
             &config,
         );
-        assert_eq!(
-            rendered.chars().count(),
-            columns.min(series.len()) + 1,
-            "{columns} columns plus one state glyph"
+        assert!(
+            rendered.is_empty(),
+            "{columns} unobserved columns drew {rendered:?} instead of clearing"
         );
     }
 }
 
 #[test]
-fn a_short_series_is_not_padded_out_to_the_column_count() {
-    // Padding would invent columns we never had data for. Drawing fewer is
-    // honest; the store hands every workspace the same column count anyway.
-    let config = Config::default();
-    let rendered = badge(
-        &activity("young", levels(&[3]), AgentState::Working, Some(2), 1),
-        &config,
-    );
-    assert_eq!(rendered, "▃>");
+fn a_badge_is_one_glyph_per_column_the_store_was_asked_for() {
+    // `daemon::cycle` asks for `config.badge_columns` columns, so this is the
+    // production shape: the series *is* the window, and the badge draws all of it
+    // plus the state glyph.
+    for columns in [1usize, 2, 8, 16, 64] {
+        let config = config_with_columns(columns);
+        let series: Vec<Option<Level>> = levels(&vec![4u8; columns]);
+        let rendered = badge(
+            &activity("wide", series, AgentState::Idle, Some(1), 1),
+            &config,
+        );
+        assert_eq!(
+            rendered.chars().count(),
+            columns + 1,
+            "{columns} columns plus one state glyph"
+        );
+        assert_eq!(display_width(&rendered), columns + 1);
+    }
 }
 
 #[test]
-fn a_badge_window_that_is_all_gaps_still_reports_the_current_state() {
-    // History exists, but nothing recent. Blanking the badge here would hide
-    // that we stopped watching a workspace that is blocked right now.
-    let config = config_with_columns(4);
-    let mut series = levels(&[7, 7]);
-    series.extend(vec![None; 4]);
-    let rendered = badge(
-        &activity("stale", series, AgentState::Blocked, Some(4_000), 1),
-        &config,
-    );
-    assert_eq!(rendered, format!("{}!", GAP.to_string().repeat(4)));
+fn a_badge_never_exceeds_the_configured_sidebar_budget() {
+    // A bounds guard on a public function, not a claim about the daemon. Nothing
+    // in this crate hands `badge` a series longer than `badge_columns` — that is
+    // exactly why the earlier "the badge windows a longer series" tests proved
+    // nothing — but the width invariant belongs to this function rather than to a
+    // convention between two modules, so a caller that got it wrong must still
+    // not overflow the sidebar cell.
+    for columns in [1usize, 3, 8] {
+        let config = config_with_columns(columns);
+        let series: Vec<Option<Level>> = levels(&vec![8u8; columns * 4]);
+        let rendered = badge(
+            &activity("over", series, AgentState::Working, Some(5), 1),
+            &config,
+        );
+        assert_eq!(display_width(&rendered), columns + 1);
+        // Newest columns kept: the badge answers "recently", not "ever".
+        assert_eq!(rendered, format!("{}>", "█".repeat(columns)));
+    }
 }
 
 #[test]
 fn the_badge_fits_its_sidebar_budget_at_the_default_configuration() {
+    // Eight columns is `DEFAULT_BADGE_COLUMNS`, so this is the default-config
+    // production shape.
     let config = Config::default();
     let rendered = badge(
         &activity(
@@ -390,6 +438,9 @@ fn the_badge_fits_its_sidebar_budget_at_the_default_configuration() {
 
 #[test]
 fn the_badge_never_panics_whatever_the_series() {
+    // Robustness, not semantics: the shapes here are deliberately wider than
+    // anything the store builds, because the point is that no input can panic —
+    // not that any particular one occurs.
     for columns in [1usize, 3, 8, 64] {
         let config = config_with_columns(columns);
         for length in [0usize, 1, 7, 8, 9, 300] {
@@ -444,7 +495,7 @@ fn column_offsets(rendered: &str, marker: char) -> Vec<usize> {
 }
 
 fn sample_pane(rows: Vec<WorkspaceActivity>) -> String {
-    pane(&rows, &Config::default(), 1_723_000_000)
+    pane(&rows, &Config::default(), AS_OF)
 }
 
 #[test]
@@ -514,8 +565,8 @@ fn pane_columns_line_up_when_a_label_contains_multi_byte_characters() {
 
 #[test]
 fn pane_columns_line_up_when_sparklines_contain_gaps() {
-    // A gap is a space, so a row that begins unobserved must not look like one
-    // whose label was padded further.
+    // A gapped series is the same width as any other, so a row that begins or
+    // ends unobserved must sit in exactly the same columns as one that does not.
     let rendered = sample_pane(vec![
         activity(
             "a",
@@ -542,7 +593,7 @@ fn pane_columns_line_up_when_sparklines_contain_gaps() {
 
 #[test]
 fn a_pane_with_nothing_recorded_says_so_rather_than_drawing_an_empty_table() {
-    let rendered = pane(&[], &Config::default(), 1_723_000_000);
+    let rendered = pane(&[], &Config::default(), AS_OF);
     assert!(rendered.to_lowercase().contains("no workspace history"));
     assert!(rendered.contains("--enable"));
     // An empty table would read as "we looked, and every workspace was quiet".
@@ -550,7 +601,7 @@ fn a_pane_with_nothing_recorded_says_so_rather_than_drawing_an_empty_table() {
 }
 
 #[test]
-fn the_pane_explains_that_a_blank_column_means_unobserved() {
+fn the_pane_explains_what_a_gap_column_means() {
     let rendered = sample_pane(vec![activity(
         "web",
         levels(&[1, 2]),
@@ -560,11 +611,30 @@ fn the_pane_explains_that_a_blank_column_means_unobserved() {
     )]);
     let lower = rendered.to_lowercase();
     assert!(lower.contains("legend"));
-    assert!(
-        lower.contains("blank not observed"),
-        "a gap is invisible without a key that names it:\n{rendered}"
-    );
     assert!(lower.contains("nothing happened"));
+
+    // Asserted against the constants rather than against prose. An earlier
+    // version of this test pinned the literal words "blank not observed", which
+    // silently became a lie the moment GAP stopped being a space — the legend
+    // is precisely the thing that must never drift from the glyphs it explains.
+    assert!(
+        rendered.contains(GAP),
+        "the key never shows the gap glyph itself:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(QUIET),
+        "the key never shows the quiet glyph itself:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("not observed"),
+        "the key does not say what a gap means:\n{rendered}"
+    );
+    for step in RAMP {
+        assert!(
+            rendered.contains(step),
+            "the key omits ramp step {step:?}:\n{rendered}"
+        );
+    }
 }
 
 #[test]
@@ -583,15 +653,201 @@ fn the_pane_carries_the_state_word_its_glyph_and_a_duration() {
 
 #[test]
 fn an_unobserved_state_duration_shows_a_question_mark_not_a_zero() {
+    // `state_for` is `None` when no transition has been seen. Rendering that as
+    // `0s` would claim the state changed this instant, which is a different fact
+    // from not knowing when it changed.
+    let rendered = sample_pane(vec![seen_ago(
+        activity("web", levels(&[1]), AgentState::Unknown, None, 0),
+        5,
+    )]);
+    let row = row_for(&rendered, "web");
+    // By field, not by substring: "5s" contains "0s" only by accident of digits,
+    // and an assertion that can be satisfied by a neighbouring column is not an
+    // assertion about this one.
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        &fields[fields.len() - 3..],
+        // for = unknown, seen = five seconds ago, agents = none.
+        &["?", "5s", "0"],
+        "{row:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// freshness: what the pane may say in the present tense
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_state_nobody_has_observed_for_hours_is_not_reported_in_the_present_tense() {
+    // The exact row from the review: five hours of gaps beside the claim that an
+    // agent has been working for five hours. The sparkline was the honest half,
+    // and the words now agree with it.
+    let stale = seen_ago(
+        activity("alpha", vec![None; 32], AgentState::Working, Some(600), 1),
+        5 * 3_600,
+    );
+    let rendered = sample_pane(vec![stale]);
+    let row = row_for(&rendered, "alpha");
+
+    assert!(
+        row.contains("was working"),
+        "a five-hour-old observation is stated as fact: {row:?}"
+    );
+    // The age of the observation, not a duration extrapolated across it.
+    assert!(row.contains("5h00"), "{row:?}");
+}
+
+#[test]
+fn a_freshly_observed_state_is_reported_in_the_present_tense() {
     let rendered = sample_pane(vec![activity(
         "web",
-        levels(&[1]),
+        levels(&[4, 5]),
+        AgentState::Working,
+        Some(600),
+        1,
+    )]);
+    let row = row_for(&rendered, "web");
+    assert!(row.contains("> working"), "{row:?}");
+    assert!(
+        !row.contains("was"),
+        "a current observation was hedged: {row:?}"
+    );
+}
+
+#[test]
+fn the_freshness_line_falls_exactly_on_the_tolerance() {
+    let config = Config::default();
+    let tolerance = staleness_tolerance(&config);
+
+    let at = pane(
+        &[seen_ago(
+            activity("edge", levels(&[4]), AgentState::Working, Some(60), 1),
+            tolerance,
+        )],
+        &config,
+        AS_OF,
+    );
+    assert!(
+        !row_for(&at, "edge").contains("was"),
+        "a workspace exactly at the tolerance is still current:\n{at}"
+    );
+
+    let past = pane(
+        &[seen_ago(
+            activity("edge", levels(&[4]), AgentState::Working, Some(60), 1),
+            tolerance + 1,
+        )],
+        &config,
+        AS_OF,
+    );
+    assert!(
+        row_for(&past, "edge").contains("was working"),
+        "one second past the tolerance is stale:\n{past}"
+    );
+}
+
+#[test]
+fn the_tolerance_is_three_sampling_intervals_not_a_fixed_number_of_seconds() {
+    // Lateness is only meaningful in cycles missed. A user sampling once a minute
+    // must not be told their whole session is stale between two healthy cycles.
+    for seconds in [1u64, 5, 30, 60, 3_600] {
+        let config = Config {
+            interval: Duration::from_secs(seconds),
+            ..Config::default()
+        };
+        assert_eq!(staleness_tolerance(&config), seconds * 3);
+    }
+    // Never zero, or every row would be stale the instant it was recorded.
+    assert!(staleness_tolerance(&Config::default()) >= 1);
+}
+
+#[test]
+fn a_workspace_that_has_never_been_observed_is_never_current() {
+    let rendered = sample_pane(vec![never_seen(activity(
+        "ghost",
+        vec![None; 4],
         AgentState::Unknown,
         None,
         0,
+    ))]);
+    let row = row_for(&rendered, "ghost");
+    assert!(row.contains("was unknown"), "{row:?}");
+    // Both "how long in that state" and "how long ago" are genuinely unknown, and
+    // both say so rather than defaulting to a number. Checked by field rather
+    // than by counting `?`, since the glyph for `Unknown` is one too.
+    let fields: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(&fields[fields.len() - 3..], &["?", "?", "0"], "{row:?}");
+}
+
+#[test]
+fn a_clock_that_runs_behind_the_history_reports_a_fresh_observation_not_a_huge_age() {
+    // `observed_ago` saturates. A history written by a machine whose clock is
+    // ahead of ours must not read as an observation from the far future turned
+    // into an enormous negative age.
+    let ahead = WorkspaceActivity {
+        last_seen: Some(AS_OF + 10_000),
+        ..activity("ahead", levels(&[4]), AgentState::Working, Some(60), 1)
+    };
+    let rendered = sample_pane(vec![ahead]);
+    let row = row_for(&rendered, "ahead");
+    assert!(row.contains("> working"), "{row:?}");
+    assert!(row.contains("0s"), "{row:?}");
+}
+
+#[test]
+fn the_legend_explains_the_past_tense_only_when_a_row_uses_it() {
+    let fresh = sample_pane(vec![activity(
+        "web",
+        levels(&[4]),
+        AgentState::Working,
+        Some(60),
+        1,
     )]);
-    assert!(rendered.contains('?'));
-    assert!(!rendered.contains("0s"));
+    assert!(
+        !fresh.contains("not a claim about now"),
+        "a pane with no stale rows explains a distinction none of them makes:\n{fresh}"
+    );
+
+    let stale = sample_pane(vec![seen_ago(
+        activity("web", levels(&[4]), AgentState::Working, Some(60), 1),
+        9_000,
+    )]);
+    assert!(
+        stale.contains("not a claim about now"),
+        "a stale row is unexplained:\n{stale}"
+    );
+    // And the two duration columns are always distinguished.
+    assert!(stale.contains("seen = how long ago"), "{stale}");
+}
+
+#[test]
+fn a_stale_row_and_a_fresh_row_stay_aligned() {
+    // The past-tense marker widens the state cell, so every other row has to move
+    // with it or the pane loses the one property it is judged on.
+    let rendered = sample_pane(vec![
+        activity(
+            "fresh",
+            levels(&[4, 5, 6, 7]),
+            AgentState::Idle,
+            Some(60),
+            1,
+        ),
+        seen_ago(
+            activity("stale", vec![None; 4], AgentState::Working, Some(60), 1),
+            18_000,
+        ),
+    ]);
+    let ends = column_offsets(&rendered, ']');
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0], ends[1], "\n{rendered}");
+
+    // Header and rows share the column, so the agent counts line up too.
+    let widths: Vec<usize> = rendered
+        .lines()
+        .filter(|line| line.contains('['))
+        .map(display_width)
+        .collect();
+    assert_eq!(widths[0], widths[1], "\n{rendered}");
 }
 
 #[test]
@@ -701,7 +957,7 @@ fn the_pane_never_panics_on_awkward_input() {
     };
 
     let rows = vec![
-        activity("", vec![], AgentState::Unknown, None, 0),
+        never_seen(activity("", vec![], AgentState::Unknown, None, 0)),
         activity(
             "gaps",
             vec![None; 500],
@@ -716,6 +972,12 @@ fn the_pane_never_panics_on_awkward_input() {
             Some(0),
             1,
         ),
+        // A last_seen far ahead of every `as_of` below, so the saturating age
+        // path is exercised alongside the enormous-age one.
+        WorkspaceActivity {
+            last_seen: Some(u64::MAX),
+            ..activity("ahead", levels(&[3]), AgentState::Working, Some(1), 1)
+        },
     ];
     for as_of in [0u64, 1, 86_399, u64::MAX] {
         let rendered = pane(&rows, &config, as_of);

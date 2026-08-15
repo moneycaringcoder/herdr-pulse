@@ -55,6 +55,27 @@ pub const DEFAULT_BADGE_WINDOW_MINUTES: u64 = 64;
 /// construction rather than by how many workspaces a user happens to open.
 /// Least-recently-seen workspaces are evicted first.
 pub const DEFAULT_MAX_WORKSPACES: usize = 64;
+pub const MAX_MAX_WORKSPACES: usize = 512;
+
+/// Upper bound on the badge's window.
+///
+/// A day is already far past the point where eight columns say anything useful,
+/// and without *some* ceiling the field is unbounded: it is settable only from
+/// the config file, so nothing on the command line ever exercised it.
+pub const MAX_BADGE_WINDOW_MINUTES: u64 = 1_440;
+
+/// Ceiling on `retention_buckets × max_workspaces`, which is what actually
+/// determines the history file's size.
+///
+/// Clamping the two fields separately is not enough to keep the promise that
+/// storage is "bounded by construction": their documented maxima multiply out to
+/// tens of millions of buckets, and a measured
+/// `{"max_workspaces": 4096, "retention_buckets": 10000}` produced a 103 MB file
+/// that the daemon then rewrote and fsync'd every five seconds. Each bucket
+/// serialises to roughly 55 bytes, so this ceiling corresponds to a few
+/// megabytes — generous next to the 15,360 buckets (~840 KB) the defaults use,
+/// and small enough that the rewrite stays cheap.
+pub const MAX_TOTAL_BUCKETS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -97,11 +118,21 @@ impl Config {
 
     /// How many buckets one badge column aggregates. At least one, so a badge
     /// window shorter than a bucket still renders something.
+    ///
+    /// Capped so the badge can never ask for more history than the ring is able
+    /// to hold. Without the cap, `--bucket-seconds 10` at the default 64-minute
+    /// window asks for 384 buckets against a 240-bucket ring, and the three
+    /// oldest columns are permanent gaps that no amount of uptime can fill — on a
+    /// workspace that has in fact been observed without interruption. Gaps are
+    /// supposed to mean "we were not watching", so inventing them from a
+    /// configuration arithmetic mismatch undermines the one signal this plugin
+    /// exists to give.
     pub fn buckets_per_badge_column(&self) -> usize {
         let window_seconds = self.badge_window_minutes.saturating_mul(60);
-        let per_column =
-            window_seconds / self.bucket_seconds.max(1) / self.badge_columns.max(1) as u64;
-        (per_column as usize).max(1)
+        let columns = self.badge_columns.max(1);
+        let per_column = window_seconds / self.bucket_seconds.max(1) / columns as u64;
+        let affordable = self.retention_buckets / columns;
+        (per_column as usize).clamp(1, affordable.max(1))
     }
 
     /// Seconds of history the whole ring spans.
@@ -128,8 +159,26 @@ impl Config {
         self.badge_columns = self
             .badge_columns
             .clamp(MIN_BADGE_COLUMNS, MAX_BADGE_COLUMNS);
-        self.badge_window_minutes = self.badge_window_minutes.max(1);
-        self.max_workspaces = self.max_workspaces.clamp(1, 4_096);
+        self.badge_window_minutes = self.badge_window_minutes.clamp(1, MAX_BADGE_WINDOW_MINUTES);
+        self.max_workspaces = self.max_workspaces.clamp(1, MAX_MAX_WORKSPACES);
+
+        // The file's size is the product of these two, not either one alone, so
+        // clamping them separately leaves "bounded by construction" untrue.
+        // `retention_buckets` is the user's explicit statement about how far back
+        // they want to see, so the workspace cap gives way instead — losing the
+        // least recently seen workspace is a smaller loss than silently
+        // shortening everyone's history.
+        if self.retention_buckets.saturating_mul(self.max_workspaces) > MAX_TOTAL_BUCKETS {
+            let affordable = (MAX_TOTAL_BUCKETS / self.retention_buckets.max(1)).max(1);
+            // Loud, because a user who asked to track 400 workspaces and is
+            // silently given 6 would have no way to discover it.
+            eprintln!(
+                "pulse: retention_buckets {} x max_workspaces {} exceeds the {} bucket ceiling; \
+                 tracking {} workspaces instead",
+                self.retention_buckets, self.max_workspaces, MAX_TOTAL_BUCKETS, affordable
+            );
+            self.max_workspaces = affordable;
+        }
     }
 }
 

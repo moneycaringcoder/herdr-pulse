@@ -77,6 +77,16 @@ const TEMP_FILE: &str = "history.json.tmp";
 /// cannot answer the question it exists for.
 const OCCUPANCY_STEPS: u32 = 6;
 
+/// How far behind the newest recorded bucket a sample may fall before we
+/// conclude the recorded *anchor* is wrong rather than the sample.
+///
+/// Two buckets, because that is the largest honest disagreement: `taken_at` is
+/// stamped before the snapshot round trip, so consecutive samples can cross a
+/// bucket boundary in the wrong order by one bucket, and one more absorbs a slow
+/// server. Anything further back is a clock that was stepped. See
+/// [`WorkspaceHistory::observe`] for why erring towards re-anchoring is right.
+const REANCHOR_AFTER_BUCKETS: u64 = 2;
+
 /// Set once a save has failed, so a state dir that is unwritable for an hour
 /// produces one line on stderr rather than one per sampling interval. Cleared by
 /// a successful save so a problem that comes back is reported again.
@@ -205,7 +215,19 @@ impl WorkspaceHistory {
     /// below it has already been overwritten by newer data.
     fn slot(&self, number: u64) -> Option<usize> {
         let len = self.buckets.len() as u64;
-        if len == 0 || number > self.newest_bucket || number + len <= self.newest_bucket {
+        if len == 0 || number > self.newest_bucket {
+            return None;
+        }
+        // `number + len` has to be checked. `newest_bucket` comes straight out of
+        // the history file, and one near `u64::MAX` overflows the add — a panic
+        // in a debug build today, and a bare SIGABRT the day anyone turns on
+        // `overflow-checks` for the release profile, on the `pulse --once` path
+        // that runs in somebody's sidebar. An overflow means the lap edge is past
+        // `u64::MAX` and so past `newest_bucket`: the bucket is inside the lap.
+        if number
+            .checked_add(len)
+            .is_some_and(|lap_edge| lap_edge <= self.newest_bucket)
+        {
             return None;
         }
         Some((number % len) as usize)
@@ -266,6 +288,39 @@ impl WorkspaceHistory {
         self.newest_bucket = number;
     }
 
+    /// Pulls the anchor *back* to `number`, discarding every bucket newer than
+    /// it, and re-stamps the timestamps that were written alongside them.
+    ///
+    /// The counterpart to [`Self::advance`], and the only escape from a
+    /// `newest_bucket` that a fast clock wrote into the future. Without it the
+    /// drop rule in [`Self::observe`] discards every later sample until the wall
+    /// clock climbs back past that bucket — for as long as the forward jump was,
+    /// across daemon restarts and reboots, because `newest_bucket` is persisted.
+    ///
+    /// Discarding the newer buckets is not a loss: they were stamped by the same
+    /// wrong clock and describe minutes that never happened. `last_seen` and
+    /// `state_since` carry that clock too, and `WorkspaceActivity` measures
+    /// freshness from them, so a future `last_seen` left in place would report
+    /// "observed just now" forever beside a sparkline of pure gaps.
+    fn rewind(&mut self, number: u64, taken_at: u64) {
+        let len = self.buckets.len() as u64;
+        if len > 0 {
+            let ahead = self.newest_bucket - number;
+            for step in 0..ahead.min(len) {
+                let unreachable = self.newest_bucket - step;
+                self.buckets[(unreachable % len) as usize] = Bucket::default();
+            }
+        }
+        self.newest_bucket = number;
+        self.last_seen = taken_at;
+        if self.state_since.is_some_and(|since| since > taken_at) {
+            // We no longer know when this state began: the only stamp we had for
+            // it was a time that has not happened. "Unknown" is the honest
+            // answer, and the same one a freshly tracked workspace gives.
+            self.state_since = None;
+        }
+    }
+
     /// How many of this observation's agents have moved since the last one.
     ///
     /// The comparison is `!=`, not `>`. `state_change_seq` is session-global and
@@ -294,18 +349,43 @@ impl WorkspaceHistory {
     }
 
     /// Folds one observation of this workspace in.
-    fn observe(&mut self, observation: &WorkspaceObservation, taken_at: u64, config: &Config) {
+    ///
+    /// Returns whether the anchor had to be pulled back to meet this sample, so
+    /// the caller can report it once for the sample rather than once per
+    /// workspace.
+    fn observe(
+        &mut self,
+        observation: &WorkspaceObservation,
+        taken_at: u64,
+        config: &Config,
+    ) -> bool {
         self.reshape(config.retention_buckets);
 
         let number = bucket_number(taken_at, config);
+        let mut rewound = false;
         if number < self.newest_bucket {
-            // The clock went backwards — an NTP step, a suspended laptop, a
-            // container getting its time set. Writing into an older bucket would
-            // mean re-opening a minute we have already finished reporting, and
-            // `advance` would then clear everything between here and the newest
-            // bucket on the next forward sample. Dropping one sample loses a few
-            // seconds of resolution; rewriting history loses the history.
-            return;
+            // A sample is by definition "now", so an anchor ahead of it means one
+            // of the two clocks is wrong. Which one decides everything: dropping
+            // the sample protects a bucket we have already finished reporting,
+            // but if the *anchor* is the bogus value then dropping is a decision
+            // to record nothing until the wall clock catches up with a time that
+            // never happened.
+            //
+            // A bucket or two of slack absorbs the honest case: `taken_at` is
+            // stamped before the round trip, so a sample can straddle a bucket
+            // boundary and land marginally behind its predecessor. Beyond that
+            // the clock has been stepped, and everything ahead of this sample was
+            // stamped by the stepped clock — so re-anchor and drop it.
+            //
+            // The alternative of only re-anchoring when the sample is more than a
+            // whole ring behind was rejected: it is the same bug with a shorter
+            // fuse, leaving the store deaf for up to a full retention window (four
+            // hours at the defaults) after an ordinary NTP correction.
+            if self.newest_bucket - number <= REANCHOR_AFTER_BUCKETS {
+                return false;
+            }
+            self.rewind(number, taken_at);
+            rewound = true;
         }
         if number > self.newest_bucket {
             self.advance(number);
@@ -359,6 +439,7 @@ impl WorkspaceHistory {
         self.agent_seqs.dedup_by(|a, b| a.0 == b.0);
 
         self.last_seen = self.last_seen.max(taken_at);
+        rewound
     }
 
     /// The level for one output column, covering absolute buckets `first..=last`.
@@ -367,13 +448,23 @@ impl WorkspaceHistory {
     /// half gap and half data is data: it is real, and dropping it would punch a
     /// hole in the sparkline every time the daemon restarted mid-column.
     fn column(&self, first: u64, last: u64) -> Option<Level> {
-        // Nothing outside the current lap can contribute, so clamp the walk to
-        // one ring length however wide the caller's columns are.
         let len = self.buckets.len() as u64;
         if len == 0 {
             return None;
         }
-        let first = first.max(last.saturating_sub(len - 1));
+        // Clamp the walk to the live lap — `[newest_bucket - len + 1,
+        // newest_bucket]` — so a column wider than the ring still costs at most
+        // one lap of iteration however far into the future `as_of` is.
+        //
+        // Both ends are anchored on `newest_bucket`, never on the column. An
+        // earlier version measured a ring length back from `last`, which is the
+        // *column's* newest bucket and can be well past `newest_bucket` whenever
+        // the workspace stopped being reported before `as_of`. The walk then
+        // started after the oldest live slots and never reached them, so a column
+        // holding minutes of real, still-retained data read as a gap.
+        // `--bucket-seconds 10 --columns 1` is enough to reach it.
+        let first = first.max(self.newest_bucket.saturating_sub(len - 1));
+        let last = last.min(self.newest_bucket);
 
         let mut total: u32 = 0;
         let mut observed: u32 = 0;
@@ -417,24 +508,42 @@ impl History {
     ///
     /// Must be idempotent with respect to bucket allocation: many samples land
     /// in one bucket, and the ring slot is chosen from `sample.taken_at`, never
-    /// from a running counter. A sample older than the newest bucket already
-    /// written is dropped rather than rewriting history — a clock that jumps
-    /// backwards must not corrupt the series.
+    /// from a running counter. A sample slightly older than the newest bucket
+    /// already written is dropped rather than rewriting history; one far enough
+    /// behind that the recorded anchor cannot be believed re-anchors the store
+    /// and says so, because a clock that steps forward and comes back must not
+    /// leave the store permanently deaf.
     pub fn record(&mut self, sample: &Sample, config: &Config) {
+        let mut rewound = 0usize;
         for observation in &sample.workspaces {
-            self.record_workspace(observation, sample.taken_at, config);
+            if self.record_workspace(observation, sample.taken_at, config) {
+                rewound += 1;
+            }
+        }
+        // Once for the sample, not once per workspace: one clock step moves every
+        // workspace at the same instant, and the next sample is already
+        // re-anchored, so this is one line per event rather than a stream.
+        // Discarding recorded history without saying so is how a user ends up
+        // staring at a badge of gaps with a live pid and no hint of the cause.
+        if rewound > 0 {
+            eprintln!(
+                "pulse: the recorded history was ahead of the clock; \
+                 discarded the unreachable buckets for {rewound} workspace(s) and resumed recording"
+            );
         }
         // After, not before: a workspace introduced by this sample is the most
         // recently seen thing in the store and must never be the one evicted.
         self.evict(config);
     }
 
+    /// Returns whether folding this observation in had to re-anchor the
+    /// workspace's ring.
     fn record_workspace(
         &mut self,
         observation: &WorkspaceObservation,
         taken_at: u64,
         config: &Config,
-    ) {
+    ) -> bool {
         let existing = self
             .workspaces
             .iter()
@@ -457,7 +566,7 @@ impl History {
                 self.workspaces.len() - 1
             }
         };
-        self.workspaces[index].observe(observation, taken_at, config);
+        self.workspaces[index].observe(observation, taken_at, config)
     }
 
     /// Enforces the workspace cap, dropping the least recently seen first.
@@ -523,7 +632,9 @@ impl History {
     /// order they are stored in and is stable across a save and load. A
     /// workspace whose whole window is a gap is still reported: "this workspace
     /// exists and we have nothing recent for it" is the renderer's call to make,
-    /// not the store's.
+    /// not the store's — which is what `last_seen` is for. `state` is always a
+    /// past observation, `last_seen` says how old it is, and `state_for` is
+    /// measured between the two rather than up to `as_of`.
     pub fn activity(
         &self,
         as_of: u64,
@@ -540,7 +651,7 @@ impl History {
                     .map(|column| {
                         // Oldest first: column 0 is the furthest back, and the
                         // last column is the one containing `as_of`.
-                        let back = (columns - 1 - column) as u64 * per_column;
+                        let back = ((columns - 1 - column) as u64).saturating_mul(per_column);
                         // A column entirely before the epoch is not a column.
                         let last = newest.checked_sub(back)?;
                         let first = last.saturating_sub(per_column - 1);
@@ -552,12 +663,27 @@ impl History {
                     label: workspace.label.clone(),
                     series,
                     state: AgentState::parse(&workspace.state),
-                    // Saturating: `as_of` before the recorded transition means a
-                    // clock that moved backwards, and a huge duration from a
-                    // wrapped subtraction would be reported with confidence.
+                    // Measured to the last observation, never to `as_of`. The
+                    // difference is the whole point: an agent that was working
+                    // when we last looked five hours ago has been *observed*
+                    // working for however long we watched it, not for five hours.
+                    // Measuring to now would print "working 5h00" in the same row
+                    // as a sparkline of pure gaps, and `--json` would hand a
+                    // downstream tool the same claim.
+                    //
+                    // Saturating: a `state_since` ahead of `last_seen` can only
+                    // come from a corrupt file, and a wrapped subtraction would
+                    // report a duration of several hundred billion years with
+                    // complete confidence.
                     state_for: workspace
                         .state_since
-                        .map(|since| as_of.saturating_sub(since)),
+                        .map(|since| workspace.last_seen.saturating_sub(since)),
+                    // The stamp that makes `state` falsifiable. A recorded
+                    // workspace always carries the time of the observation that
+                    // created it, so a zero here can only come from a hand-edited
+                    // file: report it as never observed rather than as a 1970
+                    // sighting, which would read as ancient-but-real.
+                    last_seen: Some(workspace.last_seen).filter(|seen| *seen > 0),
                     agent_count: workspace.agent_seqs.len(),
                 }
             })

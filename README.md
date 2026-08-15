@@ -1,4 +1,4 @@
-<!-- LOGO -->
+<img src="docs/img/logo.svg" alt="" width="96" align="right">
 
 # pulse
 
@@ -13,21 +13,82 @@ workspace:
 > **Which of these actually did anything in the last hour, and which have been
 > idle since lunch?**
 
-<!-- DIAGRAM: mechanism -->
+<p align="center">
+  <img src="docs/img/mechanism.svg" alt="One session.snapshot every five seconds is folded into a per-workspace ring of one-minute buckets, which is drawn as a sidebar badge and an activity pane." width="620">
+</p>
 
 ## The one rule worth knowing
 
-A blank column is **not** a quiet column.
+A gap column is **not** a quiet column.
 
 | Glyph | Meaning |
 |---|---|
 | `▁▂▃▄▅▆▇█` | Observed activity, low to high |
 | `·` | Observed, and nothing happened |
-| *(blank)* | **Not observed** — the sampler was not running then |
+| `╌` | **Not observed** — the sampler was not running then |
 
 "We were not watching" and "nothing happened" are different facts. pulse never
 draws one as the other; a stopped sampler leaves a visible hole in the history
 rather than a convincing stretch of calm.
+
+The gap is a printing character rather than a blank for a reason that is not
+cosmetic: herdr trims whitespace off a badge token's value and deletes a token
+whose value is entirely whitespace. With a space, the *newest* columns of a
+sparkline were silently stripped, so the series stopped lining up with the
+present — and a workspace nobody had been watching lost its badge altogether,
+which is the one moment the gap most needed showing.
+
+## What it looks like
+
+A real `pulse --once`, captured from a running session. Only the workspace labels
+have been renamed; every glyph, column and number is as the plugin printed it.
+
+```
+pulse — 19 workspaces — 23:32:18 UTC
+
+workspace           activity                            state          for  seen  agents
+orchestrator        [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·▃·····]  ? unknown      35m  3s    0
+research            [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  ? unknown      ?    3s    0
+planner             [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  ? unknown      32m  3s    0
+media-fix           [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  - idle         ?    3s    2
+budget-fix          [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  = done         ?    3s    2
+shear               [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▆▆▇▆▆▂·]  = done         11m  3s    1
+redact              [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▆▆▆▆▆▆▆]  > working      ?    3s    3
+collide             [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▆▆▆▆▆▆▆]  > working      ?    3s    5
+standup             [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▆▆▇▇▆▆▅]  ! blocked      14m  3s    4
+pulse               [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▆▆▆▆▆▆▆]  > working      ?    3s    5
+app                 [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·······]  ? unknown      ?    3s    0
+repo                [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌····]  ? unknown      ?    3s    0
+label-probe         [╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌·╌╌╌]  ? was unknown  ?    24m   0
+
+legend  ▁▂▃▄▅▆▇█ busier  |  · observed, nothing happened  |  ╌ not observed
+        for = how long the state had held when last seen  |  seen = how long ago that was
+        "was X" is the last observation and nothing has been seen since — not a claim about now
+        one column = 7m  |  whole row = 3h44
+```
+
+Four things worth reading off that:
+
+- **`standup` is `! blocked`** — one of its four agents is waiting on a human
+  while the others finish. That workspace will not make progress until somebody
+  looks at it, and it is the only row where that is true.
+- **`shear` is winding down.** `▆▆▇▆▆▂·` is a busy stretch that tailed off; the
+  state caught up a moment later and says `= done`.
+- **The leading `╌` are honest.** The sampler had been running for about half an
+  hour when this was taken, so most of the four-hour row is time nobody watched —
+  drawn as gaps, not as calm.
+- **`label-probe` says `was unknown`, `seen 24m`.** Nothing has been observed
+  there for 24 minutes, so the row refuses to make a present-tense claim, and its
+  newest columns are gaps rather than quiet.
+
+In the sidebar each workspace gets the compact form — eight columns over the last
+64 minutes, plus the state glyph:
+
+```
+standup   ╌╌▆▇▇▆▆▅!
+collide   ╌╌▆▆▆▆▆▆>
+budget    ╌╌······=
+```
 
 ## Install
 
@@ -104,6 +165,38 @@ pulse --once
 | `--json` | Print the recorded history as JSON and exit. Gaps are `null`, observed-and-quiet is `0`. |
 | `--watch` | Live activity view, refreshing on an interval. Exits with a message if no sampler is running. |
 
+### Reading the pane
+
+`--once` and `--watch` print one row per workspace:
+
+| Column | Meaning |
+|---|---|
+| `workspace` | The workspace's label. |
+| `activity` | The sparkline, oldest column on the left, newest on the right. |
+| `state` | The state the workspace was in **at the last observation**. |
+| `for` | How long that state had held when we last looked. |
+| `seen` | How long ago that observation was. |
+| `agents` | Agents in the workspace at that observation. |
+
+Every state in the pane is a past observation. While the sampler is running the
+last observation is seconds old, so reading it as the present is fair and the row
+says `> working`. Once the last observation is older than three sampling
+intervals — because the sampler stopped, or the machine slept — the row switches
+to the past tense:
+
+| Row reads | Means |
+|---|---|
+| `> working` | An agent is working, as of a moment ago. |
+| `> was working` | An agent was working when we last looked, `seen` ago. Nothing is claimed about now. |
+
+The sparkline says the same thing in glyphs: a stretch of `╌` is time nobody
+watched. The words and the sparkline are never allowed to disagree.
+
+`--json` carries the same distinction, since a consumer cannot read a tense:
+each workspace has `last_seen`, `observed_ago_seconds` and `state_is_current`,
+and the document has the `staleness_tolerance_seconds` those were judged
+against.
+
 ### Sampler
 
 | Verb | What it does |
@@ -160,11 +253,26 @@ from rendering.
 | `bucket_seconds` | `60` | 10–3600 | Wall clock each history bucket covers. |
 | `retention_buckets` | `240` | 8–10000 | Buckets kept per workspace. Fixed-length ring; never grows. |
 | `badge_columns` | `8` | 1–64 | Sparkline columns in the sidebar badge. |
-| `badge_window_minutes` | `64` | ≥ 1 | Minutes of history those columns span. |
-| `max_workspaces` | `64` | 1–4096 | Ceiling on tracked workspaces; least recently seen are evicted first. |
+| `badge_window_minutes` | `64` | 1–1440 | Minutes of history those columns span. |
+| `max_workspaces` | `64` | 1–512 | Ceiling on tracked workspaces; least recently seen are evicted first. |
 
 Command-line options override the file. Every value is clamped into its range,
 so no configuration can produce output the renderer has to defend against.
+
+Two of those ranges interact, and pulse says so rather than quietly obeying:
+
+- **`retention_buckets × max_workspaces` is capped at 65,536 buckets**, which is
+  what actually determines the history file's size — clamping each field on its
+  own would leave "bounded by construction" untrue, since their maxima multiply
+  out to a file of tens of megabytes rewritten every few seconds. When the pair
+  exceeds the cap the workspace ceiling gives way, and the reason is printed on
+  stderr. `retention_buckets` wins because it is your explicit statement about
+  how far back you want to see.
+- **The badge never asks for more history than the ring holds.** `--bucket-seconds
+  10` with the default 64-minute window would want 384 buckets from a 240-bucket
+  ring, leaving three columns permanently gapped on a workspace that was in fact
+  watched the whole time. The window is shortened to fit instead, because a gap
+  has to mean "nobody was watching" and not "the arithmetic did not line up".
 
 ```json
 {

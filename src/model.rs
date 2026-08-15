@@ -206,10 +206,44 @@ pub struct WorkspaceActivity {
     /// not a quiet period, and must never render as one.
     pub series: Vec<Option<Level>>,
     pub state: AgentState,
-    /// How long `state` has held, in seconds. `None` when we have not observed
-    /// a transition yet and so genuinely do not know.
+    /// How long `state` has held, in seconds, **measured to [`Self::last_seen`]
+    /// rather than to now**. `None` when we have not observed a transition yet
+    /// and so genuinely do not know.
+    ///
+    /// The distinction matters once the sampler stops. Measuring to now would
+    /// turn "an agent was working when we last looked, five hours ago" into the
+    /// confident claim "an agent has been working for five hours" — a
+    /// present-tense assertion about a period nobody observed, sitting in the
+    /// same row as a sparkline full of gaps that says the opposite.
     pub state_for: Option<u64>,
+    /// Unix seconds of the most recent observation of this workspace, or `None`
+    /// if it has never been observed.
+    ///
+    /// This is what makes `state` falsifiable. `state` is always a *past*
+    /// observation; without knowing how old it is, a reader cannot tell a live
+    /// fact from a stale one, and every renderer would have to guess.
+    pub last_seen: Option<u64>,
     pub agent_count: usize,
+}
+
+impl WorkspaceActivity {
+    /// How long ago this workspace was last observed, relative to `as_of`.
+    /// `None` when it has never been observed.
+    ///
+    /// Saturating, so a history file written by a clock ahead of ours reports
+    /// "just now" rather than underflowing into an enormous age.
+    pub fn observed_ago(&self, as_of: u64) -> Option<u64> {
+        self.last_seen.map(|seen| as_of.saturating_sub(seen))
+    }
+
+    /// Whether [`Self::state`] is recent enough to state in the present tense.
+    ///
+    /// `tolerance` is how far behind the sampler is allowed to be — a couple of
+    /// sampling intervals, so an ordinary missed cycle does not flip every row
+    /// to "stale", while a stopped daemon does so quickly.
+    pub fn is_current(&self, as_of: u64, tolerance: u64) -> bool {
+        self.observed_ago(as_of).is_some_and(|ago| ago <= tolerance)
+    }
 }
 
 /// A bucket's activity, normalised to the sparkline's scale.
