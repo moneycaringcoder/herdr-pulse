@@ -1,0 +1,39 @@
+name: Feature request
+description: Something pulse could usefully do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Worth knowing before you write: **pulse observes and never acts.** It
+        will not prompt agents, send keys, kill processes, or write to a
+        repository. Ideas in that direction belong in a different plugin, and
+        that is a scope decision rather than a judgement on the idea.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is awkward today
+      description: >
+        The situation, rather than the solution. What did you want to know about
+        your session that pulse could not tell you?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: Rough is fine. "I don't know how this should look" is fine too.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This is observation only — it does not act on an agent or a repository
+          required: true
+        - label: This needs no network access
+          required: true

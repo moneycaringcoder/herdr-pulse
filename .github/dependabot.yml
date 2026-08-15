@@ -1,0 +1,25 @@
+# The crate has four direct dependencies and no network surface, so updates are
+# grouped into a single monthly pull request rather than arriving one at a time.
+#
+# Note that `tests/read_only.rs` asserts an allowlist over the whole locked
+# dependency tree. A dependabot pull request that pulls in a new transitive
+# crate will fail CI until that crate has been reviewed and added deliberately,
+# which is the intended behaviour rather than an inconvenience.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

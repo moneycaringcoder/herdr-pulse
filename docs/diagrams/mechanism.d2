@@ -1,0 +1,96 @@
+# How one snapshot becomes one sparkline. Rendered to docs/img/mechanism.svg.
+#
+# No unicode marks in labels — d2's bundled font has no glyph for them and they
+# render as tofu.
+
+direction: right
+
+classes: {
+  node: {
+    shape: rectangle
+    style: {
+      stroke: "#8b949e"
+      font-color: "#57606a"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+  store: {
+    shape: cylinder
+    style: {
+      stroke: "#8b949e"
+      font-color: "#57606a"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+  out: {
+    shape: rectangle
+    style: {
+      stroke: "#8cd98c"
+      font-color: "#57606a"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+}
+
+herdr: {
+  class: node
+  label: "herdr server\nsession.snapshot"
+}
+
+sampler: {
+  class: node
+  label: "sampler\nevery 5s, one round trip"
+}
+
+fold: {
+  class: node
+  label: "fold into the current bucket\nworking? blocked? did seq move?"
+}
+
+store: {
+  class: store
+  label: "history.json\n240 x 60s ring per workspace\nwritten by atomic rename"
+}
+
+badge: {
+  class: out
+  label: "sidebar badge\n8 columns, 64 minutes"
+}
+
+pane: {
+  class: out
+  label: "activity pane\n32 columns, plus state and duration"
+}
+
+herdr -> sampler: "workspaces, agents,\nagent_status, state_change_seq" {
+  style.stroke: "#8b949e"
+  style.font-color: "#57606a"
+}
+sampler -> fold {style.stroke: "#8b949e"}
+fold -> store: "one bucket per minute" {
+  style.stroke: "#8b949e"
+  style.font-color: "#57606a"
+}
+store -> badge: "workspace.report_metadata" {
+  style.stroke: "#8b949e"
+  style.font-color: "#57606a"
+}
+store -> pane {style.stroke: "#8b949e"}
+
+note: |md
+  A bucket the sampler never observed
+  stays empty and renders as a gap,
+  never as a quiet period.
+| {
+  style: {
+    stroke: "#8b949e"
+    font-color: "#57606a"
+    fill: transparent
+    stroke-dash: 4
+  }
+}
+
+store -> note: {style.stroke-dash: 4; style.stroke: "#8b949e"}

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="pulse">
+  <title>pulse</title>
+  <!--
+    A sparkline of agent activity, drawn as the plugin itself draws one.
+
+    The bars rise, fall, and rise again — the shape of the last hour that herdr's
+    live state cannot show you. Two things are deliberate:
+
+      * the sixth column is EMPTY, not short. That is a gap: a stretch the
+        sampler was not running for. The whole design rests on a gap never being
+        drawn as a quiet period, so the mark says it too.
+      * the last column is the tall one and carries the accent, because the badge
+        answers "recently", not "ever".
+
+    Mid-tone grey on purpose: one file that reads on light and dark, needing no
+    dark variant.
+  -->
+  <g fill="#8b949e" fill-opacity="0.9">
+    <rect x="14"  y="80" width="12" height="34" rx="3"/>
+    <rect x="32"  y="62" width="12" height="52" rx="3"/>
+    <rect x="50"  y="40" width="12" height="74" rx="3"/>
+    <rect x="68"  y="70" width="12" height="44" rx="3"/>
+  </g>
+
+  <!--
+    The gap. A dotted baseline stub rather than nothing at all, so it reads as
+    "we were not watching here" instead of as an accident of spacing.
+  -->
+  <line x1="86" y1="110" x2="98" y2="110" stroke="#8b949e" stroke-width="4"
+        stroke-linecap="round" stroke-dasharray="1 7" stroke-opacity="0.75"/>
+
+  <rect x="104" y="22" width="12" height="92" rx="3" fill="#8cd98c"/>
+</svg>

@@ -20,9 +20,14 @@
 //! "nothing happened" are different facts, and conflating them is the class of
 //! bug this plugin was written to avoid committing.
 
+use std::io::Write;
+
+use serde_json::{json, Value};
+
 use crate::config::Config;
 use crate::model::{AgentState, Level, WorkspaceActivity};
 use crate::Result;
+use crate::{daemon, history};
 
 /// Eight steps of block element, indexed by [`Level`] 1..=8. Level 0 is
 /// [`QUIET`], which is deliberately not `▁`: a one-pixel bar reads as a small
@@ -35,17 +40,55 @@ pub const QUIET: char = '·';
 /// Not observed. The sampler was not running for this column.
 pub const GAP: char = ' ';
 
+/// Sparkline columns in the activity pane. Wider than the badge because the pane
+/// is an overlay rather than a sidebar cell, and narrow enough that a row still
+/// fits an 80-column terminal beside a label, a state and a duration.
+pub const PANE_COLUMNS: usize = 32;
+
+/// Display columns a workspace label may occupy in the pane before it is
+/// elided. One pathological label must not widen every other row.
+const MAX_LABEL_WIDTH: usize = 28;
+
+/// Blank columns between two pane columns.
+const COLUMN_GAP: &str = "  ";
+
+/// Clear the screen and home the cursor, for `--watch`.
+const CLEAR: &str = "\x1b[2J\x1b[H";
+
 /// One glyph per state, for the badge and the pane.
-pub fn state_glyph(_state: AgentState) -> char {
-    todo!("presenter")
+///
+/// Deliberately ASCII. The block ramp is the only Unicode we have live evidence
+/// for surviving the badge round trip at a known display width, and a state
+/// glyph that a terminal decided to render double-width would shift the sidebar
+/// row it sits in — the one thing this module exists to get right. Distinctness
+/// at a glance matters more here than prettiness.
+pub fn state_glyph(state: AgentState) -> char {
+    match state {
+        AgentState::Blocked => '!',
+        AgentState::Working => '>',
+        AgentState::Idle => '-',
+        AgentState::Done => '=',
+        AgentState::Unknown => '?',
+    }
 }
 
 /// Renders a series as a sparkline of exactly `series.len()` characters.
 ///
 /// Never panics, whatever the input. A [`Level`] above [`Level::MAX`] is clamped
 /// rather than indexing out of bounds.
-pub fn sparkline(_series: &[Option<Level>]) -> String {
-    todo!("presenter")
+pub fn sparkline(series: &[Option<Level>]) -> String {
+    series
+        .iter()
+        .map(|slot| match slot {
+            None => GAP,
+            Some(level) if level.is_quiet() => QUIET,
+            // Clamped, not trusted: `Level` is a public tuple struct, so a value
+            // above `Level::MAX` can reach us without ever passing through
+            // `Level::new`. Indexing `RAMP` with it would panic in the one code
+            // path a user sees on every refresh.
+            Some(level) => RAMP[level.0.min(Level::MAX) as usize - 1],
+        })
+        .collect()
 }
 
 /// The sidebar badge for one workspace: a sparkline plus the current state.
@@ -54,14 +97,63 @@ pub fn sparkline(_series: &[Option<Level>]) -> String {
 /// string** when there is nothing worth showing, which the daemon treats as
 /// "clear the token" rather than as an empty badge — so an untracked workspace
 /// does not occupy a sidebar row with blanks.
-pub fn badge(_activity: &WorkspaceActivity, _config: &Config) -> String {
-    todo!("presenter")
+///
+/// "Nothing worth showing" is judged over the *whole* series, not over the
+/// window we are about to draw. A workspace that was busy this morning and has
+/// been unobserved since is still tracked, and blanking its badge would hide the
+/// fact that we stopped watching it. A workspace we have never recorded a single
+/// observation for is a different thing, and is the only case that clears.
+///
+/// A quiet workspace is emphatically *not* cleared: a flat row of `·` next to a
+/// burst that ended ten minutes ago is the most useful sentence this plugin
+/// says.
+pub fn badge(activity: &WorkspaceActivity, config: &Config) -> String {
+    if activity.series.iter().all(Option::is_none) {
+        return String::new();
+    }
+
+    // The store may hand us a longer series than the badge has room for — the
+    // pane and the badge read the same history at different resolutions. Take
+    // the newest columns, since the badge answers "recently", not "ever".
+    let columns = config.badge_columns.max(1);
+    let start = activity.series.len().saturating_sub(columns);
+    let mut out = sparkline(&activity.series[start..]);
+    out.push(state_glyph(activity.state));
+    out
 }
 
 /// A human duration in at most four characters: `12s`, `4m`, `1h20`, `3d`.
 /// `None` renders as `?`, because "we do not know how long" is a real answer.
-pub fn duration(_seconds: Option<u64>) -> String {
-    todo!("presenter")
+pub fn duration(seconds: Option<u64>) -> String {
+    let Some(seconds) = seconds else {
+        return "?".to_string();
+    };
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 10 {
+        // The minutes are zero-padded so the field is always four characters
+        // wide: `1h05`, never the ambiguous `1h5`.
+        return format!("{hours}h{:02}", minutes % 60);
+    }
+    if hours < 24 {
+        // Two-digit hours have spent the budget; the minutes go.
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    // Everything here is division, so a garbage `state_since` — a clock that
+    // jumped, a value near `u64::MAX` — saturates into a legible answer instead
+    // of overflowing or printing a fifteen-digit number into a four-wide column.
+    if days < 100 {
+        format!("{days}d")
+    } else {
+        ">99d".to_string()
+    }
 }
 
 /// The full activity pane: every tracked workspace, its sparkline, its current
@@ -69,26 +161,340 @@ pub fn duration(_seconds: Option<u64>) -> String {
 ///
 /// Columns must line up regardless of label width or of multi-byte glyphs in the
 /// sparkline — pad by display width, not by byte length.
-pub fn pane(_activity: &[WorkspaceActivity], _config: &Config, _as_of: u64) -> String {
-    todo!("presenter")
+pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> String {
+    if activity.is_empty() {
+        // Not an empty table. An empty table looks like a quiet session, and a
+        // quiet session is the one answer we must never give by accident.
+        return format!(
+            "pulse — {}\n\nNo workspace history recorded yet.\n\
+             Start the sampler with `pulse --enable`; activity appears after the first bucket.\n",
+            clock(as_of)
+        );
+    }
+
+    let mut rows = vec![vec![
+        "workspace".to_string(),
+        "activity".to_string(),
+        "state".to_string(),
+        "for".to_string(),
+        "agents".to_string(),
+    ]];
+    for workspace in activity {
+        rows.push(vec![
+            clean_label(&workspace.label),
+            // Bracketed because [`GAP`] is a space: without a delimiter a series
+            // that begins or ends unobserved is indistinguishable from column
+            // padding, and the gap would be invisible in the one view whose job
+            // is to show it.
+            format!("[{}]", sparkline(&workspace.series)),
+            format!("{} {}", state_glyph(workspace.state), workspace.state),
+            duration(workspace.state_for),
+            workspace.agent_count.to_string(),
+        ]);
+    }
+
+    let mut out = format!(
+        "pulse — {} workspace{} — {}\n\n",
+        activity.len(),
+        if activity.len() == 1 { "" } else { "s" },
+        clock(as_of)
+    );
+    out.push_str(&table(&rows));
+    out.push('\n');
+    out.push_str(&legend(config, activity));
+    out
 }
 
 /// `--once`: print the pane once and exit.
-pub fn run_once(_config: &Config) -> Result<()> {
-    todo!("presenter")
+pub fn run_once(config: &Config) -> Result<()> {
+    let as_of = crate::now_unix();
+    let (columns, buckets_per_column) = pane_geometry(config);
+    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    print!("{}", pane(&activity, config, as_of));
+
+    // An empty report and a stopped sampler look identical on screen, so say
+    // which one this is. On stderr, so `pulse --once > report.txt` still
+    // captures only the report.
+    if activity.is_empty() && daemon::live_pid().is_none() {
+        eprintln!("pulse: no sampler is running — nothing is being recorded.");
+    }
+    Ok(())
 }
 
 /// `--json`: the recorded history as machine-readable JSON.
 ///
 /// A gap must be representable and distinguishable from a zero — `null` in the
 /// series array, not `0`.
-pub fn run_json(_config: &Config) -> Result<()> {
-    todo!("presenter")
+pub fn run_json(config: &Config) -> Result<()> {
+    let as_of = crate::now_unix();
+    let (columns, buckets_per_column) = pane_geometry(config);
+    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+
+    let workspaces: Vec<Value> = activity
+        .iter()
+        .map(|workspace| {
+            json!({
+                "workspace_id": workspace.workspace_id,
+                "label": workspace.label,
+                "state": workspace.state.as_str(),
+                "state_for_seconds": workspace.state_for,
+                "agent_count": workspace.agent_count,
+                // `null` is a gap and `0` is an observed quiet bucket. A
+                // consumer that flattens the two gets the same wrong answer the
+                // glyphs exist to prevent, so the distinction is carried in the
+                // JSON type rather than in a sentinel number.
+                "series": workspace
+                    .series
+                    .iter()
+                    .map(|slot| match slot {
+                        Some(level) => json!(level.0.min(Level::MAX)),
+                        None => Value::Null,
+                    })
+                    .collect::<Vec<Value>>(),
+                // The rendered form too, so a bug report can show what the user
+                // saw without asking them to screenshot a sidebar.
+                "sparkline": sparkline(&workspace.series),
+            })
+        })
+        .collect();
+
+    let document = json!({
+        "as_of": as_of,
+        "bucket_seconds": config.bucket_seconds,
+        "columns": columns,
+        "buckets_per_column": buckets_per_column,
+        "seconds_per_column": (buckets_per_column as u64).saturating_mul(config.bucket_seconds),
+        "level_max": Level::MAX,
+        "workspaces": workspaces,
+    });
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    Ok(())
 }
 
 /// `--watch`: the pane, redrawn on an interval, reading the history the daemon
 /// writes. Must degrade with a clear message when no sampler is running, rather
 /// than showing an empty pane that looks like a quiet session.
-pub fn run_watch(_config: &Config) -> Result<()> {
-    todo!("presenter")
+pub fn run_watch(config: &Config) -> Result<()> {
+    if daemon::live_pid().is_none() {
+        return Err(no_sampler_error().into());
+    }
+
+    let (columns, buckets_per_column) = pane_geometry(config);
+    let mut out = std::io::stdout();
+    loop {
+        // Re-checked every cycle, not just at startup. A sampler that dies under
+        // a running watch would otherwise leave the last frame on screen for
+        // hours, ageing into a confident lie.
+        if daemon::live_pid().is_none() {
+            write!(out, "{CLEAR}")?;
+            out.flush()?;
+            return Err(format!("the sampler stopped while watching. {}", no_sampler_error()).into());
+        }
+
+        let as_of = crate::now_unix();
+        let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+        write!(out, "{CLEAR}{}", pane(&activity, config, as_of))?;
+        writeln!(
+            out,
+            "\nrefreshing every {} — ctrl-c to stop",
+            duration(Some(config.interval.as_secs()))
+        )?;
+        out.flush()?;
+        std::thread::sleep(config.interval);
+    }
+}
+
+fn no_sampler_error() -> String {
+    "no sampler is running, so there is nothing live to watch — start it with `pulse --enable`, \
+     or use `pulse --once` to read what was recorded earlier"
+        .to_string()
+}
+
+/// How many pane columns to ask the store for, and how many buckets each one
+/// aggregates.
+///
+/// Derived from retention rather than from the badge window: the pane is where
+/// someone goes to see the whole recorded history, not the last hour of it. The
+/// column count is capped by the number of buckets that exist, so a small
+/// retention draws a short row rather than a long row of gaps that were never
+/// recordable in the first place.
+pub fn pane_geometry(config: &Config) -> (usize, usize) {
+    let columns = PANE_COLUMNS.min(config.retention_buckets).max(1);
+    let buckets_per_column = (config.retention_buckets / columns).max(1);
+    (columns, buckets_per_column)
+}
+
+/// Time of day in UTC.
+///
+/// Deliberately not a date. A calendar needs civil-from-days arithmetic and a
+/// timezone database to be worth printing, and the question the pane answers —
+/// "how fresh is this?" — is answered by a clock.
+fn clock(as_of: u64) -> String {
+    let seconds = as_of % 86_400;
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        seconds / 3_600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
+/// The key to the glyphs, including the one made of nothing.
+///
+/// A gap is a space, which is by definition invisible. Without this line a user
+/// reading a half-blank sparkline has no way to learn that the blank means "we
+/// were not watching", and would reasonably read it as "quiet" — the exact
+/// misreading the glyph split exists to prevent.
+fn legend(config: &Config, activity: &[WorkspaceActivity]) -> String {
+    let mut out = String::from(
+        "legend  ▁▂▃▄▅▆▇█ busier  |  · observed, nothing happened  |  blank not observed\n",
+    );
+
+    // Only claim a timescale when the series we were handed actually has the
+    // shape this config implies. A caller that built the activity with different
+    // geometry would otherwise get a confidently mislabelled axis.
+    let (columns, buckets_per_column) = pane_geometry(config);
+    if activity
+        .iter()
+        .all(|workspace| workspace.series.len() == columns)
+    {
+        let per_column = (buckets_per_column as u64).saturating_mul(config.bucket_seconds);
+        out.push_str(&format!(
+            "        one column = {}  |  whole row = {}\n",
+            duration(Some(per_column)),
+            duration(Some(per_column.saturating_mul(columns as u64)))
+        ));
+    }
+    out
+}
+
+/// Lays out rows into aligned columns, padding every cell but the last.
+///
+/// The last cell is left unpadded so rows carry no trailing whitespace; nothing
+/// lines up to the right of it anyway.
+fn table(rows: &[Vec<String>]) -> String {
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0usize; column_count];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(display_width(cell));
+        }
+    }
+
+    let mut out = String::new();
+    for row in rows {
+        let last = row.len().saturating_sub(1);
+        for (index, cell) in row.iter().enumerate() {
+            if index > 0 {
+                out.push_str(COLUMN_GAP);
+            }
+            if index == last {
+                out.push_str(cell);
+            } else {
+                out.push_str(&pad(cell, widths[index]));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Right-pads to `width` **display columns**.
+fn pad(text: &str, width: usize) -> String {
+    let mut out = text.to_string();
+    for _ in display_width(text)..width {
+        out.push(' ');
+    }
+    out
+}
+
+/// A label safe to lay out.
+///
+/// Control characters would move the terminal cursor and undo every column we
+/// just aligned, so they are dropped rather than trusted — workspace labels come
+/// from whatever the user typed, or from a directory name, and are not ours.
+fn clean_label(label: &str) -> String {
+    let cleaned: String = label.chars().filter(|ch| !ch.is_control()).collect();
+    if cleaned.trim().is_empty() {
+        return "(unnamed)".to_string();
+    }
+    truncate_to_width(&cleaned, MAX_LABEL_WIDTH)
+}
+
+/// Truncates to `width` display columns, never splitting a character.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1); // room for the ellipsis
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = char_width(ch);
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
+}
+
+/// Terminal cells a string occupies.
+///
+/// `str::len()` is bytes and `chars().count()` is code points; a terminal aligns
+/// by neither. The sparkline is three bytes per glyph and a workspace label may
+/// be CJK or contain a combining accent, so padding by anything but this
+/// silently misaligns every column to its right.
+///
+/// This is an approximation of UAX #11 rather than the whole table — the crate
+/// has no unicode-width dependency and this is cosmetic — but it covers what
+/// actually turns up in a workspace label: the CJK and Hangul blocks, fullwidth
+/// forms, emoji, and zero-width combining marks.
+pub fn display_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+fn char_width(ch: char) -> usize {
+    let code = ch as u32;
+    // Combining marks, variation selectors and the zero-width formatting
+    // characters attach to the previous cell rather than claiming one.
+    if matches!(code,
+        0x0300..=0x036F
+        | 0x0483..=0x0489
+        | 0x1AB0..=0x1AFF
+        | 0x1DC0..=0x1DFF
+        | 0x200B..=0x200F
+        | 0x20D0..=0x20F0
+        | 0xFE00..=0xFE0F
+        | 0xFE20..=0xFE2F
+        | 0xFEFF
+    ) {
+        return 0;
+    }
+    if ch.is_control() {
+        return 0;
+    }
+    if matches!(code,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE19
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F680..=0x1F6FF
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD
+    ) {
+        return 2;
+    }
+    1
 }

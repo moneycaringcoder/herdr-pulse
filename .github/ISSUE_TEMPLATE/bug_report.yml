@@ -1,0 +1,89 @@
+name: Bug report
+description: Something pulse did wrong, or did not do.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for taking the time. The most useful bug reports for this plugin
+        are the ones where the sparkline said something that was not true — a
+        quiet workspace that was actually busy, a gap that should have been data,
+        or a badge that never appeared.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did pulse show, and what was actually going on?
+      placeholder: >
+        The badge for my "build" workspace showed a flat row of dots, but the
+        agent in it had been working continuously for ten minutes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: >
+        Even a rough sequence helps. If it only happens sometimes, say that —
+        an intermittent report is still worth filing.
+    validations:
+      required: false
+
+  - type: input
+    id: pulse-version
+    attributes:
+      label: pulse version
+      description: "`pulse --version`"
+    validations:
+      required: true
+
+  - type: input
+    id: herdr-version
+    attributes:
+      label: herdr version
+      description: "`herdr --version`"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Your pulse config, if you have one
+      description: >
+        The contents of
+        `~/.config/herdr/plugins/config/moneycaringcoder.pulse/config.json`.
+        Leave blank if you never created it.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything on stderr
+      description: >
+        `herdr plugin log list --plugin moneycaringcoder.pulse`. Please skim it
+        before pasting — it contains your workspace labels.
+      render: shell
+    validations:
+      required: false

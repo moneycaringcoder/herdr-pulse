@@ -1,0 +1,11 @@
+# Every change requests a review from the maintainer automatically.
+# This is about staying informed, not about gatekeeping: contributions are
+# welcome and reviewed personally.
+*       @moneycaringcoder
+
+# The safety guarantees live here. Changes to these get the closest reading,
+# because they decide whether the plugin can write anywhere it should not and
+# whether a gap in the record can be mistaken for a quiet period.
+/tests/read_only.rs @moneycaringcoder
+/src/history.rs     @moneycaringcoder
+/src/setup.rs       @moneycaringcoder
