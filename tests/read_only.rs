@@ -97,6 +97,15 @@ fn fixture_repo(dir: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(&repo).ok()?;
     let git = |args: &[&str]| -> Option<()> {
         let status = Command::new("git")
+            // Git's own background maintenance writes inside `.git` on its own
+            // schedule — `.git/objects/maintenance.lock` appears and disappears
+            // without anyone asking. The fingerprint below cannot tell that
+            // apart from the plugin writing, so a run that happened to straddle
+            // a maintenance tick failed a test about the plugin's behaviour for
+            // a reason that had nothing to do with the plugin. Turning both off
+            // makes the fixture quiet, so a difference means what the test says
+            // it means.
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .current_dir(&repo)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
