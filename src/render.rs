@@ -313,6 +313,24 @@ pub fn run_json(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let (columns, buckets_per_column) = pane_geometry(config);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    let document = json_document(config, as_of, columns, buckets_per_column, &activity);
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    Ok(())
+}
+
+/// Builds the `--json` document from already-loaded activity.
+///
+/// Pulled out of [`run_json`] as a pure function so the gap/quiet distinction —
+/// `null` in `series` for a gap, `0` for an observed-but-idle bucket — is
+/// checkable directly against a hand-built [`WorkspaceActivity`], without going
+/// through the history store or a subprocess.
+pub fn json_document(
+    config: &Config,
+    as_of: u64,
+    columns: usize,
+    buckets_per_column: usize,
+    activity: &[WorkspaceActivity],
+) -> Value {
     let tolerance = staleness_tolerance(config);
 
     let workspaces: Vec<Value> = activity
@@ -349,7 +367,7 @@ pub fn run_json(config: &Config) -> Result<()> {
         })
         .collect();
 
-    let document = json!({
+    json!({
         "as_of": as_of,
         "bucket_seconds": config.bucket_seconds,
         "columns": columns,
@@ -358,9 +376,7 @@ pub fn run_json(config: &Config) -> Result<()> {
         "staleness_tolerance_seconds": tolerance,
         "level_max": Level::MAX,
         "workspaces": workspaces,
-    });
-    println!("{}", serde_json::to_string_pretty(&document)?);
-    Ok(())
+    })
 }
 
 /// `--watch`: the pane, redrawn on an interval, reading the history the daemon

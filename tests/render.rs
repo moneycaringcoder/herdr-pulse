@@ -13,8 +13,8 @@ use std::time::Duration;
 use pulse::config::Config;
 use pulse::model::{AgentState, Level, WorkspaceActivity};
 use pulse::render::{
-    badge, display_width, duration, pane, pane_geometry, sparkline, staleness_tolerance,
-    state_glyph, GAP, QUIET, RAMP,
+    badge, display_width, duration, json_document, pane, pane_geometry, sparkline,
+    staleness_tolerance, state_glyph, GAP, QUIET, RAMP,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -1085,5 +1085,34 @@ fn the_gap_glyph_survives_a_badge_round_trip() {
     assert!(
         rendered.contains(GAP),
         "trailing gaps vanished from {rendered:?}"
+    );
+}
+
+/// The `--json` document must carry the same gap/quiet distinction the pane
+/// draws with glyphs, but in the JSON type rather than in a sentinel number: a
+/// gap is `null`, an observed-but-idle bucket is `0`. A consumer that flattens
+/// the two — treating `null` as `0` — gets exactly the wrong answer this plugin
+/// exists to prevent, so the distinction has to survive serialisation, not just
+/// live in `WorkspaceActivity::series`.
+#[test]
+fn json_series_tells_a_gap_from_an_observed_quiet_bucket() {
+    let config = Config::default();
+    let series = vec![None, Some(Level::new(0)), Some(Level::new(5))];
+    let workspace = activity("w1", series, AgentState::Idle, None, 1);
+
+    let document = json_document(&config, AS_OF, 3, 1, &[workspace]);
+    let series = &document["workspaces"][0]["series"];
+
+    assert!(
+        series[0].is_null(),
+        "a gap must serialise as JSON null, not 0: {series}"
+    );
+    assert_eq!(
+        series[1], 0,
+        "an observed quiet bucket must serialise as 0, not null: {series}"
+    );
+    assert_eq!(
+        series[2], 5,
+        "an observed active bucket lost its level: {series}"
     );
 }
