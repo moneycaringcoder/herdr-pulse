@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-16
+
 ### Added
 
 - A background sampler that records every agent's lifecycle state from herdr's
@@ -40,4 +42,5 @@ against a live server, and both shaped the design:
 
 Both are written up in `docs/herdr-protocol.md`.
 
-[Unreleased]: https://github.com/moneycaringcoder/herdr-pulse
+[Unreleased]: https://github.com/moneycaringcoder/herdr-pulse/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/moneycaringcoder/herdr-pulse/releases/tag/v0.1.0
