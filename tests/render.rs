@@ -16,6 +16,7 @@ use pulse::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActiv
 use pulse::render::{
     badge, display_width, duration, json_document, pane, pane_geometry, sampler_stop_message,
     sparkline, staleness_tolerance, state_glyph, week_pane, SamplerState, GAP, QUIET, RAMP,
+    TRANSITION_MARKER,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -30,6 +31,10 @@ fn activity(
     state_for: Option<u64>,
     agent_count: usize,
 ) -> WorkspaceActivity {
+    let transitions = series
+        .iter()
+        .map(|level| level.as_ref().map(|_| 0))
+        .collect();
     WorkspaceActivity {
         workspace_id: format!("w-{label}"),
         label: label.to_string(),
@@ -46,11 +51,16 @@ fn activity(
         // it: the pane tests are about the fine series, and an unset coarse ring
         // must not change what they see.
         week: vec![None; pulse::config::WEEK_COLUMNS],
+        week_transitions: vec![None; pulse::config::WEEK_COLUMNS],
         week_blocked_seconds: 0,
         week_watched_seconds: 0,
         // No per-agent rings unless a test asks: the sampler only records them
         // when the user turns them on.
         agents: Vec::new(),
+        // Observed columns with nothing moving in them, so a test that says
+        // nothing about transitions gets no markers rather than an accidental
+        // one. `with_transitions` sets them where a test means to.
+        transitions,
     }
 }
 
@@ -63,14 +73,49 @@ fn agent(
     blocked_seconds: u64,
     watched_seconds: u64,
 ) -> AgentActivity {
+    let transitions = series
+        .iter()
+        .map(|level| level.as_ref().map(|_| 0))
+        .collect();
     AgentActivity {
         pane_id: pane_id.to_string(),
         program: program.map(str::to_string),
         state,
+        transitions,
         series,
         last_seen: AS_OF - seen_ago,
         blocked_seconds,
         watched_seconds,
+    }
+}
+
+/// Marks transitions on a workspace row, column for column with its series.
+fn with_transitions(
+    activity: WorkspaceActivity,
+    transitions: Vec<Option<u32>>,
+) -> WorkspaceActivity {
+    WorkspaceActivity {
+        transitions,
+        ..activity
+    }
+}
+
+/// Marks transitions on the week row, column for column with its series.
+fn with_week_transitions(
+    activity: WorkspaceActivity,
+    transitions: Vec<Option<u32>>,
+) -> WorkspaceActivity {
+    WorkspaceActivity {
+        week_transitions: transitions,
+        ..activity
+    }
+}
+
+/// Marks transitions on an individual agent row.
+fn with_agent_transitions(agent: AgentActivity, transitions: Vec<Option<u32>>) -> AgentActivity {
+    AgentActivity {
+        transitions,
+        ..agent
     }
 }
 
@@ -163,6 +208,22 @@ fn agent_row_for<'a>(rendered: &'a str, label: &str) -> &'a str {
                 .is_some_and(|line| line.starts_with(label))
         })
         .unwrap_or_else(|| panic!("no indented row for {label:?} in\n{rendered}"))
+}
+
+fn line_after<'a>(rendered: &'a str, row: &str) -> Option<&'a str> {
+    let start = rendered.find(row)?.checked_add(row.len())?;
+    rendered[start..].strip_prefix('\n')?.lines().next()
+}
+
+fn marked_columns(row: &str, marker_line: &str) -> Vec<usize> {
+    let bracket = row
+        .rfind('[')
+        .unwrap_or_else(|| panic!("no sparkline in {row:?}"));
+    let first_column = display_width(&row[..bracket]) + 1;
+    marker_line
+        .match_indices(TRANSITION_MARKER)
+        .map(|(at, _)| display_width(&marker_line[..at]) - first_column)
+        .collect()
 }
 
 fn levels(raw: &[u8]) -> Vec<Option<Level>> {
@@ -932,6 +993,110 @@ fn pane_columns_line_up_when_sparklines_contain_gaps() {
 }
 
 #[test]
+fn a_marked_workspace_emits_an_aligned_line_below_its_sparkline() {
+    let rendered = sample_pane(vec![with_transitions(
+        activity("web", levels(&[1, 2, 3, 4]), AgentState::Idle, Some(5), 1),
+        vec![Some(0), Some(5), Some(0), Some(1)],
+    )]);
+    let row = row_for(&rendered, "web");
+    let markers =
+        line_after(&rendered, row).unwrap_or_else(|| panic!("no marker line after {row:?}"));
+
+    assert_eq!(marked_columns(row, markers), [1, 3], "\n{rendered}");
+    assert_eq!(
+        format!("{row}\n{markers}"),
+        concat!(
+            "web        [▁▂▃▄]    ?        - idle  0s       5s   0s    1\n",
+            "             ^ ^"
+        )
+    );
+    assert!(
+        rendered.contains("^ busiest observed changes, not every change"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_row_without_observed_transitions_emits_no_marker_line_or_legend_clause() {
+    let rendered = sample_pane(vec![activity(
+        "still",
+        levels(&[1, 2, 3]),
+        AgentState::Working,
+        Some(4),
+        1,
+    )]);
+
+    assert!(!rendered.contains(TRANSITION_MARKER), "{rendered}");
+    assert!(!rendered.contains("busiest observed changes"), "{rendered}");
+}
+
+#[test]
+fn no_more_than_three_transition_columns_are_marked_and_newest_ties_win() {
+    let rendered = sample_pane(vec![with_transitions(
+        activity(
+            "busy",
+            levels(&[1, 1, 1, 1, 1, 1]),
+            AgentState::Working,
+            Some(4),
+            1,
+        ),
+        vec![Some(2); 6],
+    )]);
+    let row = row_for(&rendered, "busy");
+    let markers =
+        line_after(&rendered, row).unwrap_or_else(|| panic!("no marker line after {row:?}"));
+
+    assert_eq!(markers.matches(TRANSITION_MARKER).count(), 3, "{markers:?}");
+    assert_eq!(marked_columns(row, markers), [3, 4, 5], "\n{rendered}");
+}
+
+#[test]
+fn an_unobserved_column_is_never_marked_between_observed_neighbours() {
+    let rendered = sample_pane(vec![with_transitions(
+        activity(
+            "gapped",
+            vec![Some(Level(4)), None, Some(Level(4))],
+            AgentState::Working,
+            Some(4),
+            1,
+        ),
+        vec![Some(3), None, Some(2)],
+    )]);
+    let row = row_for(&rendered, "gapped");
+    let markers =
+        line_after(&rendered, row).unwrap_or_else(|| panic!("no marker line after {row:?}"));
+
+    assert_eq!(marked_columns(row, markers), [0, 2], "\n{rendered}");
+    assert!(row.contains(&format!("[▄{GAP}▄]")), "{row:?}");
+}
+
+#[test]
+fn transition_markers_align_with_multibyte_sparklines_and_a_long_label() {
+    let rendered = sample_pane(vec![with_transitions(
+        activity(
+            "日本語のとても長いワークスペース名",
+            levels(&[1, 2, 3, 4]),
+            AgentState::Working,
+            Some(4),
+            1,
+        ),
+        vec![Some(0), Some(0), Some(7), Some(0)],
+    )]);
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("[▁▂▃▄]"))
+        .unwrap_or_else(|| panic!("no workspace row in\n{rendered}"));
+    let markers =
+        line_after(&rendered, row).unwrap_or_else(|| panic!("no marker line after {row:?}"));
+
+    assert_eq!(marked_columns(row, markers), [2], "\n{rendered}");
+    assert_eq!(
+        display_width(&markers[..markers.find(TRANSITION_MARKER).unwrap()]),
+        display_width(&row[..row.rfind('[').unwrap()]) + 3
+    );
+}
+
+#[test]
 fn agent_rows_follow_their_workspace_in_most_recent_order() {
     let live = session("live", 13 * 3_600 + 28 * 60);
     let workspace = recorded_by(
@@ -1014,6 +1179,42 @@ fn an_agent_that_appeared_late_keeps_gaps_before_its_first_bar() {
         row.contains(&format!("[{GAP}{GAP}{QUIET}█]")),
         "absence before appearance became observed quiet: {row:?}"
     );
+}
+
+#[test]
+fn an_agent_row_gets_its_own_transition_markers() {
+    let workspace = with_agents(
+        activity(
+            "web",
+            levels(&[8, 8, 8, 8]),
+            AgentState::Working,
+            Some(1),
+            1,
+        ),
+        vec![with_agent_transitions(
+            agent(
+                "pane-1",
+                Some("claude"),
+                levels(&[1, 2, 3, 4]),
+                AgentState::Working,
+                1,
+                0,
+                120,
+            ),
+            vec![Some(0), Some(4), Some(0), Some(2)],
+        )],
+    );
+    let rendered = sample_pane(vec![workspace]);
+    let workspace_row = row_for(&rendered, "web");
+    let agent_row = agent_row_for(&rendered, "claude");
+    let markers = line_after(&rendered, agent_row)
+        .unwrap_or_else(|| panic!("no marker line after {agent_row:?}"));
+
+    assert!(
+        !line_after(&rendered, workspace_row).is_some_and(|line| line.contains(TRANSITION_MARKER)),
+        "the aggregate borrowed its agent's marks:\n{rendered}"
+    );
+    assert_eq!(marked_columns(agent_row, markers), [1, 3], "\n{rendered}");
 }
 
 #[test]
@@ -1612,6 +1813,31 @@ fn the_week_pane_draws_the_week_series_instead_of_the_fine_series() {
 }
 
 #[test]
+fn the_week_pane_marks_week_transitions_not_the_fine_windows_transitions() {
+    let mut workspace = with_transitions(
+        activity(
+            "web",
+            levels(&[8, 8, 8, 8]),
+            AgentState::Working,
+            Some(60),
+            1,
+        ),
+        vec![Some(9), Some(0), Some(0), Some(0)],
+    );
+    workspace.week = levels(&[8; WEEK_COLUMNS]);
+    let mut week_transitions = vec![Some(0); WEEK_COLUMNS];
+    week_transitions[5] = Some(2);
+    let workspace = with_week_transitions(workspace, week_transitions);
+
+    let rendered = week_pane(&[workspace], &Config::default(), AS_OF, None);
+    let row = row_for(&rendered, "web");
+    let markers =
+        line_after(&rendered, row).unwrap_or_else(|| panic!("no marker line after {row:?}"));
+
+    assert_eq!(marked_columns(row, markers), [5], "\n{rendered}");
+}
+
+#[test]
 fn the_week_pane_keeps_a_gap_distinct_from_an_observed_quiet_hour() {
     let mut workspace = activity("web", levels(&[8]), AgentState::Idle, Some(60), 1);
     workspace.week = vec![None; WEEK_COLUMNS];
@@ -1878,6 +2104,7 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     let series = vec![None, Some(Level::new(0)), Some(Level::new(5))];
     let mut workspace = activity("w1", series, AgentState::Idle, None, 1);
     workspace.week = vec![Some(Level::new(0)), None, Some(Level::new(8))];
+    workspace.week_transitions = vec![Some(0), None, Some(0)];
 
     let document = json_document(&config, AS_OF, 3, 1, &[workspace], None, running());
     let series = &document["workspaces"][0]["series"];
@@ -1912,6 +2139,58 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
 }
 
 #[test]
+fn json_carries_workspace_week_and_agent_transition_arrays_with_nulls_intact() {
+    let mut workspace = with_transitions(
+        activity(
+            "w1",
+            vec![None, Some(Level::new(0)), Some(Level::new(5))],
+            AgentState::Working,
+            Some(30),
+            1,
+        ),
+        vec![None, Some(0), Some(7)],
+    );
+    workspace.week = vec![Some(Level::new(4)), None, Some(Level::new(8))];
+    workspace.week_transitions = vec![Some(1), None, Some(0)];
+    let workspace = with_agents(
+        workspace,
+        vec![with_agent_transitions(
+            agent(
+                "pane-7",
+                Some("claude"),
+                vec![None, Some(Level::new(4)), Some(Level::new(4))],
+                AgentState::Working,
+                7,
+                0,
+                120,
+            ),
+            vec![None, Some(3), Some(0)],
+        )],
+    );
+
+    let document = json_document(
+        &Config::default(),
+        AS_OF,
+        3,
+        1,
+        &[workspace],
+        None,
+        running(),
+    );
+    let workspace = &document["workspaces"][0];
+
+    assert_eq!(workspace["transitions"], serde_json::json!([null, 0, 7]));
+    assert_eq!(
+        workspace["week_transitions"],
+        serde_json::json!([1, null, 0])
+    );
+    assert_eq!(
+        workspace["agents"][0]["transitions"],
+        serde_json::json!([null, 3, 0])
+    );
+}
+
+#[test]
 fn json_carries_each_agent_series_without_flattening_its_gaps() {
     let workspace = with_agents(
         activity("w1", levels(&[8, 8, 8]), AgentState::Working, Some(30), 1),
@@ -1943,6 +2222,7 @@ fn json_carries_each_agent_series_without_flattening_its_gaps() {
             "program": "claude",
             "state": "working",
             "series": [null, 0, 8],
+            "transitions": [null, 0, 0],
             "last_seen": AS_OF - 7,
             // The same two fields the workspace object carries: a consumer
             // reading `"state":"working"` otherwise has no way to see how old

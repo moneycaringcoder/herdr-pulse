@@ -308,6 +308,20 @@ pub struct WorkspaceActivity {
     /// unless `per_agent_series` is on. The workspace's own series stays whatever
     /// it was: these are beside it, not instead of it.
     pub agents: Vec<AgentActivity>,
+    /// Transitions observed in each column of [`Self::series`], `None` where the
+    /// column was not watched.
+    ///
+    /// A sparkline column says how busy the workspace was; this says whether
+    /// anything *changed* inside it — the agent that went blocked halfway through
+    /// a column that still reads as work. `Some(0)` is "watched, nothing moved";
+    /// `None` is "nobody watched", and marking it would put a moment on screen
+    /// that nobody observed.
+    pub transitions: Vec<Option<u32>>,
+    /// The same per-column counts over the week series, so a week row can mark
+    /// the week's changes rather than this afternoon's — the two rings cover
+    /// different stretches and a mark from one under the other's sparkline
+    /// points at a moment the reader is not looking at.
+    pub week_transitions: Vec<Option<u32>>,
 }
 
 /// One agent's own series inside a workspace, when the sampler is recording
@@ -339,6 +353,9 @@ pub struct AgentActivity {
     /// with the same rule: a gap is in neither total.
     pub blocked_seconds: u64,
     pub watched_seconds: u64,
+    /// This agent's own transitions per column, same rules as
+    /// [`WorkspaceActivity::transitions`].
+    pub transitions: Vec<Option<u32>>,
 }
 
 impl WorkspaceActivity {

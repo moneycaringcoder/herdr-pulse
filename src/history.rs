@@ -268,19 +268,79 @@ impl<'a> RingRef<'a> {
         Some(Level::new(((total + observed / 2) / observed) as u8))
     }
 
+    /// The absolute buckets one output column covers, or `None` when the column
+    /// describes no bucket this ring holds.
+    ///
+    /// One copy, because there are three projections over these columns now —
+    /// the levels, the transitions and the blocked totals — and the module's
+    /// whole reason for having a ring type is that a second copy of the lap edge
+    /// is a second place for it to go wrong. A drift between two of them would
+    /// show up as a mark under the wrong minute, which is precisely the class of
+    /// error nobody can see.
+    fn column_range(
+        &self,
+        newest_wanted: u64,
+        columns: usize,
+        column: usize,
+        per_column: u64,
+    ) -> Option<(u64, u64)> {
+        let len = self.buckets.len() as u64;
+        if len == 0 {
+            return None;
+        }
+        // Oldest first: column 0 is the furthest back, and the last column is
+        // the one containing `newest_wanted`.
+        let back = ((columns - 1 - column) as u64).saturating_mul(per_column.max(1));
+        // A column entirely before the epoch is not a column.
+        let last = newest_wanted.checked_sub(back)?;
+        let first = last.saturating_sub(per_column.max(1) - 1);
+        // Clamped to the live lap: a slot from a previous lap is not this
+        // column's data, however happily `number % len` hands it over.
+        let first = first.max(self.newest.saturating_sub(len - 1));
+        let last = last.min(self.newest);
+        (first <= last).then_some((first, last))
+    }
+
     /// Every column of a series, oldest first, ending with the bucket containing
     /// `newest_wanted`.
     fn series(&self, newest_wanted: u64, columns: usize, per_column: u64) -> Vec<Option<Level>> {
-        let per_column = per_column.max(1);
         (0..columns)
             .map(|column| {
-                // Oldest first: column 0 is the furthest back, and the last
-                // column is the one containing `newest_wanted`.
-                let back = ((columns - 1 - column) as u64).saturating_mul(per_column);
-                // A column entirely before the epoch is not a column.
-                let last = newest_wanted.checked_sub(back)?;
-                let first = last.saturating_sub(per_column - 1);
+                let (first, last) =
+                    self.column_range(newest_wanted, columns, column, per_column)?;
                 self.column(first, last)
+            })
+            .collect()
+    }
+
+    /// Transitions observed in each column, oldest first, `None` for a column
+    /// nobody watched.
+    ///
+    /// The distinction the `Option` carries is the whole point. A column with
+    /// observed buckets and no movement in them is `Some(0)`: we watched, and
+    /// nothing changed. A column nobody watched is `None`, and a renderer that
+    /// marked it would be drawing a moment it inferred rather than one anybody
+    /// saw — which is the invention this module exists to refuse, in a new place.
+    ///
+    /// Shares [`Self::column_range`] with [`Self::series`], so the two answers
+    /// are `Some` and `None` in exactly the same columns by construction rather
+    /// than by two copies of the same arithmetic agreeing.
+    fn transitions(&self, newest_wanted: u64, columns: usize, per_column: u64) -> Vec<Option<u32>> {
+        (0..columns)
+            .map(|column| {
+                let (first, last) =
+                    self.column_range(newest_wanted, columns, column, per_column)?;
+                let mut total = 0u32;
+                let mut observed = false;
+                for number in first..=last {
+                    let bucket = self.bucket(number);
+                    if !bucket.observed() {
+                        continue;
+                    }
+                    observed = true;
+                    total = total.saturating_add(u32::from(bucket.transitions));
+                }
+                observed.then_some(total)
             })
             .collect()
     }
@@ -1482,6 +1542,7 @@ impl History {
                             last_seen: agent.last_seen,
                             blocked_seconds,
                             watched_seconds,
+                            transitions: ring.transitions(newest, columns, per_column),
                         }
                     })
                     .collect();
@@ -1489,6 +1550,12 @@ impl History {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
                     series,
+                    transitions: workspace.fine().transitions(newest, columns, per_column),
+                    week_transitions: workspace.week().transitions(
+                        week_newest,
+                        crate::config::WEEK_COLUMNS,
+                        crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
+                    ),
                     state: AgentState::parse(&workspace.state),
                     // Measured to the last observation, never to `as_of`. The
                     // difference is the whole point: an agent that was working

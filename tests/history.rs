@@ -1621,6 +1621,184 @@ fn one_pane_id_reported_twice_is_absorbed_once() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Transitions per column
+// ---------------------------------------------------------------------------
+
+/// The transition counts for the first workspace, one column per bucket.
+fn marks(history: &History, as_of: u64, columns: usize, config: &Config) -> Vec<Option<u32>> {
+    history.activity(as_of, columns, 1, config)[0]
+        .transitions
+        .clone()
+}
+
+#[test]
+fn a_column_counts_the_movements_observed_inside_it() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Four samples in one minute; the agent's seq moves on two of them.
+    for (step, seq) in [(0u64, 10u64), (1, 10), (2, 11), (3, 12)] {
+        history.record(
+            &one(T0 + step * 15, "w15", "api", &[("w15:p1", "working", seq)]),
+            &config,
+        );
+    }
+
+    assert_eq!(
+        marks(&history, T0, 1, &config),
+        vec![Some(2)],
+        "two movements were seen, and a first sighting is not one of them"
+    );
+}
+
+#[test]
+fn a_watched_column_with_nothing_moving_is_zero_and_not_unknown() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for step in 0..4u64 {
+        history.record(
+            &one(T0 + step * 15, "w15", "api", &[("w15:p1", "working", 10)]),
+            &config,
+        );
+    }
+
+    // The difference a renderer needs: nothing moved *and we were looking*.
+    assert_eq!(marks(&history, T0, 1, &config), vec![Some(0)]);
+}
+
+#[test]
+fn a_column_nobody_watched_has_no_transition_count_at_all() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Minute 0 and minute 3 watched, the two between not.
+    for minute in [0u64, 3] {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    let marks = marks(&history, T0 + 3 * 60, 4, &config);
+    assert_eq!(
+        marks,
+        vec![Some(0), None, None, Some(1)],
+        "a gap has no count to draw a mark from: inferring one would put a \
+         moment on screen that nobody observed"
+    );
+}
+
+#[test]
+fn a_wide_column_sums_the_movements_of_the_buckets_it_covers() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..4u64 {
+        for step in 0..2u64 {
+            history.record(
+                &one(
+                    T0 + minute * 60 + step * 30,
+                    "w15",
+                    "api",
+                    &[("w15:p1", "working", 10 + minute * 2 + step)],
+                ),
+                &config,
+            );
+        }
+    }
+
+    // Two columns of two minutes each. Every sample after the first moved.
+    let activity = &history.activity(T0 + 3 * 60, 2, 2, &config)[0];
+    assert_eq!(activity.transitions, vec![Some(3), Some(4)]);
+}
+
+#[test]
+fn each_agent_counts_only_its_own_movements() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // One agent changes state every sample; the other never does.
+    for step in 0..4u64 {
+        history.record(
+            &crowd(
+                T0 + step * 15,
+                &[("w15:p1", "working", 10 + step), ("w15:p2", "idle", 500)],
+            ),
+            &config,
+        );
+    }
+
+    let activity = &history.activity(T0, 1, 1, &config)[0];
+    let busy = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p1")
+        .expect("the moving agent");
+    let still = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the still agent");
+
+    assert_eq!(busy.transitions, vec![Some(3)]);
+    assert_eq!(
+        still.transitions,
+        vec![Some(0)],
+        "the workspace moved, this agent did not, and the rows must not say the \
+         same thing"
+    );
+}
+
+#[test]
+fn the_levels_and_the_transitions_describe_the_same_columns() {
+    // The two projections walk the same columns, and a renderer marks a column
+    // only if both agree it was watched. If they ever disagreed the mark would
+    // land under a minute the sparkline says nobody saw — so they share one
+    // derivation, and this is what says so.
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    // A wrapped ring with a hole in the middle: sixteen minutes through an
+    // eight-bucket ring, skipping three of them.
+    for minute in 0..16u64 {
+        if (7..10).contains(&minute) {
+            continue;
+        }
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    for (as_of, columns, per_column) in [
+        (T0 + 15 * 60, 8, 1),
+        (T0 + 15 * 60, 4, 2),
+        (T0 + 15 * 60, 32, 1),
+        (T0 + 40 * 60, 8, 1),
+        (T0, 8, 1),
+    ] {
+        let activity = &history.activity(as_of, columns, per_column, &config)[0];
+        assert_eq!(
+            activity.series.len(),
+            activity.transitions.len(),
+            "as_of {as_of}, {columns}x{per_column}"
+        );
+        let series_shape: Vec<bool> = activity.series.iter().map(Option::is_some).collect();
+        let marks_shape: Vec<bool> = activity.transitions.iter().map(Option::is_some).collect();
+        assert_eq!(
+            series_shape, marks_shape,
+            "as_of {as_of}, {columns}x{per_column}: a column is watched in one \
+             projection and not the other"
+        );
+    }
+}
+
 #[test]
 fn turning_per_agent_series_off_drops_the_rings_rather_than_freezing_them() {
     let recording = per_agent(60, 16, 4);
