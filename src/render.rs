@@ -204,16 +204,25 @@ pub fn duration(seconds: Option<u64>) -> String {
         ">99d".to_string()
     }
 }
-/// Explains why there is no live sampler, or returns `None` while one is live.
+
+/// Explains why there is no live sampler, or returns `None` when there is
+/// nothing recorded to explain.
 ///
 /// The stop time is measured against `as_of` rather than the wall clock so the
-/// pane, JSON document, and explanation all describe the same instant. A future
-/// timestamp saturates to `0s` instead of underflowing.
+/// pane, the JSON document and this line all describe the same instant.
+///
+/// A stamp *ahead* of `as_of` is dropped rather than saturated. The marker
+/// outlives reboots, and an RTC read as local time or an NTP step easily puts it
+/// in the future; saturating would print "0s ago", which is both invented and
+/// the most reassuring value in the range — it reads as "you just did this" to
+/// the one reader who is deciding how much of an empty sparkline to believe. No
+/// age at all is what the module already prints for an age it cannot establish.
 pub fn sampler_stop_message(stop: Option<&daemon::SamplerStop>, as_of: u64) -> Option<String> {
     let stop = stop?;
     let age = stop
         .at
-        .map(|at| format!(" {} ago", duration(Some(as_of.saturating_sub(at)))))
+        .filter(|at| *at <= as_of)
+        .map(|at| format!(" {} ago", duration(Some(as_of - at))))
         .unwrap_or_default();
     let reason = match stop.reason {
         daemon::StopReason::Disabled => format!("disabled{age}"),
@@ -233,6 +242,19 @@ pub fn sampler_stop_message(stop: Option<&daemon::SamplerStop>, as_of: u64) -> O
     Some(format!(
         "no sampler is running — {reason}; nothing since then is recorded."
     ))
+}
+
+/// What a report should say about the sampler.
+///
+/// The two halves are separate because they are separate questions with
+/// different evidence behind them: whether one is live now, and why the last one
+/// stopped. A machine that has never started a sampler answers the first and has
+/// nothing to say about the second, so deriving either from the other would
+/// either claim a run died or claim one is running.
+#[derive(Clone, Copy)]
+pub struct SamplerState<'a> {
+    pub running: bool,
+    pub stop: Option<&'a daemon::SamplerStop>,
 }
 
 #[derive(Clone, Copy)]
@@ -466,7 +488,10 @@ pub fn run_json(config: &Config) -> Result<()> {
         buckets_per_column,
         &activity,
         session.as_ref(),
-        stop.as_ref(),
+        SamplerState {
+            running: sampler_is_running(),
+            stop: stop.as_ref(),
+        },
     );
     println!("{}", serde_json::to_string_pretty(&document)?);
     Ok(())
@@ -489,24 +514,25 @@ pub fn json_document(
     buckets_per_column: usize,
     activity: &[WorkspaceActivity],
     session: Option<&SessionMark>,
-    stop: Option<&daemon::SamplerStop>,
+    sampler: SamplerState<'_>,
 ) -> Value {
     let tolerance = staleness_tolerance(config);
 
-    let sampler = match stop {
-        Some(stop) => json!({
-            "running": false,
-            "stopped": {
+    // `running` and `stopped` answer different questions and are read from
+    // different places. A machine where no sampler was ever started is not
+    // running and has no stop to report, and reading one from the other would
+    // either claim a run died or claim one is live.
+    let sampler = json!({
+        "running": sampler.running,
+        "stopped": match sampler.stop {
+            Some(stop) => json!({
                 "reason": stop.reason.as_str(),
                 "at": stop.at,
                 "detail": stop.detail.as_deref(),
-            },
-        }),
-        None => json!({
-            "running": true,
-            "stopped": Value::Null,
-        }),
-    };
+            }),
+            None => Value::Null,
+        },
+    });
 
     let workspaces: Vec<Value> = activity
         .iter()
@@ -590,9 +616,8 @@ pub fn json_document(
 /// writes. Must degrade with a clear message when no sampler is running, rather
 /// than showing an empty pane that looks like a quiet session.
 pub fn run_watch(config: &Config) -> Result<()> {
-    let as_of = crate::now_unix();
-    if let Some(stop) = current_sampler_stop() {
-        return Err(no_sampler_error(&stop, as_of).into());
+    if !sampler_is_running() {
+        return Err(no_sampler_error(current_sampler_stop().as_ref(), crate::now_unix()).into());
     }
 
     let (columns, buckets_per_column) = pane_geometry(config);
@@ -601,10 +626,16 @@ pub fn run_watch(config: &Config) -> Result<()> {
         // Re-checked every cycle, not just at startup. A sampler that dies under
         // a running watch would otherwise leave the last frame on screen for
         // hours, ageing into a confident lie.
-        if let Some(stop) = current_sampler_stop() {
+        //
+        // Liveness is the gate rather than the stop report, because a machine
+        // that never started a sampler has nothing to report and still has
+        // nothing to watch.
+        if !sampler_is_running() {
             write!(out, "{CLEAR}")?;
             out.flush()?;
-            return Err(no_sampler_error(&stop, crate::now_unix()).into());
+            return Err(
+                no_sampler_error(current_sampler_stop().as_ref(), crate::now_unix()).into(),
+            );
         }
 
         let as_of = crate::now_unix();
@@ -627,27 +658,41 @@ pub fn run_watch(config: &Config) -> Result<()> {
     }
 }
 
-fn no_sampler_error(stop: &daemon::SamplerStop, as_of: u64) -> String {
-    let message =
-        sampler_stop_message(Some(stop), as_of).expect("a sampler stop always has an explanation");
+/// The `--watch` failure message: why there is nothing to watch.
+///
+/// The reason is optional because "no sampler is running" is answerable on a
+/// machine that has never started one, while "why did the last one stop" is not.
+/// Without a recorded reason the message says only what is known.
+fn no_sampler_error(stop: Option<&daemon::SamplerStop>, as_of: u64) -> String {
+    let message = sampler_stop_message(stop, as_of)
+        .unwrap_or_else(|| "no sampler is running, so there is nothing live to watch.".to_string());
     format!(
         "{message} Start it with `pulse --enable`, or use `pulse --once` to read what was recorded earlier"
     )
 }
 
-/// Returns the recorded stop reason, with an honest fallback for a sampler that
-/// disappeared before it could leave a marker. The second live check closes the
-/// race where a sampler starts after [`daemon::stop_report`] finds no marker.
+/// The recorded reason the sampler is not running, or `None` when there is
+/// nothing to explain.
+///
+/// A thin pass-through, and deliberately nothing more. [`daemon::stop_report`]
+/// already answers all three cases — a live daemon, a recorded stop, and a run
+/// that died without a word — and its third answer is `None` for a machine where
+/// no sampler was ever started. Inventing an "unknown stop" here would put "the
+/// last run stopped for an unknown reason" under the pane on a fresh install,
+/// directly beside the pane's own "start the sampler with `pulse --enable`":
+/// two lines contradicting each other, and a `--json` consumer told a run died
+/// where none ever ran.
 fn current_sampler_stop() -> Option<daemon::SamplerStop> {
-    match daemon::stop_report() {
-        Some(stop) => Some(stop),
-        None if daemon::live_pid().is_some() => None,
-        None => Some(daemon::SamplerStop {
-            reason: daemon::StopReason::Unknown,
-            at: None,
-            detail: None,
-        }),
-    }
+    daemon::stop_report()
+}
+
+/// Whether a sampler is live right now.
+///
+/// Asked separately from [`current_sampler_stop`] because they are different
+/// questions: "is one running" has an answer on a machine that has never run
+/// one, and "why did the last one stop" does not.
+fn sampler_is_running() -> bool {
+    daemon::live_pid().is_some()
 }
 
 /// How many pane columns to ask the store for, and how many buckets each one

@@ -46,7 +46,6 @@
 //! sampling intervals, 15 s at the default — and nothing shorter.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -126,17 +125,6 @@ impl StopReason {
     }
 }
 
-impl fmt::Display for StopReason {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        out.write_str(match self {
-            Self::Disabled => "disabled",
-            Self::Terminated => "terminated",
-            Self::Failed => "ended unexpectedly",
-            Self::Unknown => "stopped for an unknown reason",
-        })
-    }
-}
-
 /// What happened to the last sampler run, and when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplerStop {
@@ -162,14 +150,18 @@ fn record_stop(reason: StopReason, detail: Option<&str>) {
     let _ = fs::write(config::stop_marker(), line);
 }
 
-/// Detail is written into a line-delimited marker, so it has to stay on one
-/// line. A panic message carrying a newline would otherwise make the file
-/// unparseable and lose the reason along with it.
+/// Squeezes a detail onto one line, because the marker is line-delimited and a
+/// newline in the middle of it would make the file unparseable — losing the
+/// reason along with the detail.
+///
+/// Folded, not truncated at the first newline. `std`'s panic message is
+/// *always* `panicked at <location>:\n<payload>`, so cutting at the newline
+/// keeps the file and line and throws away the message every single time — a
+/// marker reading `(panicked at src/daemon.rs:412:9:)` with nothing after the
+/// colon, in the one place a detached daemon can still say what happened.
 fn one_line(detail: &str) -> String {
-    detail
-        .lines()
-        .next()
-        .unwrap_or("")
+    let folded = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    folded
         .chars()
         .filter(|ch| !ch.is_control())
         .take(200)
@@ -239,9 +231,38 @@ fn read_stop_marker() -> Option<SamplerStop> {
 fn install_panic_reporter() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        record_stop(StopReason::Failed, Some(&info.to_string()));
+        record_stop(StopReason::Failed, Some(&panic_detail(info)));
         previous(info);
     }));
+}
+
+/// A panic as one line, message first.
+///
+/// `PanicHookInfo`'s own `Display` puts the location first and the payload after
+/// a newline, and the detail field is capped — so relying on it spends the whole
+/// budget on a file and line and truncates away the sentence that says what
+/// went wrong. The payload is what a reader needs first; the location follows it
+/// for whoever goes looking in the source.
+fn panic_detail(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panicked".to_string());
+    match info.location() {
+        Some(location) => format!("{payload} (at {}:{})", location.file(), location.line()),
+        None => payload,
+    }
+}
+
+/// Records a run that ended on something it could not continue past.
+///
+/// Public because the exits that reach it are not all inside this module — and
+/// because a test cannot construct a `PanicHookInfo`, so this is the only seam
+/// where the marker's handling of a real panic string can be pinned.
+pub fn record_failure(detail: &str) {
+    record_stop(StopReason::Failed, Some(detail));
 }
 
 pub fn enable(args: &[String]) -> Result<()> {

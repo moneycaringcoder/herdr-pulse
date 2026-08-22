@@ -15,7 +15,7 @@ use pulse::daemon::{SamplerStop, StopReason};
 use pulse::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
     badge, display_width, duration, json_document, pane, pane_geometry, sampler_stop_message,
-    sparkline, staleness_tolerance, state_glyph, week_pane, GAP, QUIET, RAMP,
+    sparkline, staleness_tolerance, state_glyph, week_pane, SamplerState, GAP, QUIET, RAMP,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -50,6 +50,31 @@ fn session(fingerprint: &str, began: u64) -> SessionMark {
     SessionMark {
         fingerprint: fingerprint.to_string(),
         began,
+    }
+}
+
+/// A sampler that is live: nothing to explain.
+fn running() -> SamplerState<'static> {
+    SamplerState {
+        running: true,
+        stop: None,
+    }
+}
+
+/// A machine where no sampler was ever started: not running, and no stop to
+/// report. The two are separate facts, and this is the pair that catches a
+/// document deriving one from the other.
+fn never_ran() -> SamplerState<'static> {
+    SamplerState {
+        running: false,
+        stop: None,
+    }
+}
+
+fn stopped(stop: &SamplerStop) -> SamplerState<'_> {
+    SamplerState {
+        running: false,
+        stop: Some(stop),
     }
 }
 
@@ -1435,7 +1460,7 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     let mut workspace = activity("w1", series, AgentState::Idle, None, 1);
     workspace.week = vec![Some(Level::new(0)), None, Some(Level::new(8))];
 
-    let document = json_document(&config, AS_OF, 3, 1, &[workspace], None, None);
+    let document = json_document(&config, AS_OF, 3, 1, &[workspace], None, running());
     let series = &document["workspaces"][0]["series"];
     let week = &document["workspaces"][0]["week"];
 
@@ -1490,7 +1515,15 @@ fn json_carries_the_live_and_per_workspace_session_marks() {
     current.workspace_id = "same-checkout".to_string();
     old.workspace_id = "same-checkout".to_string();
 
-    let document = json_document(&config, AS_OF, 1, 1, &[current, old], Some(&live), None);
+    let document = json_document(
+        &config,
+        AS_OF,
+        1,
+        1,
+        &[current, old],
+        Some(&live),
+        running(),
+    );
     assert_eq!(
         document["session"]["fingerprint"].as_str(),
         Some("live-fingerprint")
@@ -1519,19 +1552,36 @@ fn json_carries_the_live_and_per_workspace_session_marks() {
     assert_eq!(earlier_session["began"].as_u64(), Some(3 * 3_600 + 7 * 60));
     assert_eq!(earlier_session["is_current"].as_bool(), Some(false));
 
-    let unknown = json_document(&config, AS_OF, 0, 1, &[], None, None);
+    let unknown = json_document(&config, AS_OF, 0, 1, &[], None, never_ran());
     assert!(unknown["session"]["fingerprint"].is_null());
     assert!(unknown["session"]["began"].is_null());
 }
 
 #[test]
 fn json_says_when_the_sampler_is_running() {
-    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, None);
+    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, running());
 
     assert_eq!(
         document["sampler"],
         serde_json::json!({
             "running": true,
+            "stopped": null,
+        })
+    );
+}
+
+#[test]
+fn json_says_nothing_stopped_on_a_machine_that_never_started_one() {
+    // Not running, and no reason to give: a fresh install where `--enable` was
+    // never run. Reporting a stop here would tell a consumer a run died where
+    // none ever ran, and reading `running` from the absence of a stop would
+    // claim one is live.
+    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, never_ran());
+
+    assert_eq!(
+        document["sampler"],
+        serde_json::json!({
+            "running": false,
             "stopped": null,
         })
     );
@@ -1544,7 +1594,7 @@ fn json_carries_the_complete_sampler_stop() {
         at: Some(AS_OF - 3 * 60),
         detail: Some("history write failed".to_string()),
     };
-    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, Some(&stop));
+    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, stopped(&stop));
 
     assert_eq!(
         document["sampler"],

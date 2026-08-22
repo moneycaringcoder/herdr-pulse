@@ -358,6 +358,12 @@ fn a_marker_nobody_can_read_is_unknown_rather_than_ignored() {
     write_stop_marker("evaporated\n1700000000\n");
     let stop = daemon::stop_report().expect("a stopped sampler");
     assert_eq!(stop.reason, daemon::StopReason::Unknown);
+    assert_eq!(
+        stop.at,
+        Some(1_700_000_000),
+        "the marker was parsed, not skipped: without this the enabled-flag \
+         fallback would produce the same reason and the test would prove nothing"
+    );
 
     // A marker with no timestamp still names its reason; only the "when"
     // degrades.
@@ -375,6 +381,44 @@ fn a_sampler_that_was_never_enabled_here_has_nothing_to_report() {
     // A fresh state dir is not a stopped sampler. Reporting one would put a
     // reason under every empty pane on a machine that has never run `--enable`.
     assert!(daemon::stop_report().is_none());
+}
+
+#[test]
+fn a_real_panic_string_keeps_its_message_in_the_marker() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-panic");
+    daemon::mark_enabled(true);
+
+    // What `std` hands a panic hook, verbatim in shape: the location first, the
+    // message on the *next* line. A fold that cut at the first newline would
+    // keep the file and line and throw the sentence away — in the one place a
+    // detached daemon can still say what happened.
+    daemon::record_failure("panicked at src/daemon.rs:412:9:\nthe ring length was zero");
+
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    assert_eq!(stop.reason, daemon::StopReason::Failed);
+    let detail = stop.detail.expect("a failure carries its detail");
+    assert!(
+        detail.contains("the ring length was zero"),
+        "the message is the part a reader needs: {detail:?}"
+    );
+    assert!(
+        !detail.contains('\n'),
+        "the marker is line-delimited: {detail:?}"
+    );
+}
+
+#[test]
+fn an_enormous_detail_is_trimmed_rather_than_written_whole() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-huge");
+    daemon::mark_enabled(true);
+
+    daemon::record_failure(&"x".repeat(10_000));
+
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    let detail = stop.detail.expect("detail");
+    assert!(detail.len() <= 200, "{} chars", detail.len());
 }
 
 #[test]
