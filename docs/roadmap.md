@@ -9,15 +9,6 @@ watching" render as "nothing happened" is wrong no matter what else it buys.
 
 ## Keeping history that is currently lost
 
-### Downsample instead of discarding on a bucket-size change
-
-Changing `bucket_seconds` invalidates the recorded history, which is discarded
-with a message. Coarsening buckets is arithmetic, and going from 60s to 300s
-could fold five buckets into one rather than starting from nothing.
-
-Going the other way cannot be done honestly — one bucket cannot be split into
-five without inventing detail — so a decrease should still discard, and say so.
-
 ### A second, coarser ring
 
 The 240-bucket ring covers four hours, chosen for "since lunch". A separate

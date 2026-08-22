@@ -74,6 +74,14 @@ All notable changes to this project are documented here. The format follows
   sample carrying a path adopts that ring and stamps the path onto it. (A file
   written by 0.1.0 predates the session field too, so it is kept as one
   unattributable watch instead — see the session entry above.)
+- A change to `bucket_seconds` used to discard the entire recorded history. A
+  whole-multiple increase now folds each group of old buckets into one and keeps
+  it, summing the counters because a bucket counts observations. A decrease
+  still discards because a smaller bucket cannot be recovered from a larger one;
+  an increase that is not a whole multiple still discards because the new
+  boundaries would split observations that were never recorded separately. A
+  folded group containing any unobserved time is itself unobserved rather than
+  quiet.
 - `min_herdr_version` is now `0.8.0`, up from `0.7.5`. The old floor was reasoned
   from when the socket APIs pulse calls first appeared; it was never exercised
   against a 0.7.x server. 0.8.0 is the latest stable herdr and the only version
