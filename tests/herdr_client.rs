@@ -19,13 +19,14 @@
 //! No running herdr is required, and nothing here touches the user's state.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use pulse::herdr::{error_code, reduce_snapshot, socket_path, Herdr};
+use pulse::herdr::{error_code, reduce_snapshot, session_mark, socket_path, Herdr};
 use pulse::model::AgentState;
 use serde_json::{json, Value};
 
@@ -229,6 +230,144 @@ fn notification_reply() -> Reply {
 /// reads cannot catch the client reading the wrong thing.
 fn live_reply() -> Reply {
     Reply::Line(live_response().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Which session a snapshot came from
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_socket_is_one_session_however_often_it_is_asked() {
+    let server = TestServer::start(vec![live_reply()]);
+
+    let first = session_mark(&server.path).expect("a bound socket has a session");
+    let second = session_mark(&server.path).expect("a bound socket has a session");
+
+    assert_eq!(
+        first, second,
+        "the mark decides whether a series continues, so it must not wobble between calls"
+    );
+}
+
+#[test]
+fn two_sockets_are_two_sessions() {
+    let one = TestServer::start(vec![live_reply()]);
+    let other = TestServer::start(vec![live_reply()]);
+
+    let first = session_mark(&one.path).expect("mark");
+    let second = session_mark(&other.path).expect("mark");
+
+    assert_ne!(
+        first.fingerprint, second.fingerprint,
+        "two servers listening are two sessions, and joining their histories would \
+         state a continuity that never existed"
+    );
+}
+
+#[test]
+fn a_socket_that_is_not_there_has_no_session() {
+    let missing = std::env::temp_dir().join(format!("pulse-absent-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
+
+    assert_eq!(
+        session_mark(&missing),
+        None,
+        "an unattributable sample is a fact the store records; a guessed session is not"
+    );
+}
+
+#[test]
+fn a_regular_file_where_the_socket_should_be_is_not_a_session() {
+    let server = TestServer::start(vec![live_reply()]);
+    let decoy = server.dir.join("not-a-socket");
+    std::fs::write(&decoy, b"this is a file").expect("write the decoy");
+
+    // A path that exists proves nothing on its own. Fingerprinting a plain file
+    // would hand every session that ever wrote it the same identity.
+    assert_eq!(session_mark(&decoy), None);
+}
+
+#[test]
+fn the_session_began_when_the_socket_was_created() {
+    let server = TestServer::start(vec![live_reply()]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let mark = session_mark(&server.path).expect("mark");
+
+    // Seconds old at most: this socket was bound by `TestServer::start`. The
+    // point of the field is that a series can say when its session started
+    // without pulse having watched it start.
+    assert!(
+        mark.began <= now && now - mark.began <= 60,
+        "began {} is not the socket's creation time near {now}",
+        mark.began
+    );
+}
+
+#[test]
+fn rebinding_one_path_is_a_new_session() {
+    // What a herdr restart looks like on disk: the same socket path, unlinked
+    // and bound again. The inode is very often the one just freed, so this is
+    // the collision the fingerprint has to survive — and the only direction of
+    // error that matters, because reading two sessions as one would splice two
+    // incomparable series together.
+    let dir = std::env::temp_dir().join(format!("pulse-rebind-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("s.sock");
+
+    let mut marks = Vec::new();
+    for _ in 0..6 {
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        marks.push(session_mark(&path).expect("a bound socket has a session"));
+        drop(listener);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut fingerprints: Vec<&str> = marks.iter().map(|m| m.fingerprint.as_str()).collect();
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    assert_eq!(
+        fingerprints.len(),
+        marks.len(),
+        "six rebinds of one path are six sessions, not one: {marks:?}"
+    );
+}
+
+#[test]
+fn touching_the_sockets_metadata_does_not_change_the_session() {
+    // A `chmod` on a bound socket moves its `ctime` while the server keeps
+    // running. If that moved the mark, the live ring would be orphaned and the
+    // workspace would restart from an empty sparkline for no reason.
+    let server = TestServer::start(vec![live_reply()]);
+    let before = session_mark(&server.path).expect("mark");
+
+    std::fs::set_permissions(&server.path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod the bound socket");
+
+    let after = session_mark(&server.path).expect("mark");
+    assert_eq!(
+        before, after,
+        "the session did not change, so neither may its mark"
+    );
+}
+
+#[test]
+fn a_sample_carries_the_session_of_the_socket_it_was_read_from() {
+    let server = TestServer::start(vec![live_reply()]);
+    let _lock = env_lock();
+    let mut client = server.client();
+
+    let sample = client.sample(1_700_000_000).expect("sample");
+
+    assert_eq!(
+        sample.session.as_ref().map(|mark| mark.fingerprint.clone()),
+        session_mark(&server.path).map(|mark| mark.fingerprint),
+        "the store keys a series on this, so it has to be the session that answered"
+    );
+    assert_eq!(sample.workspaces.len(), 10, "the fixture's workspaces");
 }
 
 /// An error envelope, captured verbatim from a live server.
@@ -507,7 +646,7 @@ fn a_snapshot_key_that_is_not_an_object_is_also_a_loud_error() {
     for degenerate in [json!(null), json!("session_snapshot"), json!([]), json!(0)] {
         let result = json!({"type": "session_snapshot", "snapshot": degenerate});
 
-        let err = reduce_snapshot(&result, 0)
+        let err = reduce_snapshot(&result, None, 0)
             .expect_err("a non-object snapshot must not read as an idle session");
 
         assert!(
@@ -519,11 +658,11 @@ fn a_snapshot_key_that_is_not_an_object_is_also_a_loud_error() {
 
 #[test]
 fn the_error_names_the_result_type_it_actually_saw() {
-    let err = reduce_snapshot(&json!({"type": "ok"}), 0).expect_err("no snapshot");
+    let err = reduce_snapshot(&json!({"type": "ok"}), None, 0).expect_err("no snapshot");
     assert!(err.to_string().contains("ok"), "{err}");
 
     // And says so plainly when even the discriminator is missing.
-    let err = reduce_snapshot(&json!({}), 0).expect_err("no snapshot");
+    let err = reduce_snapshot(&json!({}), None, 0).expect_err("no snapshot");
     assert!(err.to_string().contains("missing"), "{err}");
 }
 
@@ -533,7 +672,7 @@ fn the_error_names_the_result_type_it_actually_saw() {
 
 #[test]
 fn the_captured_session_reduces_to_its_recorded_workspaces() {
-    let sample = reduce_snapshot(&live_result(), 42).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 42).expect("reduce");
 
     assert_eq!(sample.taken_at, 42);
     assert_eq!(
@@ -568,7 +707,7 @@ fn the_captured_session_reduces_to_its_recorded_workspaces() {
 
 #[test]
 fn workspaces_are_kept_whether_or_not_they_are_git_repos() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
 
     // The capture has three workspaces with a `worktree` and seven without. A
     // workspace that is not a repo still has agents whose history is worth
@@ -584,7 +723,7 @@ fn workspaces_are_kept_whether_or_not_they_are_git_repos() {
 
 #[test]
 fn the_checkout_path_is_carried_when_the_workspace_has_a_worktree() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
     let path = |id: &str| {
         sample
             .workspaces
@@ -622,7 +761,7 @@ fn the_checkout_path_is_carried_when_the_workspace_has_a_worktree() {
 
 #[test]
 fn agents_are_attributed_to_their_own_workspace() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
     let by_id = |id: &str| {
         sample
             .workspaces
@@ -653,7 +792,7 @@ fn agents_are_attributed_to_their_own_workspace() {
 
 #[test]
 fn the_label_is_the_program_and_never_the_users_agent_name() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
     let agents: Vec<_> = sample
         .workspaces
         .iter()
@@ -679,7 +818,7 @@ fn the_label_is_the_program_and_never_the_users_agent_name() {
 
 #[test]
 fn the_workspace_state_is_the_most_actionable_of_its_agents() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
     let state = |id: &str| {
         sample
             .workspaces
@@ -698,7 +837,7 @@ fn the_workspace_state_is_the_most_actionable_of_its_agents() {
 
 #[test]
 fn the_sequence_counter_is_session_global_and_survives_the_reduction() {
-    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let sample = reduce_snapshot(&live_result(), None, 0).expect("reduce");
     let seqs: Vec<u64> = sample
         .workspaces
         .iter()
@@ -734,15 +873,20 @@ fn result_with(snapshot: Value) -> Value {
 
 #[test]
 fn a_genuinely_idle_session_is_an_empty_sample_and_not_an_error() {
-    let sample = reduce_snapshot(&result_with(json!({"workspaces": [], "agents": []})), 9)
-        .expect("an empty session is data");
+    let sample = reduce_snapshot(
+        &result_with(json!({"workspaces": [], "agents": []})),
+        None,
+        9,
+    )
+    .expect("an empty session is data");
 
     assert!(sample.workspaces.is_empty());
     assert_eq!(sample.taken_at, 9);
 
     // Absent arrays are the same thing: the `snapshot` object was there, so we
     // did read the payload, and it really was empty.
-    let sample = reduce_snapshot(&result_with(json!({"version": "0.8.0"})), 9).expect("reduce");
+    let sample =
+        reduce_snapshot(&result_with(json!({"version": "0.8.0"})), None, 9).expect("reduce");
     assert!(sample.workspaces.is_empty());
 }
 
@@ -753,6 +897,7 @@ fn a_workspace_with_no_agents_is_tracked_and_reads_as_unknown() {
             "workspaces": [{"workspace_id": "w1", "label": "notes"}],
             "agents": []
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -773,8 +918,8 @@ fn a_workspace_without_a_label_falls_back_to_its_id() {
         json!({"workspace_id": "w1", "label": "   "}),
         json!({"workspace_id": "w1", "label": null}),
     ] {
-        let sample =
-            reduce_snapshot(&result_with(json!({"workspaces": [workspace]})), 0).expect("reduce");
+        let sample = reduce_snapshot(&result_with(json!({"workspaces": [workspace]})), None, 0)
+            .expect("reduce");
         // The label is `history`'s guard against workspace-id reuse. A stable
         // fallback keeps that comparison stable; an empty one would make every
         // sample look like a rename and drop the history each cycle.
@@ -792,6 +937,7 @@ fn a_workspace_with_no_id_is_dropped_because_nothing_can_be_keyed_to_it() {
                 {"workspace_id": "w2", "label": "real"}
             ]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -821,6 +967,7 @@ fn an_agent_missing_either_id_is_dropped_rather_than_merged() {
                 {"pane_id": "w1:p9", "agent_status": "working"}
             ]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -844,6 +991,7 @@ fn an_agent_naming_an_unlisted_workspace_is_dropped() {
                 {"pane_id": "w9:p1", "workspace_id": "w9", "agent_status": "working"}
             ]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -875,6 +1023,7 @@ fn every_agent_status_the_server_can_send_round_trips() {
             "workspaces": [{"workspace_id": "w1", "label": "one"}],
             "agents": agents
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -911,6 +1060,7 @@ fn an_unparseable_status_keeps_the_agent_as_unknown() {
                 {"pane_id": "w1:p5", "workspace_id": "w1", "agent_status": "WORKING"}
             ]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -937,19 +1087,16 @@ fn an_unparseable_status_keeps_the_agent_as_unknown() {
 
 #[test]
 fn a_missing_or_odd_sequence_number_never_manufactures_a_transition() {
-    let sample = reduce_snapshot(
-        &result_with(json!({
-            "workspaces": [{"workspace_id": "w1", "label": "one"}],
-            "agents": [
-                {"pane_id": "w1:p1", "workspace_id": "w1"},
-                {"pane_id": "w1:p2", "workspace_id": "w1", "state_change_seq": null},
-                {"pane_id": "w1:p3", "workspace_id": "w1", "state_change_seq": "795"},
-                {"pane_id": "w1:p4", "workspace_id": "w1", "state_change_seq": -1},
-                {"pane_id": "w1:p5", "workspace_id": "w1", "state_change_seq": 18446744073709551615u64}
-            ]
-        })),
-        0,
-    )
+    let sample = reduce_snapshot(&result_with(json!({
+        "workspaces": [{"workspace_id": "w1", "label": "one"}],
+        "agents": [
+            {"pane_id": "w1:p1", "workspace_id": "w1"},
+            {"pane_id": "w1:p2", "workspace_id": "w1", "state_change_seq": null},
+            {"pane_id": "w1:p3", "workspace_id": "w1", "state_change_seq": "795"},
+            {"pane_id": "w1:p4", "workspace_id": "w1", "state_change_seq": -1},
+            {"pane_id": "w1:p5", "workspace_id": "w1", "state_change_seq": 18446744073709551615u64}
+        ]
+    })), None, 0)
     .expect("reduce");
 
     assert_eq!(
@@ -976,6 +1123,7 @@ fn a_program_that_is_absent_or_blank_is_none_rather_than_an_empty_label() {
                 {"pane_id": "w1:p4", "workspace_id": "w1"}
             ]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -1002,6 +1150,7 @@ fn two_workspaces_sharing_an_id_both_keep_their_agents() {
             ],
             "agents": [{"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "working"}]
         })),
+        None,
         0,
     )
     .expect("reduce");
@@ -1024,6 +1173,7 @@ fn only_the_agents_array_is_read_and_never_the_panes_array() {
                 "agent": "claude", "agent_status": "working"
             }]
         })),
+        None,
         0,
     )
     .expect("reduce");

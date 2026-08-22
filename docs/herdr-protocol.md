@@ -69,6 +69,32 @@ Reading the arrays off `result` instead of `result.snapshot` yields no data at
 all, which is indistinguishable from an idle session. An absent `snapshot`
 object must therefore be a loud error, never a fallback to empty.
 
+### There is no session identity in here
+
+Checked against the schema of a live 0.8.0 server, not inferred: `SessionSnapshot`
+carries `version`, `protocol`, the four arrays and the three `focused_*` ids, and
+nothing that distinguishes this run of the server from the last one. There is no
+session id, no server start time, and no boot counter. The `session_start_source`
+and `started_unix_ms` fields that turn up elsewhere in the schema belong to
+*agent* sessions and to command results, not to the herdr session.
+
+The read-only surface has no substitute either. Every `server.*` method —
+`server.stop`, `server.live_handoff`, `server.reload_config`,
+`server.agent_manifests`, `server.reload_agent_manifests` — is an action, and this
+plugin observes and never acts.
+
+So pulse takes the session's identity from the thing it is talking to: the socket
+at `HERDR_SOCKET_PATH`. Its device and inode identify it among every socket on
+the machine, and its creation time is the moment the server started listening,
+which is the closest thing to "when this session began" that can be read without
+having watched it start. Verified on a live server: the bound path is a socket,
+and `(dev, ino, ctime)` are stable across repeated calls while it keeps running.
+
+What that proves, and what it does not, is in **Still unverified** below. The
+error it can make is to report two sessions where there was one, which splits a
+history; the error it cannot make is to report one where there were two, which
+would join two incomparable series.
+
 ### Two corrections to the notes this plugin inherited
 
 Both confirmed against a live snapshot:
@@ -272,6 +298,19 @@ Honest list of what this plugin assumes rather than checked:
   they cannot, and the three worktrees in the capture are distinct, so a path
   seen twice in one snapshot is treated as no identity at all rather than as a
   reason to merge two workspaces' histories.
+- **Whether a restarted server always re-binds a different socket.** A Unix
+  socket has to be unlinked and re-bound to be listened on again, so a fresh
+  server should always land on a new inode, and `(dev, ino, ctime)` should
+  therefore differ. Not watched happening: the live server observed here has been
+  bound since it started. Inode numbers *are* reused once a file is gone, which
+  is why the creation time to the nanosecond is part of the fingerprint. If both
+  ever collided, two sessions would look like one — the only direction of error
+  that matters, and the reason it is worth stating out loud.
+- **What a live handoff does to the socket.** `herdr update --handoff` replaces
+  the process without ending the session. If it re-binds the socket, pulse will
+  read that as a new session and split the history, which costs a seam that was
+  not really there. That is the safe direction: a split says "these two stretches
+  may not be comparable", which is true either way.
 - **`blocked` in a real snapshot.** The status appears in the server's schema and
   in the write-side enum, but no agent in the observed session entered it during
   the capture window, so the fixture carrying it is structurally real with that

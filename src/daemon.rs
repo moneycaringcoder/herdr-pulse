@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use crate::config::{self, Config};
 use crate::herdr::{self, Herdr};
 use crate::history;
-use crate::model::{Tone, WorkspaceActivity};
+use crate::model::{SessionMark, Tone, WorkspaceActivity};
 use crate::Result;
 
 /// The stop request only posts a signal; the daemon still has to clear its
@@ -140,8 +140,9 @@ pub fn restore() -> Result<()> {
 /// The sampling loop itself, running in the foreground.
 ///
 /// One cycle: take a snapshot, fold it into the history, persist, then push one
-/// badge per workspace. History is saved every cycle — a SIGKILLed daemon must
-/// lose at most one interval of data, not the whole session.
+/// badge per workspace recorded by that snapshot's session. History is saved
+/// every cycle — a SIGKILLed daemon must lose at most one interval of data, not
+/// the whole session.
 pub fn run(config: &Config) -> Result<()> {
     write_pid(std::process::id());
 
@@ -273,7 +274,14 @@ fn cycle(
         config.buckets_per_badge_column(),
         config,
     );
-    push(client, config, &activity, active, stopping);
+    push(
+        client,
+        config,
+        &activity,
+        sample.session.as_ref(),
+        active,
+        stopping,
+    );
     Ok(())
 }
 
@@ -315,13 +323,20 @@ pub struct WorkspaceBadge {
 ///   than left to expire.
 /// * The plan must be deterministic: sort anything that comes out of a `HashMap`
 ///   before emitting it, so tests and logs are reproducible.
+/// * Only activity recorded by the live sample's session is a badge target.
+///   Workspace ids are session-scoped, so pushing this session's badge to an id
+///   retained from a previous session can land on a different workspace
+///   entirely. A skipped row is still absent from the wanted set, so an active
+///   token left by an earlier cycle is cleared rather than orphaned.
 pub fn badge_plan(
     active: &HashMap<String, String>,
     activity: &[WorkspaceActivity],
+    live_session: Option<&SessionMark>,
     config: &Config,
 ) -> Vec<BadgeOp> {
     let badges: Vec<WorkspaceBadge> = activity
         .iter()
+        .filter(|activity| activity.is_session(live_session))
         .map(|activity| WorkspaceBadge {
             workspace_id: activity.workspace_id.clone(),
             tone: Tone::of(activity.state),
@@ -454,6 +469,7 @@ fn push(
     client: &mut Herdr,
     config: &Config,
     activity: &[WorkspaceActivity],
+    live_session: Option<&SessionMark>,
     active: &Mutex<HashMap<String, String>>,
     stopping: &AtomicBool,
 ) {
@@ -466,7 +482,7 @@ fn push(
     }
 
     let ttl_ms = config.ttl_ms();
-    let plan = badge_plan(&active.clone(), activity, config);
+    let plan = badge_plan(&active.clone(), activity, live_session, config);
     let mut lit: HashMap<String, String> = HashMap::new();
 
     for entry in batch(plan) {

@@ -25,9 +25,9 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::model::{AgentState, Level, WorkspaceActivity};
+use crate::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use crate::Result;
-use crate::{daemon, history};
+use crate::{daemon, herdr, history};
 
 /// Eight steps of block element, indexed by [`Level`] 1..=8. Level 0 is
 /// [`QUIET`], which is deliberately not `▁`: a one-pixel bar reads as a small
@@ -211,6 +211,10 @@ pub fn duration(seconds: Option<u64>) -> String {
 /// Columns must line up regardless of label width or of multi-byte glyphs in the
 /// sparkline — pad by display width, not by byte length.
 ///
+/// The `session` column attributes each independently recorded series. A row
+/// from an earlier herdr process remains real history and keeps every observed
+/// sparkline bucket; only its provenance is marked as different.
+///
 /// # Tense
 ///
 /// Every state in here is a *past observation*. Most of the time the last
@@ -223,7 +227,12 @@ pub fn duration(seconds: Option<u64>) -> String {
 /// nothing but gap glyphs — "nobody looked for five hours" — used to sit beside
 /// the words `working  5h00`, which asserts the opposite about the same five
 /// hours. The sparkline was the honest half.
-pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> String {
+pub fn pane(
+    activity: &[WorkspaceActivity],
+    config: &Config,
+    as_of: u64,
+    session: Option<&SessionMark>,
+) -> String {
     if activity.is_empty() {
         // Not an empty table. An empty table looks like a quiet session, and a
         // quiet session is the one answer we must never give by accident.
@@ -236,10 +245,14 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
 
     let tolerance = staleness_tolerance(config);
     let mut any_stale = false;
+    let explain_sessions = activity
+        .iter()
+        .any(|workspace| workspace.session.is_none() || !workspace.is_session(session));
 
     let mut rows = vec![vec![
         "workspace".to_string(),
         "activity".to_string(),
+        "session".to_string(),
         "state".to_string(),
         "for".to_string(),
         "seen".to_string(),
@@ -255,6 +268,7 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
             // for legibility, but the delimiters still make the column width
             // obvious when every glyph in a row is the same.
             format!("[{}]", sparkline(&workspace.series)),
+            session_cell(workspace, session),
             // The tense is the whole point. `was` costs four columns and is the
             // difference between reporting a fact and inventing one.
             if current {
@@ -278,16 +292,32 @@ pub fn pane(activity: &[WorkspaceActivity], config: &Config, as_of: u64) -> Stri
     );
     out.push_str(&table(&rows));
     out.push('\n');
-    out.push_str(&legend(config, activity, any_stale));
+    out.push_str(&legend(
+        config,
+        activity,
+        any_stale,
+        explain_sessions,
+        session,
+    ));
     out
+}
+/// The live herdr identity, when both locating and fingerprinting its socket
+/// succeed. Reporting commands still render saved history when there is no
+/// socket, so a path lookup failure is provenance we do not know, not a command
+/// failure.
+fn live_session() -> Option<SessionMark> {
+    herdr::socket_path()
+        .ok()
+        .and_then(|socket| herdr::session_mark(&socket))
 }
 
 /// `--once`: print the pane once and exit.
 pub fn run_once(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
+    let session = live_session();
     let (columns, buckets_per_column) = pane_geometry(config);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
-    print!("{}", pane(&activity, config, as_of));
+    print!("{}", pane(&activity, config, as_of, session.as_ref()));
 
     // An empty report and a stopped sampler look identical on screen, so say
     // which one this is. On stderr, so `pulse --once > report.txt` still
@@ -311,9 +341,17 @@ pub fn run_once(config: &Config) -> Result<()> {
 /// five hours, and would be right to treat it as current.
 pub fn run_json(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
+    let session = live_session();
     let (columns, buckets_per_column) = pane_geometry(config);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
-    let document = json_document(config, as_of, columns, buckets_per_column, &activity);
+    let document = json_document(
+        config,
+        as_of,
+        columns,
+        buckets_per_column,
+        &activity,
+        session.as_ref(),
+    );
     println!("{}", serde_json::to_string_pretty(&document)?);
     Ok(())
 }
@@ -324,12 +362,17 @@ pub fn run_json(config: &Config) -> Result<()> {
 /// `null` in `series` for a gap, `0` for an observed-but-idle bucket — is
 /// checkable directly against a hand-built [`WorkspaceActivity`], without going
 /// through the history store or a subprocess.
+///
+/// Session provenance prevents a consumer from joining two entries for one
+/// checkout into one interrupted series. They were recorded by different herdr
+/// sessions, and merging them would state a continuity no sampler observed.
 pub fn json_document(
     config: &Config,
     as_of: u64,
     columns: usize,
     buckets_per_column: usize,
     activity: &[WorkspaceActivity],
+    session: Option<&SessionMark>,
 ) -> Value {
     let tolerance = staleness_tolerance(config);
 
@@ -339,6 +382,15 @@ pub fn json_document(
             json!({
                 "workspace_id": workspace.workspace_id,
                 "label": workspace.label,
+                "session": {
+                    "fingerprint": workspace.session.as_deref(),
+                    "began": workspace.session_began,
+                    // `null`, not `false`, when there is no live session to
+                    // compare against: "recorded by a session that has ended"
+                    // and "pulse could not establish which session is running"
+                    // are different facts, and `false` asserts the first.
+                    "is_current": session.map(|_| workspace.is_session(session)),
+                },
                 "state": workspace.state.as_str(),
                 // Measured to `last_seen`, not to `as_of`: the duration we
                 // observed, never one extrapolated across an outage.
@@ -369,6 +421,10 @@ pub fn json_document(
 
     json!({
         "as_of": as_of,
+        "session": {
+            "fingerprint": session.map(|mark| mark.fingerprint.as_str()),
+            "began": session.map(|mark| mark.began),
+        },
         "bucket_seconds": config.bucket_seconds,
         "columns": columns,
         "buckets_per_column": buckets_per_column,
@@ -402,8 +458,15 @@ pub fn run_watch(config: &Config) -> Result<()> {
         }
 
         let as_of = crate::now_unix();
+        // The bound socket can be replaced while a watch is open, so provenance
+        // is sampled with each frame rather than frozen at startup.
+        let session = live_session();
         let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
-        write!(out, "{CLEAR}{}", pane(&activity, config, as_of))?;
+        write!(
+            out,
+            "{CLEAR}{}",
+            pane(&activity, config, as_of, session.as_ref())
+        )?;
         writeln!(
             out,
             "\nrefreshing every {} — ctrl-c to stop",
@@ -440,13 +503,45 @@ pub fn pane_geometry(config: &Config) -> (usize, usize) {
 /// timezone database to be worth printing, and the question the pane answers —
 /// "how fresh is this?" — is answered by a clock.
 fn clock(as_of: u64) -> String {
+    let [hours, minutes, seconds] = clock_parts(as_of);
+    format!("{hours:02}:{minutes:02}:{seconds:02} UTC")
+}
+
+/// Time of day components in UTC, shared by the pane header and the session
+/// column so the hour and minute formats cannot drift apart.
+fn clock_parts(as_of: u64) -> [u64; 3] {
     let seconds = as_of % 86_400;
-    format!(
-        "{:02}:{:02}:{:02} UTC",
-        seconds / 3_600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
+    [seconds / 3_600, (seconds / 60) % 60, seconds % 60]
+}
+
+/// The minute at which a herdr session began. Seconds are deliberately omitted:
+/// the column identifies a run at a glance without spending sidebar width on
+/// precision the row does not need.
+fn session_clock(began: u64) -> String {
+    let [hours, minutes, _] = clock_parts(began);
+    format!("{hours:02}:{minutes:02}")
+}
+
+/// What the `session` column says about one row.
+///
+/// The parentheses mean exactly one thing — "recorded by a session other than
+/// the one running now" — so they may only be drawn when there *is* a known
+/// session running now. With no live mark, nothing is comparable to anything:
+/// the cell states when the row's own session began and claims nothing further,
+/// because "an earlier session than the one running now" would be a claim about
+/// a session that was never established.
+fn session_cell(workspace: &WorkspaceActivity, session: Option<&SessionMark>) -> String {
+    let began = |began: Option<u64>| match began {
+        Some(began) => session_clock(began),
+        None => "?".to_string(),
+    };
+    if session.is_none() {
+        return began(workspace.session_began);
+    }
+    if workspace.is_session(session) {
+        return began(session.map(|mark| mark.began));
+    }
+    format!("({})", began(workspace.session_began))
 }
 
 /// The key to the glyphs.
@@ -460,7 +555,13 @@ fn clock(as_of: u64) -> String {
 /// Built from the constants rather than spelled out, so a glyph can never be
 /// changed without the legend following it. The previous version hard-coded the
 /// word "blank", and went stale the moment [`GAP`] stopped being a space.
-fn legend(config: &Config, activity: &[WorkspaceActivity], any_stale: bool) -> String {
+fn legend(
+    config: &Config,
+    activity: &[WorkspaceActivity],
+    any_stale: bool,
+    explain_sessions: bool,
+    session: Option<&SessionMark>,
+) -> String {
     let ramp: String = RAMP.iter().collect();
     let mut out = format!(
         "legend  {ramp} busier  |  {QUIET} observed, nothing happened  |  \
@@ -478,6 +579,29 @@ fn legend(config: &Config, activity: &[WorkspaceActivity], any_stale: bool) -> S
             "        \"was X\" is the last observation and nothing has been seen since — \
              not a claim about now\n",
         );
+    }
+    if explain_sessions {
+        // Assembled from what the column actually printed. A legend that
+        // explains parentheses in a pane with none, or promises a live session
+        // when none could be established, teaches the reader something untrue
+        // about the row in front of them.
+        let mut clauses =
+            vec!["session = when the herdr session that recorded the row began".to_string()];
+        if session.is_some() {
+            clauses.push("parentheses = an earlier session than the one running now".to_string());
+        } else {
+            clauses.push(
+                "the session running now could not be established, so no row is marked live"
+                    .to_string(),
+            );
+        }
+        if activity
+            .iter()
+            .any(|workspace| workspace.session_began.is_none())
+        {
+            clauses.push("? = that session's start could not be established".to_string());
+        }
+        out.push_str(&format!("        {}\n", clauses.join("  |  ")));
     }
 
     // Only claim a timescale when the series we were handed actually has the

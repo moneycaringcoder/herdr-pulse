@@ -25,7 +25,7 @@ use pulse::config::{self, Config, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
 use pulse::daemon::{self, BadgeOp, WorkspaceBadge};
 use pulse::history::History;
 use pulse::model::WorkspaceObservation;
-use pulse::model::{AgentObservation, AgentState, Sample, Tone, WorkspaceActivity};
+use pulse::model::{AgentObservation, AgentState, Sample, SessionMark, Tone, WorkspaceActivity};
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
@@ -944,10 +944,30 @@ fn every_tone_maps_to_its_own_token_name() {
 // produce, which made them evidence for nothing.
 // ---------------------------------------------------------------------------
 
+/// A session mark with a readable fingerprint for provenance tests.
+fn session(fingerprint: &str, began: u64) -> SessionMark {
+    SessionMark {
+        fingerprint: fingerprint.to_string(),
+        began,
+    }
+}
+
 /// One sample of one workspace, in the shape `herdr::reduce_snapshot` builds.
 fn sample_of(workspace_id: &str, state: AgentState, taken_at: u64, seq: u64) -> Sample {
+    sample_of_in_session(workspace_id, state, taken_at, seq, None)
+}
+
+/// The same sample shape, with explicit session provenance.
+fn sample_of_in_session(
+    workspace_id: &str,
+    state: AgentState,
+    taken_at: u64,
+    seq: u64,
+    session: Option<SessionMark>,
+) -> Sample {
     Sample {
         taken_at,
+        session,
         workspaces: vec![WorkspaceObservation {
             workspace_id: workspace_id.to_string(),
             label: format!("label-{workspace_id}"),
@@ -1048,7 +1068,7 @@ fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
             "a workspace observed for a whole bucket must draw something: {state}"
         );
 
-        let plan = daemon::badge_plan(&HashMap::new(), &activity, &config);
+        let plan = daemon::badge_plan(&HashMap::new(), &activity, None, &config);
 
         assert_eq!(
             plan,
@@ -1060,6 +1080,115 @@ fn badge_plan_takes_its_token_from_the_tone_and_its_text_from_the_renderer() {
             "state {state}"
         );
     }
+}
+
+#[test]
+fn a_previous_session_row_is_not_badged_but_the_live_session_row_is() {
+    let config = Config::default();
+    let as_of = 1_700_000_000;
+    let previous = session("previous", as_of - 3_600);
+    let live = session("live", as_of - 60);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample_of_in_session(
+            "w6",
+            AgentState::Blocked,
+            as_of,
+            700,
+            Some(previous.clone()),
+        ),
+        &config,
+    );
+    history.record(
+        &sample_of_in_session("w6", AgentState::Working, as_of, 701, Some(live.clone())),
+        &config,
+    );
+
+    let activity = production_activity(&history, &config, as_of);
+    assert_eq!(activity.len(), 2, "the store keeps one row per session");
+    let previous_row = activity
+        .iter()
+        .find(|row| row.is_session(Some(&previous)))
+        .expect("previous-session row");
+    let live_row = activity
+        .iter()
+        .find(|row| row.is_session(Some(&live)))
+        .expect("live-session row");
+    assert!(
+        !pulse::render::badge(previous_row, &config).is_empty(),
+        "the previous row has real observed data; provenance, not blankness, excludes it"
+    );
+    let live_text = pulse::render::badge(live_row, &config);
+
+    let plan = daemon::badge_plan(&HashMap::new(), &activity, Some(&live), &config);
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Set {
+            workspace_id: "w6".to_string(),
+            token: "pulse_working",
+            text: live_text,
+        }],
+        "the previous session's blocked badge must not be sent to the reused id"
+    );
+}
+
+#[test]
+fn a_token_lit_before_its_row_stopped_being_a_target_is_cleared_once() {
+    let config = Config::default();
+    let as_of = 1_700_000_000;
+    let previous = session("previous", as_of - 3_600);
+    let live = session("live", as_of - 60);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample_of_in_session("w6", AgentState::Blocked, as_of, 700, Some(previous)),
+        &config,
+    );
+    let activity = production_activity(&history, &config, as_of);
+    assert!(
+        !pulse::render::badge(&activity[0], &config).is_empty(),
+        "the clear must come from provenance filtering, not an empty badge"
+    );
+
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "pulse_blocked")]),
+        &activity,
+        Some(&live),
+        &config,
+    );
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Clear {
+            workspace_id: "w6".to_string(),
+            token: "pulse_blocked".to_string(),
+        }],
+        "filtering a formerly badged row must feed the stale-token clear exactly once"
+    );
+}
+
+#[test]
+fn an_unknown_session_row_is_not_a_target_for_a_known_live_session() {
+    let config = Config::default();
+    let as_of = 1_700_000_000;
+    let live = session("live", as_of - 60);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample_of_in_session("w6", AgentState::Working, as_of, 700, None),
+        &config,
+    );
+    let activity = production_activity(&history, &config, as_of);
+    assert!(
+        !pulse::render::badge(&activity[0], &config).is_empty(),
+        "the unknown row is observed data, not a gap to hide"
+    );
+
+    let plan = daemon::badge_plan(&HashMap::new(), &activity, Some(&live), &config);
+
+    assert!(
+        plan.is_empty(),
+        "unknown provenance must remain visibly distinct from the live session"
+    );
 }
 
 #[test]
@@ -1089,7 +1218,7 @@ fn badge_plan_clears_a_workspace_whose_whole_window_predates_the_badge() {
     );
     assert!(pulse::render::badge(&activity[0], &config).is_empty());
 
-    let plan = daemon::badge_plan(&lit(&[("w6", "pulse_working")]), &activity, &config);
+    let plan = daemon::badge_plan(&lit(&[("w6", "pulse_working")]), &activity, None, &config);
 
     assert_eq!(
         plan,
@@ -1128,7 +1257,7 @@ fn a_quiet_workspace_still_draws_because_quiet_is_an_answer() {
         "an observed-and-idle workspace must keep its row"
     );
 
-    let plan = daemon::badge_plan(&HashMap::new(), &activity, &config);
+    let plan = daemon::badge_plan(&HashMap::new(), &activity, None, &config);
 
     assert_eq!(
         plan,

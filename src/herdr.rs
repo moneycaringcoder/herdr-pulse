@@ -52,6 +52,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -59,7 +60,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use crate::config;
-use crate::model::{AgentObservation, AgentState, Sample, WorkspaceObservation};
+use crate::model::{AgentObservation, AgentState, Sample, SessionMark, WorkspaceObservation};
 use crate::Result;
 
 /// Long enough that a busy server is not mistaken for a dead one, short enough
@@ -129,14 +130,27 @@ impl Herdr {
         })
     }
 
-    /// One `session.snapshot`, reduced to a [`Sample`] stamped with `taken_at`.
+    /// One `session.snapshot`, reduced to a [`Sample`] stamped with `taken_at`
+    /// and with the session it was read from.
     ///
     /// Workspaces are kept whether or not they are git repos and whether or not
     /// they currently have agents — a workspace that lost its agent still has a
     /// history worth showing.
+    ///
+    /// The session is read on **both** sides of the call and only kept when the
+    /// two agree. Neither side is safe alone. [`Self::call`] retries a transport
+    /// failure precisely because the first attempt can land on a socket the old
+    /// server has just unlinked, so a mark read beforehand can name a session
+    /// that did not answer — and a mark read afterwards can name one that had not
+    /// started listening when we asked. Disagreement means the socket moved
+    /// across the call and pulse cannot say which server replied: that is an
+    /// unattributable sample, which the store knows how to record, and it lasts
+    /// exactly one cycle.
     pub fn sample(&mut self, taken_at: u64) -> Result<Sample> {
+        let before = session_mark(&self.socket_path);
         let result = self.call("session.snapshot", json!({}))?;
-        reduce_snapshot(&result, taken_at)
+        let session = before.filter(|mark| session_mark(&self.socket_path).as_ref() == Some(mark));
+        reduce_snapshot(&result, session, taken_at)
     }
 
     /// Sets one badge token on a workspace, with a TTL so it self-clears if this
@@ -304,6 +318,56 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// The session behind a socket path, or `None` when it cannot be established.
+///
+/// herdr publishes no session identity — see [`SessionMark`] — so this is taken
+/// from the socket file the server bound: its device and inode identify it among
+/// every other socket on the machine, and the moment it came into existence is
+/// the moment the server started listening, which is the closest thing to "when
+/// this session began" that exists without having watched it start.
+///
+/// Reads metadata and nothing else: no connection, no subprocess, and nothing
+/// written. Cheap enough for `--once` to call on every invocation.
+///
+/// `None` on any failure, and on a path that is not a socket. An unattributable
+/// sample is a fact the store knows how to record; a guessed attribution is not.
+pub fn session_mark(socket_path: &Path) -> Option<SessionMark> {
+    let metadata = std::fs::metadata(socket_path).ok()?;
+    if !metadata.file_type().is_socket() {
+        return None;
+    }
+    // Birth time, not `ctime`. `ctime` is the inode's *status change* time, so
+    // anything that touches the socket's metadata while the server is running —
+    // a `chmod`, a rename of the path and back — moves it. That would change the
+    // fingerprint under a live session, orphan the ring being accumulated, and
+    // restart the workspace from an empty sparkline for no reason at all.
+    // `Metadata::created` is statx `STATX_BTIME` on Linux and `st_birthtime` on
+    // macOS, and both CI platforms have it on their default filesystems.
+    //
+    // `ctime` remains the fallback for a filesystem that reports no birth time,
+    // because a mark that moves on a `chmod` is still better than no attribution
+    // at all: the failure it causes is a split, and a split only ever
+    // under-claims continuity.
+    let (seconds, nanos) = match metadata
+        .created()
+        .ok()
+        .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(born) => (born.as_secs(), born.subsec_nanos() as i64),
+        None => (metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0)),
+    };
+    // The nanoseconds are the load-bearing part, not decoration. A Unix socket
+    // is unlinked and re-bound on every restart, and the fresh inode is very
+    // often the one just freed — measured on ext4, six rebinds of one path in a
+    // second reused the same inode and the same whole second every time. Without
+    // sub-second resolution those six restarts read as one session, which is the
+    // merge this whole feature exists to refuse.
+    Some(SessionMark {
+        fingerprint: format!("{}:{}:{seconds}:{nanos}", metadata.dev(), metadata.ino(),),
+        began: seconds,
+    })
+}
+
 /// Reduces a raw `session.snapshot` result object to a [`Sample`].
 ///
 /// Split out from the socket so it can be tested against captured real
@@ -312,7 +376,15 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
 ///
 /// Returns an error — never an empty sample — when `snapshot` is absent, so a
 /// protocol change is loud rather than looking like an idle session.
-pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
+///
+/// `session` is passed in rather than read here: the reduction is a pure
+/// function over a captured snapshot, and the session comes from the socket that
+/// answered, which a fixture does not have.
+pub fn reduce_snapshot(
+    result: &Value,
+    session: Option<SessionMark>,
+    taken_at: u64,
+) -> Result<Sample> {
     // Absent (or non-object) `snapshot` is an error rather than a fallback. An
     // empty workspace list is indistinguishable from an idle session, so
     // silently returning one would hide the breakage exactly the way the
@@ -400,6 +472,7 @@ pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
 
     Ok(Sample {
         taken_at,
+        session,
         workspaces,
     })
 }

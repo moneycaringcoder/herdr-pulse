@@ -68,12 +68,6 @@ Eight columns is chosen because sidebar cells are narrow and herdr starts elidin
 beyond that. If herdr ever reports the width actually available, the series could
 use it rather than assuming the tightest case.
 
-### Per-session history
-
-Workspace ids are session-scoped, so histories from different herdr sessions are
-not comparable. Keeping them separate, and saying which session a series belongs
-to, is more honest than one merged timeline.
-
 ## Interfaces
 
 ### A versioned `--json` schema
