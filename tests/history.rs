@@ -1282,6 +1282,42 @@ fn a_clock_correction_rewinds_both_rings() {
 }
 
 #[test]
+fn the_week_reports_its_own_blocked_time_and_not_the_afternoons() {
+    // The two rings cover different stretches, so their blocked figures are
+    // different numbers. A week row drawn beside the fine ring's figure would
+    // report this afternoon under a seven-day sparkline.
+    let config = config(60, 240, 4);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // An hour of blocking, twenty hours ago: inside the week ring, far outside
+    // the fine one.
+    for step in 0..6u64 {
+        history.record(
+            &one(
+                base + step * 600,
+                "w15",
+                "api",
+                &[("w15:p1", "blocked", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    let as_of = base + 20 * 3_600;
+    let activity = &history.activity(as_of, 32, 7, &config)[0];
+    assert_eq!(
+        (activity.blocked_seconds, activity.watched_seconds),
+        (0, 0),
+        "the fine ring watched none of this window"
+    );
+    assert_eq!(
+        activity.week_blocked_seconds, 3_600,
+        "the week ring watched that hour and it was blocked throughout"
+    );
+    assert_eq!(activity.week_watched_seconds, 3_600);
+}
+
+#[test]
 fn eviction_breaks_ties_deterministically() {
     let config = config(60, 8, 2);
     let mut first = History::empty(&config);

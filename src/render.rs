@@ -417,9 +417,22 @@ pub fn week_pane(
     let mut activity = activity.to_vec();
     for workspace in &mut activity {
         std::mem::swap(&mut workspace.series, &mut workspace.week);
+        // The blocked figure travels with the series it describes. Left behind,
+        // the week row would print the fine ring's last few hours beside a
+        // seven-day sparkline, under a legend that says the figure covers the
+        // time watched in *this* row.
+        std::mem::swap(
+            &mut workspace.blocked_seconds,
+            &mut workspace.week_blocked_seconds,
+        );
+        std::mem::swap(
+            &mut workspace.watched_seconds,
+            &mut workspace.week_watched_seconds,
+        );
     }
     render_pane(&activity, config, as_of, session, PaneView::week())
 }
+
 /// The live herdr identity, when both locating and fingerprinting its socket
 /// succeed. Reporting commands still render saved history when there is no
 /// socket, so a path lookup failure is provenance we do not know, not a command
@@ -573,6 +586,11 @@ pub fn json_document(
                 // the row's wall-clock width includes gaps and is not evidence.
                 "blocked_seconds": workspace.blocked_seconds,
                 "watched_seconds": workspace.watched_seconds,
+                // And the same pair over the week series, because the two rings
+                // cover different stretches and a figure from one says nothing
+                // about the other.
+                "week_blocked_seconds": workspace.week_blocked_seconds,
+                "week_watched_seconds": workspace.week_watched_seconds,
                 // `null` is a gap and `0` is an observed quiet bucket. A
                 // consumer that flattens the two gets the same wrong answer the
                 // glyphs exist to prevent, so the distinction is carried in the
@@ -803,8 +821,8 @@ fn legend(
         .any(|workspace| workspace.watched_seconds > 0)
     {
         out.push_str(
-            "        blocked = time estimated from samples that saw a blocked agent, \
-             over time actually watched rather than the whole row\n",
+            "        blocked = estimated from the samples that saw a blocked agent  |  \
+             measured over time actually watched, not the whole row\n",
         );
     }
     // Only when it applies. A reader whose rows are all fresh does not need to

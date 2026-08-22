@@ -42,9 +42,12 @@ fn activity(
         agent_count,
         session: None,
         session_began: None,
-        // A week of gaps unless a test says otherwise: the pane tests are about
-        // the fine series, and an unset coarse ring must not change what they see.
+        // A week of gaps unless a test says otherwise, with no watching behind
+        // it: the pane tests are about the fine series, and an unset coarse ring
+        // must not change what they see.
         week: vec![None; pulse::config::WEEK_COLUMNS],
+        week_blocked_seconds: 0,
+        week_watched_seconds: 0,
     }
 }
 
@@ -991,8 +994,12 @@ fn blocked_time_renders_as_a_duration_in_its_own_column() {
 
 #[test]
 fn blocked_time_is_unknown_when_nothing_was_watched() {
+    // The session column also renders `?` when there is no live session, so the
+    // marker alone proves nothing about which column it came from. State and
+    // duration are given known values and the neighbours are asserted, so this
+    // fails if the column moves or disappears.
     let rendered = sample_pane(vec![with_blocked_time(
-        activity("web", vec![None; 2], AgentState::Unknown, None, 0),
+        activity("web", vec![None; 2], AgentState::Working, Some(30), 1),
         0,
         0,
     )]);
@@ -1002,7 +1009,37 @@ fn blocked_time_is_unknown_when_nothing_was_watched() {
         .filter(|cell| !cell.is_empty())
         .collect();
 
+    assert_eq!(cells[3], "> working", "{rendered}");
     assert_eq!(cells[4], "?", "{rendered}");
+    assert_eq!(cells[5], "30s", "{rendered}");
+}
+
+#[test]
+fn the_week_pane_reports_the_weeks_blocked_time_and_not_the_afternoons() {
+    // The figure travels with the series it describes. Left behind, a week row
+    // would print the fine ring's last few hours beside a seven-day sparkline,
+    // under a legend saying the figure covers the time watched in this row.
+    let mut workspace = activity("web", vec![None; 2], AgentState::Working, Some(30), 1);
+    workspace.blocked_seconds = 60;
+    workspace.watched_seconds = 120;
+    workspace.week = levels(&[4; WEEK_COLUMNS]);
+    workspace.week_blocked_seconds = 7_200;
+    workspace.week_watched_seconds = 86_400;
+
+    let week = week_pane(&[workspace.clone()], &Config::default(), AS_OF, None);
+    let once = pane(&[workspace], &Config::default(), AS_OF, None);
+
+    let cell = |rendered: &str| {
+        row_for(rendered, "web")
+            .split("  ")
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .nth(4)
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(cell(&week), "2h00", "{week}");
+    assert_eq!(cell(&once), "1m", "{once}");
 }
 
 #[test]
@@ -1023,8 +1060,8 @@ fn zero_blocked_time_is_an_observation_when_time_was_watched() {
 
 #[test]
 fn the_blocked_legend_appears_only_when_a_row_was_watched() {
-    const CLAUSE: &str = "blocked = time estimated from samples that saw a blocked agent, \
-                          over time actually watched rather than the whole row";
+    const CLAUSE: &str = "blocked = estimated from the samples that saw a blocked agent  |  \
+                          measured over time actually watched, not the whole row";
 
     let watched = sample_pane(vec![with_blocked_time(
         activity("web", levels(&[0]), AgentState::Idle, Some(1), 1),

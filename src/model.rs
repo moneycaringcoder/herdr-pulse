@@ -295,6 +295,15 @@ pub struct WorkspaceActivity {
     /// Seconds of the same window the sampler actually observed. A gap adds
     /// nothing to it: unobserved time is not time with no blocking in it.
     pub watched_seconds: u64,
+    /// The same two figures over the week series' window, so a week row can
+    /// report the week's blocked time rather than this afternoon's.
+    ///
+    /// Two pairs rather than one for the same reason there are two series: the
+    /// rings cover different stretches of time, and a figure from one drawn
+    /// beside the other's sparkline is a number about a period the reader is not
+    /// looking at.
+    pub week_blocked_seconds: u64,
+    pub week_watched_seconds: u64,
 }
 
 impl WorkspaceActivity {

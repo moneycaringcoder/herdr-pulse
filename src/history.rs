@@ -1225,14 +1225,31 @@ impl History {
                     crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
                 );
                 // Over exactly the window the series covers, so the figure and
-                // the sparkline beside it describe the same stretch of time.
+                // the sparkline beside it describe the same stretch of time. A
+                // zero-column request draws nothing, so it measures nothing:
+                // measuring one bucket for a series with no columns in it would
+                // be a figure over a stretch no column shows.
                 let window = (columns as u64).saturating_mul(per_column);
-                let oldest = newest.saturating_sub(window.saturating_sub(1));
-                let (blocked_seconds, watched_seconds) = workspace.fine().blocked_and_watched(
-                    oldest,
-                    newest,
-                    config.bucket_seconds.max(1),
-                );
+                let (blocked_seconds, watched_seconds) = if window == 0 {
+                    (0, 0)
+                } else {
+                    workspace.fine().blocked_and_watched(
+                        newest.saturating_sub(window - 1),
+                        newest,
+                        config.bucket_seconds.max(1),
+                    )
+                };
+                // And the same again for the week, because a week row must
+                // report the week's blocked time rather than this afternoon's.
+                let week_newest = week_bucket_number(as_of);
+                let week_window = (crate::config::WEEK_COLUMNS as u64)
+                    .saturating_mul(crate::config::WEEK_BUCKETS_PER_COLUMN as u64);
+                let (week_blocked_seconds, week_watched_seconds) =
+                    workspace.week().blocked_and_watched(
+                        week_newest.saturating_sub(week_window.saturating_sub(1)),
+                        week_newest,
+                        crate::config::WEEK_BUCKET_SECONDS,
+                    );
                 WorkspaceActivity {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
@@ -1267,6 +1284,8 @@ impl History {
                     week,
                     blocked_seconds,
                     watched_seconds,
+                    week_blocked_seconds,
+                    week_watched_seconds,
                 }
             })
             .collect()
