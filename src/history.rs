@@ -285,6 +285,47 @@ impl<'a> RingRef<'a> {
             .collect()
     }
 
+    /// Transitions observed in each column, oldest first, `None` for a column
+    /// nobody watched.
+    ///
+    /// The distinction the `Option` carries is the whole point. A column with
+    /// observed buckets and no movement in them is `Some(0)`: we watched, and
+    /// nothing changed. A column nobody watched is `None`, and a renderer that
+    /// marked it would be drawing a moment it inferred rather than one anybody
+    /// saw — which is the invention this module exists to refuse, in a new place.
+    fn transitions(&self, newest_wanted: u64, columns: usize, per_column: u64) -> Vec<Option<u32>> {
+        let per_column = per_column.max(1);
+        let len = self.buckets.len() as u64;
+        (0..columns)
+            .map(|column| {
+                if len == 0 {
+                    return None;
+                }
+                let back = ((columns - 1 - column) as u64).saturating_mul(per_column);
+                let last = newest_wanted.checked_sub(back)?;
+                let first = last.saturating_sub(per_column - 1);
+                // Clamped to the live lap for the same reason `column` is: a
+                // slot from a previous lap is not this column's data.
+                let first = first.max(self.newest.saturating_sub(len - 1));
+                let last = last.min(self.newest);
+                if first > last {
+                    return None;
+                }
+                let mut total = 0u32;
+                let mut observed = false;
+                for number in first..=last {
+                    let bucket = self.bucket(number);
+                    if !bucket.observed() {
+                        continue;
+                    }
+                    observed = true;
+                    total = total.saturating_add(u32::from(bucket.transitions));
+                }
+                observed.then_some(total)
+            })
+            .collect()
+    }
+
     /// Blocked time and watched time over `first..=last`, both in seconds.
     ///
     /// The estimator is the one the sampler itself implies: within an observed
@@ -1482,6 +1523,7 @@ impl History {
                             last_seen: agent.last_seen,
                             blocked_seconds,
                             watched_seconds,
+                            transitions: ring.transitions(newest, columns, per_column),
                         }
                     })
                     .collect();
@@ -1489,6 +1531,12 @@ impl History {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
                     series,
+                    transitions: workspace.fine().transitions(newest, columns, per_column),
+                    week_transitions: workspace.week().transitions(
+                        week_newest,
+                        crate::config::WEEK_COLUMNS,
+                        crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
+                    ),
                     state: AgentState::parse(&workspace.state),
                     // Measured to the last observation, never to `as_of`. The
                     // difference is the whole point: an agent that was working

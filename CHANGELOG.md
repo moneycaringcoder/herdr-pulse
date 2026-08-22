@@ -53,6 +53,17 @@ All notable changes to this project are documented here. The format follows
   across the whole window. A gap contributes to neither figure: unobserved time
   is not time with no blocking in it.
 
+- The pane views now put a `^` marker line under workspace and recorded-agent
+  sparklines for columns in which pulse observed one or more state changes. Each
+  row shows at most three marks: the columns with the highest observed
+  transition counts, with ties going to the most recent column. That limit keeps
+  the annotation readable instead of drawing under every eligible column; the
+  single-line sidebar badge remains unchanged. A column nobody watched is never
+  marked, and pulse does not infer a transition across a gap, because that would
+  invent the moment the change happened. `--json` exposes the same evidence in
+  `transitions` arrays beside workspace and agent `series`, and in
+  `week_transitions` beside each workspace's `week`.
+
 ### Changed
 
 - A gap used to say only that nobody was watching, not why. The pane now follows

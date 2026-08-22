@@ -7,14 +7,6 @@ Everything below is measured against the one rule the plugin rests on: **a gap
 column is not a quiet column.** Any feature that would make "we were not
 watching" render as "nothing happened" is wrong no matter what else it buys.
 
-## More useful numbers
-
-### Mark transitions
-
-A column that shows activity does not show that the agent went `blocked` halfway
-through it. Annotating transitions in the wider pane views puts the moment
-something changed next to the shape of the work around it.
-
 ## Operating it
 
 ### Optional supervision

@@ -208,6 +208,18 @@ to the past tense:
 The sparkline says the same thing in glyphs: a stretch of `╌` is time nobody
 watched. The words and the sparkline are never allowed to disagree.
 
+Pane views put a `^` marker line directly under each workspace and
+recorded-agent sparkline, aligned column for column. The legend calls it
+`busiest observed changes, not every change`: each row marks at most three
+columns, choosing the highest observed transition counts and breaking ties
+toward the most recent column. This keeps the annotation readable instead of
+drawing under every eligible column. The single-line sidebar badge has no
+marker line.
+
+A gap column is never marked, and pulse never infers a transition between
+watched columns on opposite sides of a gap. Doing that would invent the moment
+the state changed.
+
 The pane's `blocked` cell shows the estimated duration alone. Its `?` means
 nothing in the row was watched, not that zero blocking was observed. The legend
 therefore says the figure is estimated over time actually watched rather than
@@ -234,6 +246,13 @@ exactly the window in `series`. The former is the blocked-time estimate; the
 latter is how many seconds of that window the sampler actually observed. They
 must be read together so the estimate is not mistaken for a measurement across
 the whole window. A gap contributes to neither field.
+
+`--json` exposes the same evidence in arrays aligned oldest-first,
+column-for-column with the activity arrays: each workspace has `transitions`
+beside `series` and `week_transitions` beside `week`, and each nested agent has
+`transitions` beside its `series`. A positive number is the observed state-change
+count, `0` means watched with no change, and `null` means nobody watched. A
+consumer must not bridge `null` entries to infer a change.
 
 The `--json` document also carries a top-level `sampler` object with `running`
 and `stopped`. Inside `stopped`, the fields are `reason`, `at` and `detail`;

@@ -64,6 +64,14 @@ pub const GAP: char = '╌';
 /// fits an 80-column terminal beside a label, a state and a duration.
 pub const PANE_COLUMNS: usize = 32;
 
+/// Marker drawn below the busiest columns in pane sparklines.
+///
+/// ASCII keeps its terminal width unambiguous on the same conservative basis
+/// as the state glyphs.
+pub const TRANSITION_MARKER: char = '^';
+
+const MAX_TRANSITION_MARKERS: usize = 3;
+
 /// Display columns a workspace label may occupy in the pane before it is
 /// elided. One pathological label must not widen every other row.
 const MAX_LABEL_WIDTH: usize = 28;
@@ -108,6 +116,52 @@ pub fn sparkline(series: &[Option<Level>]) -> String {
             Some(level) => RAMP[level.0.min(Level::MAX) as usize - 1],
         })
         .collect()
+}
+
+/// Marks the busiest observed transition columns below one sparkline.
+///
+/// At most three columns are marked, ranked by transition count with ties going
+/// to the most recent. A marker under every changed column would be a second
+/// sparkline nobody can read; the sparse line instead points to the moments
+/// something changed. A gap is never eligible, even if malformed input carries
+/// a count beside it, because no moment may be invented across unobserved time.
+fn transition_markers(series: &[Option<Level>], transitions: &[Option<u32>]) -> Option<String> {
+    let mut busiest = [None; MAX_TRANSITION_MARKERS];
+    for (index, (level, count)) in series.iter().zip(transitions).enumerate() {
+        let (Some(_), Some(count)) = (level, count) else {
+            continue;
+        };
+        if *count == 0 {
+            continue;
+        }
+        let position = busiest.iter().position(|slot| match slot {
+            Some((best_index, best_count)) => {
+                count > best_count || (count == best_count && index > *best_index)
+            }
+            None => true,
+        });
+        if let Some(position) = position {
+            for destination in ((position + 1)..MAX_TRANSITION_MARKERS).rev() {
+                busiest[destination] = busiest[destination - 1];
+            }
+            busiest[position] = Some((index, *count));
+        }
+    }
+    busiest[0]?;
+
+    // One leading cell skips the sparkline's opening bracket. Trailing blanks
+    // are removed because herdr trims them anyway and pane rows promise not to
+    // emit terminal whitespace.
+    let mut line = String::with_capacity(series.len() + 1);
+    line.push(' ');
+    for index in 0..series.len() {
+        let marked = busiest.iter().flatten().any(|(marked, _)| *marked == index);
+        line.push(if marked { TRANSITION_MARKER } else { ' ' });
+    }
+    while line.ends_with(' ') {
+        line.pop();
+    }
+    Some(line)
 }
 
 /// The sidebar badge for one workspace: a sparkline plus the current state.
@@ -343,6 +397,7 @@ fn render_pane(
     let explain_agents = activity
         .iter()
         .any(|workspace| !workspace.agents.is_empty());
+    let mut explain_transitions = false;
 
     let mut rows = vec![vec![
         "workspace".to_string(),
@@ -357,6 +412,8 @@ fn render_pane(
     for workspace in activity {
         let current = workspace.is_current(as_of, tolerance);
         any_stale |= !current;
+        let markers = transition_markers(&workspace.series, &workspace.transitions);
+
         rows.push(vec![
             clean_label(&workspace.label),
             // Bracketed so the series has visible ends. [`GAP`] is a printing
@@ -381,6 +438,11 @@ fn render_pane(
             duration(workspace.observed_ago(as_of)),
             workspace.agent_count.to_string(),
         ]);
+        if let Some(markers) = markers {
+            explain_transitions = true;
+            rows.push(vec![String::new(), markers]);
+        }
+
         // Agent rows share the workspace table rather than building a second,
         // hand-padded layout. Session provenance belongs to the aggregate, the
         // per-agent ring has no `for`, and the ragged row omits its agent count.
@@ -394,6 +456,8 @@ fn render_pane(
         for agent in agents {
             let current = as_of.saturating_sub(agent.last_seen) <= tolerance;
             any_stale |= !current;
+            let markers = transition_markers(&agent.series, &agent.transitions);
+
             // The pane id goes in the label whenever the program does not
             // identify the row on its own. Three panes running `claude` in one
             // workspace is the case this feature exists for, and three rows
@@ -425,6 +489,10 @@ fn render_pane(
                 String::new(),
                 duration(Some(as_of.saturating_sub(agent.last_seen))),
             ]);
+            if let Some(markers) = markers {
+                explain_transitions = true;
+                rows.push(vec![String::new(), markers]);
+            }
         }
     }
 
@@ -449,6 +517,7 @@ fn render_pane(
         any_stale,
         explain_sessions,
         explain_agents,
+        explain_transitions,
         session,
         view,
     ));
@@ -478,6 +547,8 @@ pub fn week_pane(
             &mut workspace.watched_seconds,
             &mut workspace.week_watched_seconds,
         );
+        std::mem::swap(&mut workspace.transitions, &mut workspace.week_transitions);
+
         // There is no coarse per-agent ring. Drawing the fine ring under a week
         // row would put an afternoon beside an axis labelled as seven days, so
         // the week view remains aggregate-only.
@@ -535,6 +606,11 @@ pub fn run_week(config: &Config) -> Result<()> {
 /// answers "did anything happen yesterday"; neither can be derived from the
 /// other.
 ///
+/// A level says how busy a column was; the transition array beside it says
+/// whether anything changed inside that column. Consumers need both to find a
+/// state change hidden inside a uniformly busy level without inventing one in a
+/// `null` column. The week carries the same pair at its own geometry.
+///
 /// `blocked_seconds` is estimated only over buckets the sampler observed, so it
 /// is paired with `watched_seconds` to expose the evidence behind that estimate.
 /// A consumer must not divide by the row's wall-clock width: gaps contribute to
@@ -585,6 +661,13 @@ fn json_series(series: &[Option<Level>]) -> Vec<Value> {
             Some(level) => json!(level.0.min(Level::MAX)),
             None => Value::Null,
         })
+        .collect()
+}
+
+fn json_transitions(transitions: &[Option<u32>]) -> Vec<Value> {
+    transitions
+        .iter()
+        .map(|count| count.map_or(Value::Null, |count| json!(count)))
         .collect()
 }
 
@@ -660,6 +743,7 @@ pub fn json_document(
                         "program": agent.program,
                         "state": agent.state.as_str(),
                         "series": json_series(&agent.series),
+                        "transitions": json_transitions(&agent.transitions),
                         "last_seen": agent.last_seen,
                         // The same two fields the workspace object carries, for
                         // the same reason: a consumer reading `"state":"working"`
@@ -687,7 +771,9 @@ pub fn json_document(
                 // glyphs exist to prevent, so the distinction is carried in the
                 // JSON type rather than in a sentinel number.
                 "series": json_series(&workspace.series),
+                "transitions": json_transitions(&workspace.transitions),
                 "week": json_series(&workspace.week),
+                "week_transitions": json_transitions(&workspace.week_transitions),
                 // The rendered form too, so a bug report can show what the user
                 // saw without asking them to screenshot a sidebar.
                 "sparkline": sparkline(&workspace.series),
@@ -882,14 +968,22 @@ fn legend(
     any_stale: bool,
     explain_sessions: bool,
     explain_agents: bool,
+    explain_transitions: bool,
     session: Option<&SessionMark>,
     view: PaneView,
 ) -> String {
     let ramp: String = RAMP.iter().collect();
-    let mut out = format!(
-        "legend  {ramp} busier  |  {QUIET} observed, nothing happened  |  \
-         {GAP} not observed\n"
-    );
+    let mut clauses = vec![
+        format!("{ramp} busier"),
+        format!("{QUIET} observed, nothing happened"),
+        format!("{GAP} not observed"),
+    ];
+    if explain_transitions {
+        clauses.push(format!(
+            "{TRANSITION_MARKER} busiest observed changes, not every change"
+        ));
+    }
+    let mut out = format!("legend  {}\n", clauses.join("  |  "));
     out.push_str(
         "        for = how long the state had held when last seen  |  \
          seen = how long ago that was\n",
