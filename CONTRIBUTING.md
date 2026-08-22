@@ -16,14 +16,16 @@ tokens. It does not prompt agents, send keys, kill processes, or touch a
 repository. A pull request that adds any of those is a different plugin, and the
 answer will be no however good the code is.
 
-Three properties are enforced by tests, and if your change makes one of them fail
+Five properties are enforced by tests, and if your change makes one of them fail
 the test is right and the change is wrong:
 
 | Property | Enforced by |
 |---|---|
-| Nothing is written outside the plugin's state directory | `tests/read_only.rs` |
-| No git invocation, and no subprocess beyond the daemon re-exec and `herdr server reload-config` | `tests/read_only.rs` |
+| Nothing is written outside the plugin's state directory, except the unit `--supervise` installs where the user asked for it | `tests/read_only.rs` |
+| No git invocation, and no subprocess beyond the daemon re-exec, `herdr server reload-config`, and the supervisor `--supervise` hands the sampler to | `tests/read_only.rs` |
 | No dependency that can open a network socket | `tests/read_only.rs` (audited allowlist over `Cargo.lock`) |
+| Every `--json` key path, with its type and nullability, is pinned | `tests/render.rs` (54 paths over two fixtures) |
+| `null` and `0` stay distinct in every `--json` array | `tests/render.rs` |
 
 **A gap is not a quiet period.** This is the correctness property that the whole
 design turns on. A bucket the sampler did not observe renders as a gap glyph,
@@ -83,6 +85,15 @@ prove it. Two habits are expected:
 
 If you change rendering, check the result in a real narrow sidebar. Alignment and
 column counts are the product here, not polish.
+
+If you change the `--json` document, read
+[docs/json-schema.md](docs/json-schema.md) first. The shape is a promise to
+anything scripting against it, and the two rules are short: a change a consumer
+could notice by reading the keys bumps `JSON_SCHEMA_VERSION`, and every visible
+change earns a changelog entry. The pinned list in `tests/render.rs` will fail
+the moment a key or a type moves — but it cannot tell whether the version should
+move with it, and it cannot see a unit or a meaning change at all. That decision
+is the reviewer's, which is why it is written down rather than automated.
 
 ## Commit messages
 

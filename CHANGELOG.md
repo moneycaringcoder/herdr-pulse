@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Every `--json` document now carries `"schema_version": 1`, and
+  `docs/json-schema.md` is the written contract: every field's type, unit and
+  meaning, and `null` as “not observed” kept distinct from `0` as “observed and
+  quiet” in every bucket array. A test pins all 54 key paths with the type and
+  nullability under each, so a key that is removed, renamed or moved, or a value
+  that changes type, fails the suite before it reaches a consumer's script.
 - Optional `--supervise` and `--unsupervise` verbs install or remove a systemd
   user unit on Linux or a launchd user agent on macOS. The installed definition
   runs the sampler at login and bakes in the state directory, socket path and
