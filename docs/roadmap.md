@@ -23,11 +23,3 @@ the edges is worse than one that is honestly narrow, and every way of guessing t
 width from what the protocol does expose is wrong on some layout. It becomes
 possible the day a snapshot says how many cells a token may occupy in a
 workspace's sidebar row, after the row's other tokens and herdr's eliding.
-
-## Interfaces
-
-### A versioned `--json` schema
-
-`--json` already distinguishes gaps as `null` from observed-quiet as `0`, which is
-the distinction the whole plugin exists to preserve. A schema version makes that
-contract explicit for anything scripting against it.

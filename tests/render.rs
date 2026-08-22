@@ -16,8 +16,9 @@ use pulse::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActiv
 use pulse::render::{
     badge, display_width, duration, fine_window, json_document, pane, pane_geometry,
     sampler_stop_message, sparkline, staleness_tolerance, state_glyph, week_pane, week_window,
-    SamplerState, GAP, QUIET, RAMP, TRANSITION_MARKER,
+    SamplerState, GAP, JSON_SCHEMA_VERSION, QUIET, RAMP, TRANSITION_MARKER,
 };
+use serde_json::Value;
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
 /// property of the test rather than of the wall clock.
@@ -2542,4 +2543,231 @@ fn json_carries_the_complete_sampler_stop() {
             },
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `--json` schema contract
+// ---------------------------------------------------------------------------
+
+/// Every key path in a document, `object.key` joined, arrays flattened to `[]`.
+///
+/// Shape, not values: the numbers change every time the sampler runs, and a test
+/// that pinned them would fail for reasons nobody cares about.
+fn key_paths(value: &Value) -> Vec<String> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    out.push(path.clone());
+                    walk(child, &path, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, &format!("{prefix}[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A document with every optional part populated, so nothing is missing from the
+/// shape by accident of the fixture.
+fn full_document() -> Value {
+    let live = session("live-fingerprint", 13 * 3_600);
+    let stop = SamplerStop {
+        reason: StopReason::Failed,
+        at: Some(AS_OF - 60),
+        detail: Some("history write failed".to_string()),
+    };
+    let mut workspace = with_agents(
+        with_blocked_time(
+            activity("web", levels(&[4, 0]), AgentState::Working, Some(60), 1),
+            30,
+            120,
+        ),
+        vec![agent(
+            "w1:p1",
+            Some("claude"),
+            vec![None, Some(Level(4))],
+            AgentState::Working,
+            7,
+            30,
+            120,
+        )],
+    );
+    workspace = recorded_by(workspace, &live);
+    workspace.week = vec![Some(Level(2)); WEEK_COLUMNS];
+    workspace.week_transitions = vec![Some(1); WEEK_COLUMNS];
+
+    json_document(
+        &Config::default(),
+        AS_OF,
+        2,
+        1,
+        &[workspace],
+        Some(&live),
+        stopped(&stop),
+    )
+}
+
+#[test]
+fn the_json_document_states_its_schema_version() {
+    // A consumer that has to guess which shape it is holding has to guess, and
+    // the guess it makes on a document from a newer pulse is the wrong one.
+    let document = full_document();
+
+    assert_eq!(
+        document["schema_version"].as_u64(),
+        Some(u64::from(JSON_SCHEMA_VERSION))
+    );
+}
+
+#[test]
+fn the_json_shape_cannot_move_without_the_schema_version_moving() {
+    // The whole point of versioning the document. If this test fails, the shape
+    // changed: decide whether it is a change a consumer could notice by reading
+    // the keys — a removal, a rename, a move between objects, a type or unit
+    // change, or a key that now means something else — and if so bump
+    // `JSON_SCHEMA_VERSION` and say so in CHANGELOG.md. A key added beside the
+    // existing ones is not a break, but it still belongs in both this list and
+    // the changelog.
+    //
+    // Values are deliberately not pinned. This is a promise about shape.
+    const SHAPE: [&str; 54] = [
+        "as_of",
+        "bucket_seconds",
+        "buckets_per_column",
+        "columns",
+        "level_max",
+        "sampler",
+        "sampler.running",
+        "sampler.stopped",
+        "sampler.stopped.at",
+        "sampler.stopped.detail",
+        "sampler.stopped.reason",
+        "schema_version",
+        "seconds_per_column",
+        "session",
+        "session.began",
+        "session.fingerprint",
+        "staleness_tolerance_seconds",
+        "week_bucket_seconds",
+        "week_buckets_per_column",
+        "week_columns",
+        "week_seconds_per_column",
+        "workspaces",
+        "workspaces[].agent_count",
+        "workspaces[].agents",
+        "workspaces[].agents[].blocked_seconds",
+        "workspaces[].agents[].last_seen",
+        "workspaces[].agents[].observed_ago_seconds",
+        "workspaces[].agents[].pane_id",
+        "workspaces[].agents[].program",
+        "workspaces[].agents[].series",
+        "workspaces[].agents[].state",
+        "workspaces[].agents[].state_is_current",
+        "workspaces[].agents[].transitions",
+        "workspaces[].agents[].watched_seconds",
+        "workspaces[].blocked_seconds",
+        "workspaces[].label",
+        "workspaces[].last_seen",
+        "workspaces[].observed_ago_seconds",
+        "workspaces[].series",
+        "workspaces[].session",
+        "workspaces[].session.began",
+        "workspaces[].session.fingerprint",
+        "workspaces[].session.is_current",
+        "workspaces[].sparkline",
+        "workspaces[].state",
+        "workspaces[].state_for_seconds",
+        "workspaces[].state_is_current",
+        "workspaces[].transitions",
+        "workspaces[].watched_seconds",
+        "workspaces[].week",
+        "workspaces[].week_blocked_seconds",
+        "workspaces[].week_transitions",
+        "workspaces[].week_watched_seconds",
+        "workspaces[].workspace_id",
+    ];
+
+    let found = key_paths(&full_document());
+    let mut expected: Vec<String> = SHAPE.iter().map(|key| (*key).to_string()).collect();
+    expected.sort();
+
+    assert_eq!(
+        found, expected,
+        "the --json shape moved at schema_version {JSON_SCHEMA_VERSION}"
+    );
+}
+
+#[test]
+fn the_schema_promises_null_is_not_zero_everywhere_it_appears() {
+    // The contract the version exists to protect. Four arrays carry it — the
+    // fine series, the week series, the transition counts and each agent's own
+    // series — and a consumer that coerces `null` to `0` in any of them turns
+    // "we were not watching" into "nothing happened".
+    let mut workspace = with_agents(
+        with_transitions(
+            activity(
+                "web",
+                vec![None, Some(Level(0))],
+                AgentState::Idle,
+                Some(1),
+                1,
+            ),
+            vec![None, Some(0)],
+        ),
+        vec![agent(
+            "w1:p1",
+            Some("claude"),
+            vec![None, Some(Level(0))],
+            AgentState::Idle,
+            1,
+            0,
+            60,
+        )],
+    );
+    workspace.week = vec![None, Some(Level(0))];
+    workspace.week_transitions = vec![None, Some(0)];
+
+    let document = json_document(
+        &Config::default(),
+        AS_OF,
+        2,
+        1,
+        &[workspace],
+        None,
+        running(),
+    );
+    let entry = &document["workspaces"][0];
+
+    for array in ["series", "week", "transitions", "week_transitions"] {
+        assert!(
+            entry[array][0].is_null(),
+            "{array}[0] is a bucket nobody observed: {}",
+            entry[array]
+        );
+        assert_eq!(
+            entry[array][1].as_u64(),
+            Some(0),
+            "{array}[1] was observed and had nothing in it"
+        );
+    }
+    for array in ["series", "transitions"] {
+        let agent = &entry["agents"][0][array];
+        assert!(agent[0].is_null(), "agent {array}[0] is a gap: {agent}");
+        assert_eq!(agent[1].as_u64(), Some(0), "agent {array}[1] is quiet");
+    }
 }

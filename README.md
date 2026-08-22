@@ -263,9 +263,13 @@ beside `series` and `week_transitions` beside `week`, and each nested agent has
 count, `0` means watched with no change, and `null` means nobody watched. A
 consumer must not bridge `null` entries to infer a change.
 
-The `--json` document also carries a top-level `sampler` object with `running`
-and `stopped`. Inside `stopped`, the fields are `reason`, `at` and `detail`;
-`reason` is one of `disabled`, `terminated`, `failed` or `unknown`.
+The `--json` document carries `"schema_version": 1` at its top level, and also a
+top-level `sampler` object with `running` and `stopped`. Inside `stopped`, the
+fields are `reason`, `at` and `detail`; `reason` is one of `disabled`,
+`terminated`, `failed` or `unknown`. That version is the consumer contract for
+the document's shape and field meanings; the
+[versioned JSON schema](docs/json-schema.md) lists every field and the
+load-bearing `null`-versus-`0` rule.
 
 ### Sessions are not spliced together
 

@@ -70,6 +70,37 @@ pub const PANE_COLUMNS: usize = 32;
 /// as the state glyphs.
 pub const TRANSITION_MARKER: char = '^';
 
+/// The `--json` document's schema version, carried in every document as
+/// `schema_version`.
+///
+/// # What this version promises
+///
+/// The document's *shape*: which keys exist, where they are nested, and what a
+/// value means. Not the values themselves, which change every time the sampler
+/// runs, and not the ordering of `workspaces`, which follows the order they were
+/// first seen.
+///
+/// The load-bearing part of the promise is the one the whole plugin exists for:
+/// **`null` in a series is a bucket nobody observed, and `0` is a bucket that
+/// was observed and had nothing in it.** They are different facts. A consumer
+/// that coerces `null` to `0` — a `serde` default, a `?? 0`, an
+/// `unwrap_or_default` — turns "we were not watching" into "nothing happened",
+/// which is the failure this plugin was written to prevent. The same rule holds
+/// for `transitions`, for the week arrays, and for every per-agent array.
+///
+/// # When it moves
+///
+/// Bump it, in the same pull request, for any change a consumer could notice by
+/// reading the shape: removing or renaming a key, moving one between objects,
+/// changing a value's type or unit, or changing what an existing key means.
+/// Adding a new key alongside the existing ones does not move it — a consumer
+/// reading the keys it knows is unaffected — but it does earn a changelog entry
+/// like any other visible change.
+///
+/// `tests/render.rs` pins the full set of key paths, so a shape that moves
+/// without this constant moving fails the suite rather than somebody's script.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
 const MAX_TRANSITION_MARKERS: usize = 3;
 
 /// Display columns a workspace label may occupy in the pane before it is
@@ -844,6 +875,12 @@ pub fn json_document(
         .collect();
 
     json!({
+        // At the top level rather than nested, so a consumer can identify the
+        // contract from the document root. Not "first": `json!` writes an
+        // ordered map, so the keys come out alphabetically and `as_of` leads.
+        // Key order is not part of the promise, and a document that only made
+        // sense read in order would be a promise JSON cannot keep.
+        "schema_version": JSON_SCHEMA_VERSION,
         "as_of": as_of,
         "session": {
             "fingerprint": session.map(|mark| mark.fingerprint.as_str()),

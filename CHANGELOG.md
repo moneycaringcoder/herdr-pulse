@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Every `--json` document now carries `"schema_version": 1`. The written
+  contract lists every field's type, unit and meaning, and keeps `null` as
+  “not observed” distinct from `0` as “observed and quiet” in every bucket
+  array. A shape-pinning test makes a consumer-visible change fail unless the
+  version moves with it.
+
 - Optional `--supervise` and `--unsupervise` verbs install or remove a systemd
   user unit on Linux or a launchd user agent on macOS. The installed definition
   runs the sampler at login and bakes in the state directory, socket path and
