@@ -52,6 +52,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -59,7 +60,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use crate::config;
-use crate::model::{AgentObservation, AgentState, Sample, WorkspaceObservation};
+use crate::model::{AgentObservation, AgentState, Sample, SessionMark, WorkspaceObservation};
 use crate::Result;
 
 /// Long enough that a busy server is not mistaken for a dead one, short enough
@@ -129,14 +130,20 @@ impl Herdr {
         })
     }
 
-    /// One `session.snapshot`, reduced to a [`Sample`] stamped with `taken_at`.
+    /// One `session.snapshot`, reduced to a [`Sample`] stamped with `taken_at`
+    /// and with the session it was read from.
     ///
     /// Workspaces are kept whether or not they are git repos and whether or not
     /// they currently have agents — a workspace that lost its agent still has a
     /// history worth showing.
+    ///
+    /// The session is read *before* the call, so a server that is replaced
+    /// mid-cycle attributes the snapshot to the session that was listening when
+    /// we asked rather than to whatever bound the socket afterwards.
     pub fn sample(&mut self, taken_at: u64) -> Result<Sample> {
+        let session = session_mark(&self.socket_path);
         let result = self.call("session.snapshot", json!({}))?;
-        reduce_snapshot(&result, taken_at)
+        reduce_snapshot(&result, session, taken_at)
     }
 
     /// Sets one badge token on a workspace, with a TTL so it self-clears if this
@@ -304,6 +311,42 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// The session behind a socket path, or `None` when it cannot be established.
+///
+/// herdr publishes no session identity — see [`SessionMark`] — so this is taken
+/// from the socket file the server bound: its device and inode identify it among
+/// every other socket on the machine, and its creation time is the moment the
+/// server started listening, which is the closest thing to "when this session
+/// began" that exists without having watched it start.
+///
+/// Reads metadata and nothing else: no connection, no subprocess, and nothing
+/// written. Cheap enough for `--once` to call on every invocation.
+///
+/// `None` on any failure, and on a path that is not a socket. An unattributable
+/// sample is a fact the store knows how to record; a guessed attribution is not.
+pub fn session_mark(socket_path: &Path) -> Option<SessionMark> {
+    let metadata = std::fs::metadata(socket_path).ok()?;
+    if !metadata.file_type().is_socket() {
+        return None;
+    }
+    // Creation time in its own right, rather than folded into the fingerprint
+    // only: `began` is what an interface shows a human, and the fingerprint is
+    // what equality is decided on. Nanoseconds are in the fingerprint because an
+    // inode number is reused once its file is gone, and two servers a second
+    // apart on the same inode would otherwise look like one session.
+    let began = metadata.ctime().max(0) as u64;
+    Some(SessionMark {
+        fingerprint: format!(
+            "{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            began,
+            metadata.ctime_nsec().max(0)
+        ),
+        began,
+    })
+}
+
 /// Reduces a raw `session.snapshot` result object to a [`Sample`].
 ///
 /// Split out from the socket so it can be tested against captured real
@@ -312,7 +355,15 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
 ///
 /// Returns an error — never an empty sample — when `snapshot` is absent, so a
 /// protocol change is loud rather than looking like an idle session.
-pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
+///
+/// `session` is passed in rather than read here: the reduction is a pure
+/// function over a captured snapshot, and the session comes from the socket that
+/// answered, which a fixture does not have.
+pub fn reduce_snapshot(
+    result: &Value,
+    session: Option<SessionMark>,
+    taken_at: u64,
+) -> Result<Sample> {
     // Absent (or non-object) `snapshot` is an error rather than a fallback. An
     // empty workspace list is indistinguishable from an idle session, so
     // silently returning one would hide the breakage exactly the way the
@@ -400,6 +451,7 @@ pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
 
     Ok(Sample {
         taken_at,
+        session,
         workspaces,
     })
 }

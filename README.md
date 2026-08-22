@@ -173,6 +173,7 @@ pulse --once
 |---|---|
 | `workspace` | The workspace's label. |
 | `activity` | The sparkline, oldest column on the left, newest on the right. |
+| `session` | When the herdr session that recorded this row started listening. Parenthesised — `(20:53)` — for a session other than the one running now, and `?` when it could not be established. |
 | `state` | The state the workspace was in **at the last observation**. |
 | `for` | How long that state had held when we last looked. |
 | `seen` | How long ago that observation was. |
@@ -196,6 +197,27 @@ watched. The words and the sparkline are never allowed to disagree.
 each workspace has `last_seen`, `observed_ago_seconds` and `state_is_current`,
 and the document has the `staleness_tolerance_seconds` those were judged
 against.
+
+### Sessions are not spliced together
+
+herdr's workspace ids, pane ids and state-change counter are all scoped to one
+run of the server, so nothing recorded under one session can be compared with
+anything recorded under another. pulse therefore keeps one series per session and
+labels each with the `session` column, rather than appending them into a single
+timeline that would imply an unbroken watch across a restart. A workspace that
+has been watched by two sessions gets two rows, and each row's sparkline covers
+only the minutes that session observed.
+
+The earlier session's bars are still real observed history and are still drawn:
+the seam is marked, never blanked. Blanking it would say "nobody was watching",
+which is the one thing this plugin refuses to say when somebody was.
+
+herdr publishes no session identity — there is no session id, start time or boot
+counter anywhere in `session.snapshot` — so pulse fingerprints the socket it read
+the snapshot from. That can split one session in two if the socket is ever
+re-bound under a live server; it cannot merge two sessions into one, which is the
+error that would matter. `--json` carries the fingerprint, the session's start
+time, and `is_current` per workspace, plus the live session at the top level.
 
 ### Sampler
 
@@ -323,6 +345,13 @@ cycle — cheap enough that the finer resolution is worth having.
   such key: for those, a label that changes under an id is treated as a different
   workspace and the recorded buckets are dropped rather than attributed to it —
   an empty sparkline is a visible loss, a wrong one is not.
+- A series belongs to one herdr session and is never appended to another's. A
+  restart therefore starts a new row rather than extending the old one, and the
+  badge — which has room for one series and one workspace id — shows the live
+  session's row only. The earlier row stays in the pane and in `--json` until it
+  ages out.
+- The badge cannot say which session it is drawing; there is no room in a sidebar
+  cell for it. The pane and `--json` can, and do.
 - Changing `bucket_seconds` invalidates the recorded history, which is discarded
   with a message on the next run. Two bucket scales cannot share one series.
 

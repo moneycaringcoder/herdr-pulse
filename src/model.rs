@@ -157,11 +157,44 @@ impl WorkspaceObservation {
     }
 }
 
+/// Which herdr session a snapshot came from, as far as pulse can establish it.
+///
+/// herdr reports no session identity of its own: `session.snapshot` carries a
+/// version and a protocol number and nothing that distinguishes this run of the
+/// server from the last one, and every `server.*` method is an action rather
+/// than a read. So the identity is taken from the thing pulse is talking to —
+/// the bound socket at `HERDR_SOCKET_PATH`.
+///
+/// What that proves and what it does not is the whole point of this type, and
+/// `docs/herdr-protocol.md` records both. It is deliberately conservative: it
+/// can report two sessions where there was one (a live handoff re-binds the
+/// socket without ending the session), which costs a split in the history. The
+/// opposite error — reporting one session where there were two — would join two
+/// incomparable series, so the conservative direction is the correct one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMark {
+    /// Opaque fingerprint of the socket: device, inode and creation time. Only
+    /// ever compared for equality; nothing reads its parts.
+    pub fingerprint: String,
+    /// Unix seconds at which that socket was created, which is when this session
+    /// started listening. Known without having watched it happen, so a series
+    /// can say which session recorded it even on the sampler's first cycle.
+    pub began: u64,
+}
+
 /// One complete `session.snapshot`, reduced to what this plugin records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
     /// Seconds since the Unix epoch, taken when the snapshot was received.
     pub taken_at: u64,
+    /// The session this snapshot was read from, or `None` when it could not be
+    /// established.
+    ///
+    /// `None` is not "the same session as last time". Two samples pulse cannot
+    /// attribute are two samples it cannot tell apart, and the store treats an
+    /// unknown session as its own unnameable one rather than folding it into a
+    /// named series it might not belong to.
+    pub session: Option<SessionMark>,
     pub workspaces: Vec<WorkspaceObservation>,
 }
 
@@ -234,6 +267,16 @@ pub struct WorkspaceActivity {
     /// fact from a stale one, and every renderer would have to guess.
     pub last_seen: Option<u64>,
     pub agent_count: usize,
+    /// Fingerprint of the herdr session that recorded this series, or `None`
+    /// when the session could not be established.
+    ///
+    /// Two rows for one workspace with different fingerprints are two series,
+    /// not one interrupted one: workspace ids, pane ids and `state_change_seq`
+    /// are all session-scoped, so nothing recorded under one session is
+    /// comparable with anything recorded under another.
+    pub session: Option<String>,
+    /// Unix seconds at which that session started listening, when known.
+    pub session_began: Option<u64>,
 }
 
 impl WorkspaceActivity {
@@ -253,6 +296,16 @@ impl WorkspaceActivity {
     /// to "stale", while a stopped daemon does so quickly.
     pub fn is_current(&self, as_of: u64, tolerance: u64) -> bool {
         self.observed_ago(as_of).is_some_and(|ago| ago <= tolerance)
+    }
+
+    /// Whether this series was recorded by `mark`'s session.
+    ///
+    /// An unknown session matches only another unknown one, and never a named
+    /// one: two samples pulse could not attribute are not evidence of a shared
+    /// session, and treating them as one is the join this type exists to
+    /// prevent.
+    pub fn is_session(&self, mark: Option<&SessionMark>) -> bool {
+        self.session.as_deref() == mark.map(|mark| mark.fingerprint.as_str())
     }
 }
 

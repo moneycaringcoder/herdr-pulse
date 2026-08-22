@@ -24,6 +24,36 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Series are kept per herdr session, and every interface says which session a
+  series belongs to. Workspace ids, pane ids and `state_change_seq` are all
+  scoped to one run of the server, so buckets recorded under two sessions were
+  never comparable — and appending them into one sparkline claimed an unbroken
+  watch across a restart nobody watched across. The store now holds one series
+  per (workspace, session); the pane gains a `session` column giving the time
+  that session started listening, parenthesised when it is not the session
+  running now and `?` when it could not be established; and `--json` carries the
+  fingerprint, start time and `is_current` per workspace plus the live session at
+  the top level.
+
+  The earlier session's observed buckets are still drawn as the bars they are.
+  The seam is marked, never blanked: blanking it would say nobody was watching
+  when somebody was, which is the error this plugin exists to refuse.
+
+  Two consequences worth stating. A badge is one series against one
+  session-scoped id, so only the live session's rows are badge targets — a badge
+  pushed to an id inherited from an ended session can land on a different
+  workspace entirely. And a first sample after a restart no longer counts a
+  transition per agent: `state_change_seq` starts over, and comparing it across
+  sessions manufactured churn out of a reset counter.
+
+  herdr publishes no session identity — verified against a live 0.8.0 server's
+  own schema, where `SessionSnapshot` has no session id, start time or boot
+  counter, and every `server.*` method is an action rather than a read — so pulse
+  fingerprints the socket it read the snapshot from. That can report two sessions
+  where there was one, which splits a history; it cannot report one where there
+  were two, which would join two incomparable series. A history file written by
+  0.1.0 keeps its buckets as one unattributable session rather than being claimed
+  by whichever session happens to be running now.
 - History survives a reused workspace id. herdr's ids are session-scoped, and a
   workspace that came back under an id somebody else had been using lost every
   recorded bucket. The store now keys a series on the workspace's checkout path

@@ -67,7 +67,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
-use crate::model::{AgentState, Level, Sample, WorkspaceActivity, WorkspaceObservation};
+use crate::model::{
+    AgentState, Level, Sample, SessionMark, WorkspaceActivity, WorkspaceObservation,
+};
 use crate::Result;
 
 /// Bump when the on-disk shape changes incompatibly. A file whose version is
@@ -169,9 +171,14 @@ impl Bucket {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceHistory {
     /// The session-scoped id herdr used for this workspace at the last
-    /// observation. Unique across the store, because it is what a badge is
-    /// pushed to: two entries sharing an id would push two different sparklines
-    /// to one workspace and the last write would win.
+    /// observation. Unique *within a session*, because it is what a badge is
+    /// pushed to: two entries of one session sharing an id would push two
+    /// different sparklines to one workspace and the last write would win.
+    ///
+    /// Entries from different sessions may hold the same id, because that is
+    /// what a session-scoped id means. Only the live session's entries are badge
+    /// targets; an id from a session that has ended may belong to somebody else
+    /// now.
     pub workspace_id: String,
     /// The workspace's label when it was last seen.
     pub label: String,
@@ -190,6 +197,30 @@ pub struct WorkspaceHistory {
     /// on the old evidence and stamps the path onto it.
     #[serde(default)]
     pub checkout_path: Option<String>,
+    /// Fingerprint of the herdr session that recorded this ring, or `None` for a
+    /// ring whose session could not be established.
+    ///
+    /// This is the other half of identity, and it is not the same question as
+    /// [`Self::checkout_path`]. The path answers *which workspace* these buckets
+    /// belong to; the session answers *which watch* recorded them. Workspace ids,
+    /// pane ids and `state_change_seq` are all session-scoped, so buckets from
+    /// two sessions cannot be compared, appended, or drawn as one series however
+    /// certain we are that they describe the same checkout.
+    ///
+    /// An unknown session matches only another unknown one. Two samples pulse
+    /// could not attribute are two samples it cannot tell apart, and joining
+    /// them would state a continuity nobody observed.
+    ///
+    /// Defaulted on load, so a file written before this field existed reads as
+    /// one unattributable session rather than being claimed by the session that
+    /// happens to be running now.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Unix seconds at which that session started listening, when known. Carried
+    /// so an interface can name the session a series belongs to without having
+    /// watched it start.
+    #[serde(default)]
+    pub session_began: Option<u64>,
     /// Ring of buckets, indexed by absolute bucket number modulo the ring
     /// length. Fixed length; never grown.
     pub buckets: Vec<Bucket>,
@@ -228,6 +259,7 @@ impl WorkspaceHistory {
     fn new(
         observation: &WorkspaceObservation,
         durable: Option<&str>,
+        session: Option<&SessionMark>,
         taken_at: u64,
         config: &Config,
     ) -> Self {
@@ -235,6 +267,8 @@ impl WorkspaceHistory {
             workspace_id: observation.workspace_id.clone(),
             label: observation.label.clone(),
             checkout_path: durable.map(str::to_string),
+            session: session.map(|mark| mark.fingerprint.clone()),
+            session_began: session.map(|mark| mark.began),
             buckets: vec![Bucket::default(); config.retention_buckets],
             newest_bucket: bucket_number(taken_at, config),
             state: observation.state().as_str().to_string(),
@@ -577,8 +611,13 @@ impl History {
                 continue;
             }
             let durable = durable_key(observation, &sample.workspaces);
-            let (index, was_rewound) =
-                self.record_workspace(observation, durable, sample.taken_at, config);
+            let (index, was_rewound) = self.record_workspace(
+                observation,
+                durable,
+                sample.session.as_ref(),
+                sample.taken_at,
+                config,
+            );
             if was_rewound {
                 rewound += 1;
             }
@@ -603,7 +642,7 @@ impl History {
                  discarded the unreachable buckets for {rewound} workspace(s) and resumed recording"
             );
         }
-        let displaced = self.drop_reused_ids(&live);
+        let displaced = self.drop_reused_ids(&live, sample.session.as_ref());
         if displaced > 0 {
             eprintln!(
                 "pulse: herdr reused {displaced} workspace id(s) for a different workspace; \
@@ -621,10 +660,11 @@ impl History {
         &mut self,
         observation: &WorkspaceObservation,
         durable: Option<&str>,
+        session: Option<&SessionMark>,
         taken_at: u64,
         config: &Config,
     ) -> (usize, bool) {
-        let index = match self.locate(observation, durable) {
+        let index = match self.locate(observation, durable, session) {
             Some(index) => {
                 // The same workspace, so the series continues. Everything herdr
                 // may have changed about it since the last sample — the
@@ -656,6 +696,7 @@ impl History {
                 self.workspaces.push(WorkspaceHistory::new(
                     observation,
                     durable,
+                    session,
                     taken_at,
                     config,
                 ));
@@ -675,6 +716,14 @@ impl History {
     /// are the durable checkout path, and — for a workspace herdr reports no
     /// worktree for — an unchanged id and label together.
     ///
+    /// Both are only ever looked for **within the sample's session**. A ring
+    /// recorded by another herdr session is not a candidate however well its
+    /// checkout matches: its ids and its `state_change_seq` values come from a
+    /// counter that no longer exists, and appending to it would draw one
+    /// unbroken watch across a boundary nobody watched across. The two questions
+    /// compose — the path says which workspace, the session says which watch —
+    /// and neither answers the other.
+    ///
     /// Note what a durable key deliberately does *not* fall back to. An
     /// observation carrying a checkout path that matches no entry is not the
     /// workspace whose entry merely shares its id and label: two worktrees of one
@@ -684,21 +733,32 @@ impl History {
     /// file written before this field existed or a workspace herdr has only just
     /// started reporting a worktree for — there the old evidence is all there
     /// ever was, and it is the same evidence the store used when it recorded it.
-    fn locate(&self, observation: &WorkspaceObservation, durable: Option<&str>) -> Option<usize> {
+    fn locate(
+        &self,
+        observation: &WorkspaceObservation,
+        durable: Option<&str>,
+        session: Option<&SessionMark>,
+    ) -> Option<usize> {
+        let fingerprint = session.map(|mark| mark.fingerprint.as_str());
+        let same_session = move |entry: &WorkspaceHistory| entry.session.as_deref() == fingerprint;
         let named = |entry: &WorkspaceHistory| {
             entry.workspace_id == observation.workspace_id && entry.label == observation.label
         };
-        match durable {
-            Some(path) => self
-                .workspaces
+        let find = |predicate: &dyn Fn(&WorkspaceHistory) -> bool| {
+            self.workspaces
                 .iter()
-                .position(|entry| entry.checkout_path.as_deref() == Some(path))
-                .or_else(|| {
-                    self.workspaces
-                        .iter()
-                        .position(|entry| entry.checkout_path.is_none() && named(entry))
-                }),
-            None => self.workspaces.iter().position(named),
+                .position(|entry| same_session(entry) && predicate(entry))
+        };
+        match durable {
+            Some(path) => {
+                find(&|entry: &WorkspaceHistory| entry.checkout_path.as_deref() == Some(path))
+                    .or_else(|| {
+                        find(&|entry: &WorkspaceHistory| {
+                            entry.checkout_path.is_none() && named(entry)
+                        })
+                    })
+            }
+            None => find(&named),
         }
     }
 
@@ -711,10 +771,16 @@ impl History {
     /// remains that can identify it — a session-scoped id is the only handle a
     /// badge has, so it cannot be kept beside the workspace that now owns the id.
     ///
+    /// Only entries of the *same* session are candidates. An id in a session that
+    /// has ended was never a claim on this one: it is exactly as session-scoped
+    /// as herdr says it is, and its ring is kept as that session's record until
+    /// eviction ages it out.
+    ///
     /// Deliberately once per sample rather than per observation: an id that looks
     /// displaced halfway through a sample may be re-keyed by a later observation
     /// in the same one, which is what a two-workspace swap looks like.
-    fn drop_reused_ids(&mut self, live: &[usize]) -> usize {
+    fn drop_reused_ids(&mut self, live: &[usize], session: Option<&SessionMark>) -> usize {
+        let fingerprint = session.map(|mark| mark.fingerprint.as_str());
         let claimed: Vec<String> = live
             .iter()
             .map(|index| self.workspaces[*index].workspace_id.clone())
@@ -723,7 +789,11 @@ impl History {
         let kept: Vec<WorkspaceHistory> = std::mem::take(&mut self.workspaces)
             .into_iter()
             .enumerate()
-            .filter(|(index, entry)| live.contains(index) || !claimed.contains(&entry.workspace_id))
+            .filter(|(index, entry)| {
+                live.contains(index)
+                    || entry.session.as_deref() != fingerprint
+                    || !claimed.contains(&entry.workspace_id)
+            })
             .map(|(_, entry)| entry)
             .collect();
         self.workspaces = kept;
@@ -770,19 +840,28 @@ impl History {
         // duplicate checkout path is the same failure through the durable key:
         // `locate` would find the first entry every time and the second would sit
         // there frozen, still being drawn. First occurrence wins in both cases.
-        let mut ids: Vec<String> = Vec::new();
-        let mut paths: Vec<String> = Vec::new();
+        //
+        // Both keys are scoped by session, because both are things herdr scopes
+        // by session: one workspace's ring in this session and another's in a
+        // session that has ended may legitimately carry the same id, and one
+        // checkout may legitimately have been watched by two sessions in turn.
+        // Deduplicating across sessions would delete a series that is not a
+        // duplicate of anything.
+        let mut ids: Vec<(Option<String>, String)> = Vec::new();
+        let mut paths: Vec<(Option<String>, String)> = Vec::new();
         self.workspaces.retain(|workspace| {
-            if ids.iter().any(|id| id == &workspace.workspace_id) {
+            let id = (workspace.session.clone(), workspace.workspace_id.clone());
+            if ids.contains(&id) {
                 return false;
             }
             if let Some(path) = &workspace.checkout_path {
-                if paths.contains(path) {
+                let keyed = (workspace.session.clone(), path.clone());
+                if paths.contains(&keyed) {
                     return false;
                 }
-                paths.push(path.clone());
+                paths.push(keyed);
             }
-            ids.push(workspace.workspace_id.clone());
+            ids.push(id);
             true
         });
         for workspace in &mut self.workspaces {
@@ -856,6 +935,10 @@ impl History {
                     // sighting, which would read as ancient-but-real.
                     last_seen: Some(workspace.last_seen).filter(|seen| *seen > 0),
                     agent_count: workspace.agent_seqs.len(),
+                    // Provenance, so nothing downstream has to assume that two
+                    // rows for one checkout are one interrupted series.
+                    session: workspace.session.clone(),
+                    session_began: workspace.session_began,
                 }
             })
             .collect()

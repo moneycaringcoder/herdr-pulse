@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use pulse::config::Config;
-use pulse::model::{AgentState, Level, WorkspaceActivity};
+use pulse::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
     badge, display_width, duration, json_document, pane, pane_geometry, sparkline,
     staleness_tolerance, state_glyph, GAP, QUIET, RAMP,
@@ -37,6 +37,23 @@ fn activity(
         state_for,
         last_seen: Some(AS_OF),
         agent_count,
+        session: None,
+        session_began: None,
+    }
+}
+
+fn session(fingerprint: &str, began: u64) -> SessionMark {
+    SessionMark {
+        fingerprint: fingerprint.to_string(),
+        began,
+    }
+}
+
+fn recorded_by(activity: WorkspaceActivity, session: &SessionMark) -> WorkspaceActivity {
+    WorkspaceActivity {
+        session: Some(session.fingerprint.clone()),
+        session_began: Some(session.began),
+        ..activity
     }
 }
 
@@ -495,7 +512,136 @@ fn column_offsets(rendered: &str, marker: char) -> Vec<usize> {
 }
 
 fn sample_pane(rows: Vec<WorkspaceActivity>) -> String {
-    pane(&rows, &Config::default(), AS_OF)
+    pane(&rows, &Config::default(), AS_OF, None)
+}
+
+#[test]
+fn a_live_session_and_an_earlier_session_are_labelled_differently() {
+    let live = session("live-fingerprint", 13 * 3_600 + 28 * 60 + 59);
+    let earlier = session("earlier-fingerprint", 3 * 3_600 + 7 * 60 + 42);
+    let rendered = pane(
+        &[
+            recorded_by(
+                activity("current", levels(&[5]), AgentState::Working, Some(4), 1),
+                &live,
+            ),
+            recorded_by(
+                activity("earlier", levels(&[8]), AgentState::Working, Some(4), 1),
+                &earlier,
+            ),
+        ],
+        &Config::default(),
+        AS_OF,
+        Some(&live),
+    );
+
+    let heading: Vec<&str> = rendered
+        .lines()
+        .find(|line| line.starts_with("workspace"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        heading,
+        [
+            "workspace",
+            "activity",
+            "session",
+            "state",
+            "for",
+            "seen",
+            "agents"
+        ]
+    );
+
+    let current: Vec<&str> = row_for(&rendered, "current").split_whitespace().collect();
+    let earlier_row = row_for(&rendered, "earlier");
+    let earlier_fields: Vec<&str> = earlier_row.split_whitespace().collect();
+    assert_eq!(current[2], "13:28", "{rendered}");
+    assert_eq!(earlier_fields[2], "(03:07)", "{rendered}");
+    assert!(
+        rendered.contains("parentheses = an earlier session than the one running now"),
+        "the earlier-session notation is unexplained:\n{rendered}"
+    );
+
+    // Provenance labels the old series; it never erases an observation from it.
+    assert!(earlier_row.contains("[█]"), "{earlier_row:?}");
+    assert!(
+        !earlier_row.contains(GAP),
+        "an earlier session's observed bucket became a gap: {earlier_row:?}"
+    );
+
+    let only_live = pane(
+        &[recorded_by(
+            activity("current", levels(&[5]), AgentState::Working, Some(4), 1),
+            &live,
+        )],
+        &Config::default(),
+        AS_OF,
+        Some(&live),
+    );
+    assert!(
+        !only_live.contains("parentheses ="),
+        "a pane containing only the live session explains an unused notation:\n{only_live}"
+    );
+}
+
+#[test]
+fn an_unknown_session_is_bare_only_when_the_live_session_is_also_unknown() {
+    let live = session("live-fingerprint", 13 * 3_600 + 28 * 60);
+    let row = activity("unknown", levels(&[4]), AgentState::Idle, Some(1), 1);
+
+    let with_live = pane(
+        std::slice::from_ref(&row),
+        &Config::default(),
+        AS_OF,
+        Some(&live),
+    );
+    let fields: Vec<&str> = row_for(&with_live, "unknown").split_whitespace().collect();
+    assert_eq!(fields[2], "(?)", "{with_live}");
+    assert!(
+        with_live.contains("? = session could not be established"),
+        "the unknown marker is unexplained:\n{with_live}"
+    );
+
+    let without_live = pane(&[row], &Config::default(), AS_OF, None);
+    let fields: Vec<&str> = row_for(&without_live, "unknown")
+        .split_whitespace()
+        .collect();
+    assert_eq!(fields[2], "?", "{without_live}");
+}
+
+#[test]
+fn a_parenthesised_session_does_not_shift_the_columns_after_it() {
+    let live = session("live-fingerprint", 13 * 3_600 + 28 * 60);
+    let earlier = session("earlier-fingerprint", 3 * 3_600 + 7 * 60);
+    let rendered = pane(
+        &[
+            recorded_by(
+                activity("live", levels(&[4]), AgentState::Working, Some(1), 1),
+                &live,
+            ),
+            recorded_by(
+                activity("old", levels(&[4]), AgentState::Working, Some(1), 1),
+                &earlier,
+            ),
+        ],
+        &Config::default(),
+        AS_OF,
+        Some(&live),
+    );
+
+    let state_offsets: Vec<usize> = ["live", "old"]
+        .iter()
+        .map(|label| {
+            let row = row_for(&rendered, label);
+            let state = row
+                .find("> working")
+                .unwrap_or_else(|| panic!("no state column in {row:?}"));
+            display_width(&row[..state])
+        })
+        .collect();
+    assert_eq!(state_offsets[0], state_offsets[1], "\n{rendered}");
 }
 
 #[test]
@@ -593,7 +739,7 @@ fn pane_columns_line_up_when_sparklines_contain_gaps() {
 
 #[test]
 fn a_pane_with_nothing_recorded_says_so_rather_than_drawing_an_empty_table() {
-    let rendered = pane(&[], &Config::default(), AS_OF);
+    let rendered = pane(&[], &Config::default(), AS_OF, None);
     assert!(rendered.to_lowercase().contains("no workspace history"));
     assert!(rendered.contains("--enable"));
     // An empty table would read as "we looked, and every workspace was quiet".
@@ -726,6 +872,7 @@ fn the_freshness_line_falls_exactly_on_the_tolerance() {
         )],
         &config,
         AS_OF,
+        None,
     );
     assert!(
         !row_for(&at, "edge").contains("was"),
@@ -739,6 +886,7 @@ fn the_freshness_line_falls_exactly_on_the_tolerance() {
         )],
         &config,
         AS_OF,
+        None,
     );
     assert!(
         row_for(&past, "edge").contains("was working"),
@@ -867,6 +1015,7 @@ fn the_pane_labels_its_timescale_only_when_the_series_matches_the_configuration(
         )],
         &config,
         0,
+        None,
     );
     assert!(matching.contains("one column = 7m"), "{matching}");
     assert!(matching.contains("whole row = 3h44"), "{matching}");
@@ -980,7 +1129,7 @@ fn the_pane_never_panics_on_awkward_input() {
         },
     ];
     for as_of in [0u64, 1, 86_399, u64::MAX] {
-        let rendered = pane(&rows, &config, as_of);
+        let rendered = pane(&rows, &config, as_of, None);
         assert!(!rendered.is_empty());
     }
 }
@@ -992,6 +1141,7 @@ fn the_pane_clock_is_a_valid_time_of_day_for_any_timestamp() {
             &[activity("web", levels(&[1]), AgentState::Idle, Some(1), 1)],
             &Config::default(),
             as_of,
+            None,
         );
         let header = rendered.lines().next().unwrap_or_default();
         let clock = header
@@ -1100,7 +1250,7 @@ fn json_series_tells_a_gap_from_an_observed_quiet_bucket() {
     let series = vec![None, Some(Level::new(0)), Some(Level::new(5))];
     let workspace = activity("w1", series, AgentState::Idle, None, 1);
 
-    let document = json_document(&config, AS_OF, 3, 1, &[workspace]);
+    let document = json_document(&config, AS_OF, 3, 1, &[workspace], None);
     let series = &document["workspaces"][0]["series"];
 
     assert!(
@@ -1115,4 +1265,61 @@ fn json_series_tells_a_gap_from_an_observed_quiet_bucket() {
         series[2], 5,
         "an observed active bucket lost its level: {series}"
     );
+}
+
+#[test]
+fn json_carries_the_live_and_per_workspace_session_marks() {
+    let config = Config::default();
+    let live = session("live-fingerprint", 13 * 3_600 + 28 * 60);
+    let earlier = session("earlier-fingerprint", 3 * 3_600 + 7 * 60);
+    let mut current = recorded_by(
+        activity(
+            "checkout-live",
+            levels(&[4]),
+            AgentState::Working,
+            Some(1),
+            1,
+        ),
+        &live,
+    );
+    let mut old = recorded_by(
+        activity("checkout-old", levels(&[8]), AgentState::Done, Some(1), 0),
+        &earlier,
+    );
+    // The same checkout can have one independent series from each herdr run.
+    current.workspace_id = "same-checkout".to_string();
+    old.workspace_id = "same-checkout".to_string();
+
+    let document = json_document(&config, AS_OF, 1, 1, &[current, old], Some(&live));
+    assert_eq!(
+        document["session"]["fingerprint"].as_str(),
+        Some("live-fingerprint")
+    );
+    assert_eq!(
+        document["session"]["began"].as_u64(),
+        Some(13 * 3_600 + 28 * 60)
+    );
+
+    let current_session = &document["workspaces"][0]["session"];
+    assert_eq!(
+        current_session["fingerprint"].as_str(),
+        Some("live-fingerprint")
+    );
+    assert_eq!(
+        current_session["began"].as_u64(),
+        Some(13 * 3_600 + 28 * 60)
+    );
+    assert_eq!(current_session["is_current"].as_bool(), Some(true));
+
+    let earlier_session = &document["workspaces"][1]["session"];
+    assert_eq!(
+        earlier_session["fingerprint"].as_str(),
+        Some("earlier-fingerprint")
+    );
+    assert_eq!(earlier_session["began"].as_u64(), Some(3 * 3_600 + 7 * 60));
+    assert_eq!(earlier_session["is_current"].as_bool(), Some(false));
+
+    let unknown = json_document(&config, AS_OF, 0, 1, &[], None);
+    assert!(unknown["session"]["fingerprint"].is_null());
+    assert!(unknown["session"]["began"].is_null());
 }

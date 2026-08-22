@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pulse::config::Config;
 use pulse::history::{self, Bucket, History, FORMAT_VERSION};
-use pulse::model::{AgentObservation, AgentState, Level, Sample, WorkspaceObservation};
+use pulse::model::{
+    AgentObservation, AgentState, Level, Sample, SessionMark, WorkspaceObservation,
+};
 
 /// A minute-aligned instant, so a test that adds 60 seconds moves exactly one
 /// bucket and a test that adds 5 does not.
@@ -65,17 +67,45 @@ fn checkout(
     }
 }
 
-/// A sample of a single workspace, which is what most of these tests need.
-fn one(taken_at: u64, id: &str, label: &str, agents: &[(&str, &str, u64)]) -> Sample {
-    Sample {
-        taken_at,
-        workspaces: vec![workspace(id, label, agents)],
+/// The session every helper stamps a sample with unless a test says otherwise.
+///
+/// Named rather than unknown, because production practically always has a mark:
+/// the socket the snapshot was read from is right there to stat. A suite that
+/// defaulted to "session unknown" would be testing the degenerate path
+/// everywhere and the ordinary one nowhere.
+fn session_a() -> SessionMark {
+    SessionMark {
+        fingerprint: "2049:1001:1699990000:0".to_string(),
+        began: T0 - 3600,
     }
 }
 
+/// A second herdr session: a different socket, bound later.
+fn session_b() -> SessionMark {
+    SessionMark {
+        fingerprint: "2049:2002:1699999900:0".to_string(),
+        began: T0 - 60,
+    }
+}
+
+/// A sample of a single workspace, which is what most of these tests need.
+fn one(taken_at: u64, id: &str, label: &str, agents: &[(&str, &str, u64)]) -> Sample {
+    sample(taken_at, vec![workspace(id, label, agents)])
+}
+
 fn sample(taken_at: u64, workspaces: Vec<WorkspaceObservation>) -> Sample {
+    sample_in(taken_at, Some(session_a()), workspaces)
+}
+
+/// A sample attributed to a named session, or to none at all.
+fn sample_in(
+    taken_at: u64,
+    session: Option<SessionMark>,
+    workspaces: Vec<WorkspaceObservation>,
+) -> Sample {
     Sample {
         taken_at,
+        session,
         workspaces,
     }
 }
@@ -1554,6 +1584,426 @@ fn a_snapshot_that_reports_one_id_twice_records_neither_workspace() {
     assert_eq!(
         series[1], None,
         "a self-contradicting snapshot observed nothing: {series:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Which session recorded a series
+// ---------------------------------------------------------------------------
+
+/// Records four minutes of one working workspace on a checkout, in `session`.
+fn watched(config: &Config, session: Option<SessionMark>, minutes: u64) -> History {
+    let mut history = History::empty(config);
+    for minute in 0..minutes {
+        history.record(
+            &sample_in(
+                T0 + minute * 60,
+                session.clone(),
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            config,
+        );
+    }
+    history
+}
+
+#[test]
+fn a_new_session_records_beside_the_old_series_and_not_into_it() {
+    let config = config(60, 16, 4);
+    let mut history = watched(&config, Some(session_a()), 4);
+
+    // herdr is restarted. Same checkout, same label, and it happens to hand out
+    // the same id — but the counter behind `state_change_seq` is a new one, and
+    // nothing recorded under the old session is comparable with this.
+    history.record(
+        &sample_in(
+            T0 + 4 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 3)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(
+        history.workspaces.len(),
+        2,
+        "two watches of one checkout are two series: {:?}",
+        history
+            .workspaces
+            .iter()
+            .map(|w| (w.session.clone(), w.workspace_id.clone()))
+            .collect::<Vec<_>>()
+    );
+    let old = &history.workspaces[0];
+    let new = &history.workspaces[1];
+    assert_eq!(
+        old.session.as_deref(),
+        Some(session_a().fingerprint.as_str())
+    );
+    assert_eq!(
+        new.session.as_deref(),
+        Some(session_b().fingerprint.as_str())
+    );
+    assert_eq!(new.session_began, Some(session_b().began));
+
+    let activity = history.activity(T0 + 4 * 60, 5, 1, &config);
+    let earlier = activity
+        .iter()
+        .find(|a| a.session.as_deref() == Some(session_a().fingerprint.as_str()))
+        .expect("the earlier session is still reported");
+    let live = activity
+        .iter()
+        .find(|a| a.session.as_deref() == Some(session_b().fingerprint.as_str()))
+        .expect("the live session");
+
+    // The old session keeps the minutes it observed — they are real, and
+    // blanking them would claim nobody was watching when somebody was.
+    assert!(
+        earlier.series[..4].iter().all(Option::is_some),
+        "the earlier watch keeps its own minutes: {:?}",
+        earlier.series
+    );
+    assert_eq!(
+        earlier.series[4], None,
+        "and claims nothing about the minute it did not see: {:?}",
+        earlier.series
+    );
+    // The new session claims only what it watched.
+    assert!(
+        live.series[..4].iter().all(Option::is_none),
+        "a session cannot claim minutes recorded before it began: {:?}",
+        live.series
+    );
+    assert!(live.series[4].is_some());
+}
+
+#[test]
+fn a_new_session_does_not_manufacture_transitions_from_a_reset_counter() {
+    let config = config(60, 16, 4);
+    let mut history = watched(&config, Some(session_a()), 3);
+
+    // `state_change_seq` is session-global and a fresh server starts it over, so
+    // the same pane id arrives with a number that has nothing to do with the one
+    // we stored. Comparing them would count a transition nobody made — and pane
+    // ids are session-scoped too, so it might not even be the same agent.
+    history.record(
+        &sample_in(
+            T0 + 3 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 1)],
+            )],
+        ),
+        &config,
+    );
+
+    let fresh = history
+        .workspaces
+        .iter()
+        .position(|w| w.session.as_deref() == Some(session_b().fingerprint.as_str()))
+        .expect("the new session's ring");
+    assert_eq!(
+        newest_bucket(&history, fresh).transitions,
+        0,
+        "a first sighting in a new session is not evidence of a transition"
+    );
+}
+
+#[test]
+fn an_unknown_session_never_joins_a_named_one() {
+    let config = config(60, 16, 4);
+    let mut history = watched(&config, Some(session_a()), 3);
+
+    // The socket could not be attributed. That is not "the session we already
+    // know about" — it is a watch pulse cannot place.
+    history.record(
+        &sample_in(
+            T0 + 3 * 60,
+            None,
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 20)],
+            )],
+        ),
+        &config,
+    );
+    assert_eq!(history.workspaces.len(), 2);
+
+    // Two unattributable samples in a row are the same unattributable watch, or
+    // the store would grow one ring per sample and record nothing useful at all.
+    history.record(
+        &sample_in(
+            T0 + 4 * 60,
+            None,
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 21)],
+            )],
+        ),
+        &config,
+    );
+    assert_eq!(history.workspaces.len(), 2);
+    let unknown = history
+        .workspaces
+        .iter()
+        .find(|w| w.session.is_none())
+        .expect("the unattributable ring");
+    assert_eq!(unknown.session_began, None);
+    assert_eq!(unknown.last_seen, T0 + 4 * 60);
+}
+
+#[test]
+fn a_history_file_written_before_sessions_is_not_claimed_by_the_live_session() {
+    let dir = TempDir::new("pre-session-file");
+    let config = config(60, 16, 4);
+    let history = watched(&config, Some(session_a()), 4);
+
+    // Exactly what the previous release wrote: no session fields at all.
+    let mut value = serde_json::to_value(&history).unwrap();
+    let entry = value["workspaces"][0].as_object_mut().unwrap();
+    assert!(entry.remove("session").is_some(), "the field is written");
+    entry.remove("session_began");
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let mut loaded = history::load_from(dir.path(), &config);
+    assert_eq!(loaded.workspaces.len(), 1);
+    assert_eq!(
+        loaded.workspaces[0].session, None,
+        "a ring whose session was never recorded is unattributable, not ours"
+    );
+
+    loaded.record(
+        &sample_in(
+            T0 + 4 * 60,
+            Some(session_a()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 30)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(
+        loaded.workspaces.len(),
+        2,
+        "the upgrade keeps the old buckets and starts an attributed series beside them"
+    );
+    assert!(
+        loaded.workspaces[0].buckets.iter().any(|b| b.samples > 0),
+        "the pre-session buckets are still there"
+    );
+}
+
+#[test]
+fn one_id_may_belong_to_two_sessions_at_once() {
+    let config = config(60, 16, 4);
+    let mut history = watched(&config, Some(session_a()), 2);
+
+    // A session-scoped id is exactly that. `w15` in the new session is a
+    // different workspace from `w15` in the old one, and the store holds both
+    // without either being a duplicate of anything.
+    history.record(
+        &sample_in(
+            T0 + 2 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "docs",
+                "/home/dev/repos/docs",
+                &[("w15:p1", "idle", 4)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 2);
+    assert!(history.workspaces.iter().all(|w| w.workspace_id == "w15"));
+    let labels: Vec<&str> = history
+        .workspaces
+        .iter()
+        .map(|w| w.label.as_str())
+        .collect();
+    assert_eq!(labels, ["api", "docs"]);
+}
+
+#[test]
+fn a_reused_id_inside_a_session_leaves_another_sessions_ring_alone() {
+    let config = config(60, 16, 4);
+    let mut history = watched(&config, Some(session_a()), 3);
+
+    // Session B watches the same checkout for a while...
+    history.record(
+        &sample_in(
+            T0 + 3 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 2)],
+            )],
+        ),
+        &config,
+    );
+    // ...and then hands `w15` to a different checkout. That displaces B's own
+    // ring, and must not touch A's.
+    history.record(
+        &sample_in(
+            T0 + 4 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "web",
+                "/home/dev/repos/web",
+                &[("w15:p1", "idle", 9)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 2, "{:?}", ids(&history));
+    let earlier = history
+        .workspaces
+        .iter()
+        .find(|w| w.session.as_deref() == Some(session_a().fingerprint.as_str()))
+        .expect("session A's ring survives");
+    assert_eq!(
+        earlier.checkout_path.as_deref(),
+        Some("/home/dev/repos/api")
+    );
+    assert_eq!(
+        earlier.buckets.iter().filter(|b| b.samples > 0).count(),
+        3,
+        "session A recorded three minutes and keeps all three"
+    );
+    let live = history
+        .workspaces
+        .iter()
+        .find(|w| w.session.as_deref() == Some(session_b().fingerprint.as_str()))
+        .expect("session B's ring");
+    assert_eq!(live.checkout_path.as_deref(), Some("/home/dev/repos/web"));
+}
+
+#[test]
+fn two_sessions_watching_one_checkout_do_not_mix_their_series() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..4u64 {
+        // The same checkout, watched by two sessions in the same minutes, busy
+        // under one and quiet under the other. Nothing in one series may leak
+        // into the other.
+        history.record(
+            &sample_in(
+                T0 + minute * 60,
+                Some(session_a()),
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+        history.record(
+            &sample_in(
+                T0 + minute * 60,
+                Some(session_b()),
+                vec![checkout(
+                    "w9",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w9:p1", "idle", 500)],
+                )],
+            ),
+            &config,
+        );
+    }
+
+    let activity = history.activity(T0 + 3 * 60, 4, 1, &config);
+    assert_eq!(activity.len(), 2);
+    let busy = activity
+        .iter()
+        .find(|a| a.session.as_deref() == Some(session_a().fingerprint.as_str()))
+        .expect("session A");
+    let quiet = activity
+        .iter()
+        .find(|a| a.session.as_deref() == Some(session_b().fingerprint.as_str()))
+        .expect("session B");
+    assert!(busy.series.iter().all(|c| c.is_some_and(|l| !l.is_quiet())));
+    assert!(quiet.series.iter().all(|c| c == &Some(Level(0))));
+}
+
+#[test]
+fn a_series_says_which_session_recorded_it() {
+    let config = config(60, 16, 4);
+    let history = watched(&config, Some(session_a()), 2);
+
+    let activity = &history.activity(T0 + 60, 2, 1, &config)[0];
+    assert_eq!(
+        activity.session.as_deref(),
+        Some(session_a().fingerprint.as_str())
+    );
+    assert_eq!(activity.session_began, Some(session_a().began));
+    assert!(
+        activity.is_session(Some(&session_a())),
+        "the live session recognises its own series"
+    );
+    assert!(
+        !activity.is_session(Some(&session_b())),
+        "and does not adopt another session's"
+    );
+    assert!(
+        !activity.is_session(None),
+        "an unknown live session claims nothing"
+    );
+}
+
+#[test]
+fn an_ended_session_is_evicted_before_a_live_workspace() {
+    // Two rings, one live workspace: the cap has to fall on the watch that is
+    // over, not on the one being sampled right now.
+    let config = config(60, 16, 1);
+    let mut history = watched(&config, Some(session_a()), 2);
+    history.record(
+        &sample_in(
+            T0 + 5 * 60,
+            Some(session_b()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 1)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(
+        history.workspaces[0].session.as_deref(),
+        Some(session_b().fingerprint.as_str()),
+        "the live session's ring is the one that survives the cap"
     );
 }
 
