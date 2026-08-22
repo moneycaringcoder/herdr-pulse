@@ -69,9 +69,11 @@ All notable changes to this project are documented here. The format follows
   either of them and neither can inherit the other's minutes when the checkout
   becomes unambiguous again. A snapshot that reports one workspace id twice
   contradicts itself and records nothing, since both observations claim the
-  handle a badge is pushed to. A history file written by 0.1.0 keeps its buckets:
-  the first sample carrying a worktree adopts the entry and stamps the path onto
-  it.
+  handle a badge is pushed to. A workspace herdr only starts reporting a worktree
+  for partway through a session keeps the buckets recorded before it: the first
+  sample carrying a path adopts that ring and stamps the path onto it. (A file
+  written by 0.1.0 predates the session field too, so it is kept as one
+  unattributable watch instead — see the session entry above.)
 - `min_herdr_version` is now `0.8.0`, up from `0.7.5`. The old floor was reasoned
   from when the socket APIs pulse calls first appeared; it was never exercised
   against a 0.7.x server. 0.8.0 is the latest stable herdr and the only version

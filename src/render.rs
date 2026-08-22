@@ -292,7 +292,13 @@ pub fn pane(
     );
     out.push_str(&table(&rows));
     out.push('\n');
-    out.push_str(&legend(config, activity, any_stale, explain_sessions));
+    out.push_str(&legend(
+        config,
+        activity,
+        any_stale,
+        explain_sessions,
+        session,
+    ));
     out
 }
 /// The live herdr identity, when both locating and fingerprinting its socket
@@ -379,7 +385,11 @@ pub fn json_document(
                 "session": {
                     "fingerprint": workspace.session.as_deref(),
                     "began": workspace.session_began,
-                    "is_current": workspace.is_session(session),
+                    // `null`, not `false`, when there is no live session to
+                    // compare against: "recorded by a session that has ended"
+                    // and "pulse could not establish which session is running"
+                    // are different facts, and `false` asserts the first.
+                    "is_current": session.map(|_| workspace.is_session(session)),
                 },
                 "state": workspace.state.as_str(),
                 // Measured to `last_seen`, not to `as_of`: the duration we
@@ -512,22 +522,26 @@ fn session_clock(began: u64) -> String {
     format!("{hours:02}:{minutes:02}")
 }
 
+/// What the `session` column says about one row.
+///
+/// The parentheses mean exactly one thing — "recorded by a session other than
+/// the one running now" — so they may only be drawn when there *is* a known
+/// session running now. With no live mark, nothing is comparable to anything:
+/// the cell states when the row's own session began and claims nothing further,
+/// because "an earlier session than the one running now" would be a claim about
+/// a session that was never established.
 fn session_cell(workspace: &WorkspaceActivity, session: Option<&SessionMark>) -> String {
+    let began = |began: Option<u64>| match began {
+        Some(began) => session_clock(began),
+        None => "?".to_string(),
+    };
+    if session.is_none() {
+        return began(workspace.session_began);
+    }
     if workspace.is_session(session) {
-        return session
-            .map(|mark| session_clock(mark.began))
-            .unwrap_or_else(|| "?".to_string());
+        return began(session.map(|mark| mark.began));
     }
-
-    if let Some(began) = workspace.session_began {
-        return format!("({})", session_clock(began));
-    }
-
-    if session.is_some() {
-        "(?)".to_string()
-    } else {
-        "?".to_string()
-    }
+    format!("({})", began(workspace.session_began))
 }
 
 /// The key to the glyphs.
@@ -546,6 +560,7 @@ fn legend(
     activity: &[WorkspaceActivity],
     any_stale: bool,
     explain_sessions: bool,
+    session: Option<&SessionMark>,
 ) -> String {
     let ramp: String = RAMP.iter().collect();
     let mut out = format!(
@@ -566,11 +581,27 @@ fn legend(
         );
     }
     if explain_sessions {
-        out.push_str(
-            "        session = when the herdr session that recorded the row began  |  \
-             parentheses = an earlier session than the one running now  |  \
-             ? = session could not be established\n",
-        );
+        // Assembled from what the column actually printed. A legend that
+        // explains parentheses in a pane with none, or promises a live session
+        // when none could be established, teaches the reader something untrue
+        // about the row in front of them.
+        let mut clauses =
+            vec!["session = when the herdr session that recorded the row began".to_string()];
+        if session.is_some() {
+            clauses.push("parentheses = an earlier session than the one running now".to_string());
+        } else {
+            clauses.push(
+                "the session running now could not be established, so no row is marked live"
+                    .to_string(),
+            );
+        }
+        if activity
+            .iter()
+            .any(|workspace| workspace.session_began.is_none())
+        {
+            clauses.push("? = that session's start could not be established".to_string());
+        }
+        out.push_str(&format!("        {}\n", clauses.join("  |  ")));
     }
 
     // Only claim a timescale when the series we were handed actually has the

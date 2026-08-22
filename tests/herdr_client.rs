@@ -19,6 +19,7 @@
 //! No running herdr is required, and nothing here touches the user's state.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -293,7 +294,6 @@ fn the_session_began_when_the_socket_was_created() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-
     let mark = session_mark(&server.path).expect("mark");
 
     // Seconds old at most: this socket was bound by `TestServer::start`. The
@@ -303,6 +303,54 @@ fn the_session_began_when_the_socket_was_created() {
         mark.began <= now && now - mark.began <= 60,
         "began {} is not the socket's creation time near {now}",
         mark.began
+    );
+}
+
+#[test]
+fn rebinding_one_path_is_a_new_session() {
+    // What a herdr restart looks like on disk: the same socket path, unlinked
+    // and bound again. The inode is very often the one just freed, so this is
+    // the collision the fingerprint has to survive — and the only direction of
+    // error that matters, because reading two sessions as one would splice two
+    // incomparable series together.
+    let dir = std::env::temp_dir().join(format!("pulse-rebind-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("s.sock");
+
+    let mut marks = Vec::new();
+    for _ in 0..6 {
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        marks.push(session_mark(&path).expect("a bound socket has a session"));
+        drop(listener);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut fingerprints: Vec<&str> = marks.iter().map(|m| m.fingerprint.as_str()).collect();
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    assert_eq!(
+        fingerprints.len(),
+        marks.len(),
+        "six rebinds of one path are six sessions, not one: {marks:?}"
+    );
+}
+
+#[test]
+fn touching_the_sockets_metadata_does_not_change_the_session() {
+    // A `chmod` on a bound socket moves its `ctime` while the server keeps
+    // running. If that moved the mark, the live ring would be orphaned and the
+    // workspace would restart from an empty sparkline for no reason.
+    let server = TestServer::start(vec![live_reply()]);
+    let before = session_mark(&server.path).expect("mark");
+
+    std::fs::set_permissions(&server.path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod the bound socket");
+
+    let after = session_mark(&server.path).expect("mark");
+    assert_eq!(
+        before, after,
+        "the session did not change, so neither may its mark"
     );
 }
 

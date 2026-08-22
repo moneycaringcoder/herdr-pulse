@@ -600,7 +600,7 @@ fn an_unknown_session_is_bare_only_when_the_live_session_is_also_unknown() {
     let fields: Vec<&str> = row_for(&with_live, "unknown").split_whitespace().collect();
     assert_eq!(fields[2], "(?)", "{with_live}");
     assert!(
-        with_live.contains("? = session could not be established"),
+        with_live.contains("? = that session's start could not be established"),
         "the unknown marker is unexplained:\n{with_live}"
     );
 
@@ -609,6 +609,38 @@ fn an_unknown_session_is_bare_only_when_the_live_session_is_also_unknown() {
         .split_whitespace()
         .collect();
     assert_eq!(fields[2], "?", "{without_live}");
+}
+
+#[test]
+fn no_live_session_means_no_row_is_called_an_earlier_one() {
+    // `--once` with herdr not running, or with no `HERDR_SOCKET_PATH` exported:
+    // the socket cannot be fingerprinted, so nothing is comparable to anything.
+    // Marking every row "an earlier session than the one running now" would be a
+    // claim about a session that was never established.
+    let earlier = session("earlier-fingerprint", 3 * 3_600 + 7 * 60);
+    let rendered = pane(
+        &[recorded_by(
+            activity("orphan", levels(&[6]), AgentState::Working, Some(9), 1),
+            &earlier,
+        )],
+        &Config::default(),
+        AS_OF,
+        None,
+    );
+
+    let fields: Vec<&str> = row_for(&rendered, "orphan").split_whitespace().collect();
+    assert_eq!(
+        fields[2], "03:07",
+        "the row states when its own session began and nothing more:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("parentheses ="),
+        "there is no live session to be earlier than:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("could not be established"),
+        "and the pane says the live session is unknown:\n{rendered}"
+    );
 }
 
 #[test]

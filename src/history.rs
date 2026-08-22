@@ -192,9 +192,13 @@ pub struct WorkspaceHistory {
     /// evidence there is, and a label that changes under an id means the buckets
     /// belong to somebody else and are dropped. See [`History::locate`].
     ///
-    /// Defaulted on load so a history file written before this field existed
-    /// keeps its buckets: the first observation carrying a path adopts the entry
-    /// on the old evidence and stamps the path onto it.
+    /// Defaulted on load. An entry with no recorded path is adopted, and stamped
+    /// with one, by the first observation that carries a path **in that entry's
+    /// own session** — a workspace herdr has only just started reporting a
+    /// worktree for. A file written before this field existed carries no session
+    /// either, so it is not adopted by a named session at all: it keeps its
+    /// buckets as one unattributable watch beside the attributed series that
+    /// follows it. See [`Self::session`].
     #[serde(default)]
     pub checkout_path: Option<String>,
     /// Fingerprint of the herdr session that recorded this ring, or `None` for a
@@ -651,7 +655,7 @@ impl History {
         }
         // After, not before: a workspace introduced by this sample is the most
         // recently seen thing in the store and must never be the one evicted.
-        self.evict(config);
+        self.evict(config, Some(sample.taken_at));
     }
 
     /// Folds one observation in, returning the entry it landed on and whether
@@ -806,20 +810,44 @@ impl History {
     /// bounds how many rings exist — so it runs on every record and on every
     /// load, including when a config change lowers the cap under a file that was
     /// written with a higher one.
-    fn evict(&mut self, config: &Config) {
+    ///
+    /// One entry per workspace *per session* means a machine that restarts herdr
+    /// all day accumulates rings for sessions that are over. They are the least
+    /// recently seen, so they are the first to go: the cap falls on finished
+    /// watches before it falls on one being sampled now.
+    ///
+    /// `now` is the time of the sample that prompted this, when there is one. An
+    /// entry stamped *after* it was stamped by a clock that has since been
+    /// corrected, and those go first however fresh they claim to be. Without
+    /// that, a forward clock step followed by a correction would leave every
+    /// ended session's ring claiming to be newer than the live one, and at the
+    /// cap the workspace being sampled right now would be the one evicted —
+    /// every cycle, until the wall clock climbed back past the stale stamps. A
+    /// live workspace that can never accumulate a series is a sparkline of gaps
+    /// with nothing to explain it.
+    fn evict(&mut self, config: &Config, now: Option<u64>) {
         let cap = config.max_workspaces.max(1);
+        let believable = |entry: &WorkspaceHistory| match now {
+            Some(now) => entry.last_seen <= now,
+            None => true,
+        };
         while self.workspaces.len() > cap {
             let victim = self
                 .workspaces
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
-                    a.last_seen
-                        .cmp(&b.last_seen)
-                        // Ties broken by id so the same input always evicts the
-                        // same workspace, whatever the map iteration order
-                        // upstream happened to be.
+                    believable(a)
+                        .cmp(&believable(b))
+                        .then_with(|| a.last_seen.cmp(&b.last_seen))
+                        // Ties broken by id and then by session so the same input
+                        // always evicts the same entry, whatever the map iteration
+                        // order upstream happened to be. The session is part of it
+                        // because an id is only unique within one: two sessions
+                        // sampled in the same second can otherwise tie on both
+                        // fields and leave the choice to vector order.
                         .then_with(|| a.workspace_id.cmp(&b.workspace_id))
+                        .then_with(|| a.session.cmp(&b.session))
                 })
                 .map(|(index, _)| index);
             match victim {
@@ -867,7 +895,9 @@ impl History {
         for workspace in &mut self.workspaces {
             workspace.reshape(config.retention_buckets);
         }
-        self.evict(config);
+        // No sample to measure against on a load: every stamp in the file is as
+        // believable as every other until one arrives.
+        self.evict(config, None);
     }
 
     /// The renderer's view: one entry per workspace, each with a series that

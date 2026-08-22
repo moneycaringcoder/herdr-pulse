@@ -1445,7 +1445,7 @@ fn a_workspace_whose_worktree_stops_being_reported_keeps_its_history() {
 }
 
 #[test]
-fn a_history_file_written_before_checkout_paths_keeps_its_buckets() {
+fn a_ring_with_no_recorded_path_is_adopted_by_the_first_worktree_its_session_reports() {
     let dir = TempDir::new("pre-checkout-file");
     let config = config(60, 16, 4);
     let mut history = History::empty(&config);
@@ -1461,7 +1461,11 @@ fn a_history_file_written_before_checkout_paths_keeps_its_buckets() {
         );
     }
 
-    // Exactly what the previous release wrote: no `checkout_path` key at all.
+    // A ring recorded in this session before herdr reported a worktree for the
+    // workspace: the same shape a file from before the field existed has, with
+    // the session still attributed. What an actual pre-release file does — no
+    // session either, so no named session adopts it — is
+    // `a_history_file_written_before_sessions_is_not_claimed_by_the_live_session`.
     let mut value = serde_json::to_value(&history).unwrap();
     let entry = value["workspaces"][0].as_object_mut().unwrap();
     assert!(
@@ -1474,8 +1478,8 @@ fn a_history_file_written_before_checkout_paths_keeps_its_buckets() {
     assert_eq!(loaded.workspaces.len(), 1);
     assert_eq!(loaded.workspaces[0].checkout_path, None);
 
-    // The first sample that carries a worktree adopts the entry on the evidence
-    // the file was recorded with, and stamps the durable key onto it.
+    // The first sample of that same session carrying a worktree adopts the entry
+    // on the evidence it was recorded with, and stamps the durable key onto it.
     loaded.record(
         &sample(
             T0 + 5 * 60,
@@ -1497,7 +1501,7 @@ fn a_history_file_written_before_checkout_paths_keeps_its_buckets() {
     let series = series(&loaded, T0 + 5 * 60, 6, &config);
     assert!(
         series.iter().all(Option::is_some),
-        "an upgrade must not cost the recorded history: {series:?}"
+        "a worktree appearing must not cost the recorded history: {series:?}"
     );
 }
 
@@ -2004,6 +2008,114 @@ fn an_ended_session_is_evicted_before_a_live_workspace() {
         history.workspaces[0].session.as_deref(),
         Some(session_b().fingerprint.as_str()),
         "the live session's ring is the one that survives the cap"
+    );
+}
+
+#[test]
+fn session_churn_stays_bounded_and_never_evicts_the_live_watch() {
+    // A machine that restarts herdr all day: forty sessions, six workspaces
+    // each. One entry per (workspace, session) is the whole point of this
+    // feature and also the way it could grow without limit, so the cap has to
+    // hold and it has to fall on the finished watches.
+    let config = config(60, 240, 24);
+    let mut history = History::empty(&config);
+    for run in 0..40u64 {
+        let session = SessionMark {
+            fingerprint: format!("2049:{}:{}:0", 1000 + run, T0 + run * 600),
+            began: T0 + run * 600,
+        };
+        for minute in 0..3u64 {
+            let taken_at = T0 + run * 600 + minute * 60;
+            let workspaces = (0..6)
+                .map(|index| {
+                    checkout(
+                        &format!("w{index}"),
+                        &format!("workspace-{index}"),
+                        &format!("/home/dev/repos/project-{index}"),
+                        &[(&format!("w{index}:p1"), "working", 10 + minute)],
+                    )
+                })
+                .collect();
+            history.record(
+                &sample_in(taken_at, Some(session.clone()), workspaces),
+                &config,
+            );
+        }
+
+        assert!(
+            history.workspaces.len() <= config.max_workspaces,
+            "run {run} left {} entries under a cap of {}",
+            history.workspaces.len(),
+            config.max_workspaces
+        );
+        // Every workspace of the session being sampled is still there, whatever
+        // the cap had to throw away.
+        let live = history
+            .workspaces
+            .iter()
+            .filter(|entry| entry.session.as_deref() == Some(session.fingerprint.as_str()))
+            .count();
+        assert_eq!(live, 6, "run {run} lost a live workspace to the cap");
+    }
+
+    // And the file stays inside the ceiling the boundedness test guards.
+    let encoded = history.encoded_len();
+    assert!(
+        encoded < 2 * 1024 * 1024,
+        "{encoded} bytes of session churn is over the ceiling"
+    );
+}
+
+#[test]
+fn a_stale_future_stamp_does_not_starve_the_live_watch_at_the_cap() {
+    // A forward clock step, then a correction. The ended session's ring keeps the
+    // stamp the stepped clock wrote, which is now in the future; the live ring
+    // carries the corrected time. At the cap, ranking by `last_seen` alone would
+    // evict the workspace being sampled right now — every cycle, until the wall
+    // clock caught up with a time that never happened.
+    let config = config(60, 16, 1);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample_in(
+            T0 + 10 * 3_600,
+            Some(session_a()),
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 10)],
+            )],
+        ),
+        &config,
+    );
+
+    // The clock is corrected and herdr is restarted.
+    for minute in 0..3u64 {
+        history.record(
+            &sample_in(
+                T0 + minute * 60,
+                Some(session_b()),
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 1 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(
+        history.workspaces[0].session.as_deref(),
+        Some(session_b().fingerprint.as_str()),
+        "the ring being sampled has to survive a stamp from a clock that was wrong"
+    );
+    let series = series(&history, T0 + 2 * 60, 3, &config);
+    assert!(
+        series.iter().any(Option::is_some),
+        "and it has to be able to accumulate a series: {series:?}"
     );
 }
 

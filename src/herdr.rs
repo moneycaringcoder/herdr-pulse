@@ -137,12 +137,19 @@ impl Herdr {
     /// they currently have agents — a workspace that lost its agent still has a
     /// history worth showing.
     ///
-    /// The session is read *before* the call, so a server that is replaced
-    /// mid-cycle attributes the snapshot to the session that was listening when
-    /// we asked rather than to whatever bound the socket afterwards.
+    /// The session is read on **both** sides of the call and only kept when the
+    /// two agree. Neither side is safe alone. [`Self::call`] retries a transport
+    /// failure precisely because the first attempt can land on a socket the old
+    /// server has just unlinked, so a mark read beforehand can name a session
+    /// that did not answer — and a mark read afterwards can name one that had not
+    /// started listening when we asked. Disagreement means the socket moved
+    /// across the call and pulse cannot say which server replied: that is an
+    /// unattributable sample, which the store knows how to record, and it lasts
+    /// exactly one cycle.
     pub fn sample(&mut self, taken_at: u64) -> Result<Sample> {
-        let session = session_mark(&self.socket_path);
+        let before = session_mark(&self.socket_path);
         let result = self.call("session.snapshot", json!({}))?;
+        let session = before.filter(|mark| session_mark(&self.socket_path).as_ref() == Some(mark));
         reduce_snapshot(&result, session, taken_at)
     }
 
@@ -315,9 +322,9 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
 ///
 /// herdr publishes no session identity — see [`SessionMark`] — so this is taken
 /// from the socket file the server bound: its device and inode identify it among
-/// every other socket on the machine, and its creation time is the moment the
-/// server started listening, which is the closest thing to "when this session
-/// began" that exists without having watched it start.
+/// every other socket on the machine, and the moment it came into existence is
+/// the moment the server started listening, which is the closest thing to "when
+/// this session began" that exists without having watched it start.
 ///
 /// Reads metadata and nothing else: no connection, no subprocess, and nothing
 /// written. Cheap enough for `--once` to call on every invocation.
@@ -329,21 +336,35 @@ pub fn session_mark(socket_path: &Path) -> Option<SessionMark> {
     if !metadata.file_type().is_socket() {
         return None;
     }
-    // Creation time in its own right, rather than folded into the fingerprint
-    // only: `began` is what an interface shows a human, and the fingerprint is
-    // what equality is decided on. Nanoseconds are in the fingerprint because an
-    // inode number is reused once its file is gone, and two servers a second
-    // apart on the same inode would otherwise look like one session.
-    let began = metadata.ctime().max(0) as u64;
+    // Birth time, not `ctime`. `ctime` is the inode's *status change* time, so
+    // anything that touches the socket's metadata while the server is running —
+    // a `chmod`, a rename of the path and back — moves it. That would change the
+    // fingerprint under a live session, orphan the ring being accumulated, and
+    // restart the workspace from an empty sparkline for no reason at all.
+    // `Metadata::created` is statx `STATX_BTIME` on Linux and `st_birthtime` on
+    // macOS, and both CI platforms have it on their default filesystems.
+    //
+    // `ctime` remains the fallback for a filesystem that reports no birth time,
+    // because a mark that moves on a `chmod` is still better than no attribution
+    // at all: the failure it causes is a split, and a split only ever
+    // under-claims continuity.
+    let (seconds, nanos) = match metadata
+        .created()
+        .ok()
+        .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(born) => (born.as_secs(), born.subsec_nanos() as i64),
+        None => (metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0)),
+    };
+    // The nanoseconds are the load-bearing part, not decoration. A Unix socket
+    // is unlinked and re-bound on every restart, and the fresh inode is very
+    // often the one just freed — measured on ext4, six rebinds of one path in a
+    // second reused the same inode and the same whole second every time. Without
+    // sub-second resolution those six restarts read as one session, which is the
+    // merge this whole feature exists to refuse.
     Some(SessionMark {
-        fingerprint: format!(
-            "{}:{}:{}:{}",
-            metadata.dev(),
-            metadata.ino(),
-            began,
-            metadata.ctime_nsec().max(0)
-        ),
-        began,
+        fingerprint: format!("{}:{}:{seconds}:{nanos}", metadata.dev(), metadata.ino(),),
+        began: seconds,
     })
 }
 

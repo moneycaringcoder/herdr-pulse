@@ -173,7 +173,7 @@ pulse --once
 |---|---|
 | `workspace` | The workspace's label. |
 | `activity` | The sparkline, oldest column on the left, newest on the right. |
-| `session` | When the herdr session that recorded this row started listening. Parenthesised — `(20:53)` — for a session other than the one running now, and `?` when it could not be established. |
+| `session` | When the herdr session that recorded this row started listening. Parenthesised — `(20:53)` — for a session other than the one running now, `(?)` when that session's start time is unknown, and `?` when it is unknown and there is no live session to compare it to. With no live session at all — herdr not running — no row is marked as earlier than anything. |
 | `state` | The state the workspace was in **at the last observation**. |
 | `for` | How long that state had held when we last looked. |
 | `seen` | How long ago that observation was. |
