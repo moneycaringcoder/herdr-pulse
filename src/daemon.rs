@@ -58,6 +58,7 @@ use crate::config::{self, Config};
 use crate::herdr::{self, Herdr};
 use crate::history;
 use crate::model::{SessionMark, Tone, WorkspaceActivity};
+use crate::supervise;
 use crate::Result;
 
 /// The stop request only posts a signal; the daemon still has to clear its
@@ -286,6 +287,12 @@ pub fn enable(args: &[String]) -> Result<()> {
     if live_pid().is_some() {
         return Ok(());
     }
+    // With a supervisor installed, the supervisor owns the process. Spawning a
+    // detached child beside it would give the machine two samplers writing one
+    // history file, and only one of them would come back after a reboot.
+    if supervise::is_installed() {
+        return supervise::start();
+    }
     spawn_detached(&forwarded)
 }
 
@@ -293,6 +300,14 @@ pub fn disable() -> Result<()> {
     // Mark first, so nothing that observes the markers mid-teardown concludes
     // the daemon is still wanted.
     mark_enabled(false);
+
+    // Before the stop request, or the supervisor restarts what we are about to
+    // stop. "Disabled" has to mean disabled: a sampler that comes back in five
+    // seconds, and again at every boot, is not what the user asked for. The unit
+    // file stays on disk, so `--enable` can start it again without a reinstall.
+    if supervise::is_installed() {
+        supervise::stop()?;
+    }
 
     if let Some(pid) = live_pid() {
         request_stop(pid);
@@ -324,6 +339,13 @@ pub fn toggle(args: &[String]) -> Result<()> {
 /// daemon is currently live.
 pub fn restore() -> Result<()> {
     if !is_enabled() || live_pid().is_some() {
+        return Ok(());
+    }
+    // A supervised sampler starts at login, not when herdr does, and the
+    // supervisor restarts it on its own schedule. Spawning a detached child from
+    // this hook would put a second sampler beside the one the supervisor is
+    // about to bring back.
+    if supervise::is_installed() {
         return Ok(());
     }
     // A startup hook has no user command line to forward; the child falls back

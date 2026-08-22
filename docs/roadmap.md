@@ -7,15 +7,6 @@ Everything below is measured against the one rule the plugin rests on: **a gap
 column is not a quiet column.** Any feature that would make "we were not
 watching" render as "nothing happened" is wrong no matter what else it buys.
 
-## Operating it
-
-### Optional supervision
-
-The sampler is a detached background process that keeps running after herdr exits
-until `pulse --disable`. It does not survive a reboot. Optional systemd and
-launchd units would make "always watching" true across restarts, for people who
-want that.
-
 ## Presentation
 
 ### Adaptive sparkline width — blocked upstream

@@ -12,6 +12,7 @@ pub mod history;
 pub mod model;
 pub mod render;
 pub mod setup;
+pub mod supervise;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

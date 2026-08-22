@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Optional `--supervise` and `--unsupervise` verbs install or remove a systemd
+  user unit on Linux or a launchd user agent on macOS. The installed definition
+  runs the sampler at login and bakes in the state directory, socket path and
+  recording flags resolved at install time, so a supervisor with neither herdr
+  environment variable set still writes the history the panes read. Once
+  installed, `--enable`, `--disable` and `--restore` defer to supervision.
+  Restarts do not turn downtime into observation: every bucket the sampler was
+  not running for remains a gap.
 - `--since <WINDOW>` narrows `--once`, `--watch`, `--json` and `--week` to a
   requested reading window without changing what the sampler records. Each ring
   answers in its own bucket size and rounds the window up to at least one
