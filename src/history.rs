@@ -320,6 +320,86 @@ impl WorkspaceHistory {
             .unwrap_or_default()
     }
 
+    /// Re-lays the ring at a coarser bucket size, folding `factor` old buckets
+    /// into each new one, and returns how many folded buckets came out observed.
+    ///
+    /// Coarsening is arithmetic and nothing else. `bucket_number` is
+    /// `at / bucket_seconds`, so when the new size is `factor` times the old one
+    /// the old bucket `o` falls inside the new bucket `o / factor` — every old
+    /// bucket lands wholly inside exactly one new bucket, and no observation has
+    /// to be split or invented. A size that is *not* a whole multiple has no such
+    /// mapping, and a smaller size would have to split one bucket into several,
+    /// which is why [`load_from`] discards in both of those cases instead.
+    ///
+    /// **A fold containing a gap is a gap.** Counters are summed only when every
+    /// old bucket in the group that could have been observed was observed; if any
+    /// recorded minute inside it is missing, the new bucket is left unobserved.
+    /// After the fold that bucket is the *only* record of its span, so calling
+    /// the span observed because part of it was would launder unobserved time
+    /// into a bar — the one lie this module exists to prevent. Summing rather
+    /// than averaging is right for the same reason it is right in the sampler: a
+    /// bucket counts observations, and five minutes of samples recorded at 300
+    /// seconds is exactly the sum of five minutes recorded at 60.
+    ///
+    /// The newest group is the exception, and only at its leading edge: buckets
+    /// past `newest_bucket` are the future rather than time nobody watched, so
+    /// they are skipped instead of poisoning it. The alternative throws away the
+    /// minutes already recorded in the bucket the user is looking at, every time
+    /// the file is loaded.
+    fn coarsen(&mut self, factor: u64, len: usize) -> usize {
+        if factor <= 1 || len == 0 {
+            return self.buckets.iter().filter(|b| b.observed()).count();
+        }
+        let newest = self.newest_bucket / factor;
+        let mut fresh = vec![Bucket::default(); len];
+        let oldest = newest.saturating_sub(len as u64 - 1);
+        let mut kept = 0usize;
+        for number in oldest..=newest {
+            // No overflow to check on the way up: `number <= newest_bucket /
+            // factor`, so `number * factor <= newest_bucket`.
+            let first = number * factor;
+            let mut folded = Bucket::default();
+            let mut missed = false;
+            for step in 0..factor {
+                // The same division identity says `first + factor - 1` cannot
+                // pass `newest_bucket` either, so this is belt and braces. It
+                // costs nothing, and the alternative if that reasoning is ever
+                // wrong is an arithmetic panic in somebody's sidebar.
+                let Some(old) = first.checked_add(step) else {
+                    break;
+                };
+                // Minutes after the newest one recorded are the future, not a
+                // gap: nobody could have observed them, and the newest group is
+                // always part-finished because time has not caught up with it
+                // yet. Poisoning the fold with them would throw away the minutes
+                // of the current bucket that *were* recorded, on every load.
+                if old > self.newest_bucket {
+                    break;
+                }
+                let old = self.bucket(old);
+                if !old.observed() {
+                    // A gap inside the recorded past, which the fold may not
+                    // launder into a bar.
+                    missed = true;
+                    break;
+                }
+                folded.samples = folded.samples.saturating_add(old.samples);
+                folded.working = folded.working.saturating_add(old.working);
+                folded.blocked = folded.blocked.saturating_add(old.blocked);
+                folded.transitions = folded.transitions.saturating_add(old.transitions);
+            }
+            // `first <= newest_bucket` always, so the first step of every group
+            // is a real bucket: anything not `missed` has folded something.
+            if !missed {
+                fresh[(number % len as u64) as usize] = folded;
+                kept += 1;
+            }
+        }
+        self.buckets = fresh;
+        self.newest_bucket = newest;
+        kept
+    }
+
     /// Re-lays the ring at a new length, keeping each bucket at the slot its
     /// absolute number implies.
     ///
@@ -978,6 +1058,23 @@ impl History {
     pub fn encoded_len(&self) -> usize {
         serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
+
+    /// Folds every ring onto a coarser bucket size, records the new size as the
+    /// one this file is written at, and returns how many folded buckets came out
+    /// of it observed.
+    ///
+    /// The count is what makes the message honest. A fold is only as good as the
+    /// groups that were watched from end to end, and a factor large enough
+    /// against a short recording can retain nothing at all — that is a discard
+    /// however it happened, and it has to say so.
+    fn coarsen(&mut self, factor: u64, config: &Config) -> usize {
+        let mut kept = 0;
+        for workspace in &mut self.workspaces {
+            kept += workspace.coarsen(factor, config.retention_buckets);
+        }
+        self.bucket_seconds = config.bucket_seconds;
+        kept
+    }
 }
 
 /// This observation's durable identity, or `None` when it has none this sample
@@ -1015,6 +1112,33 @@ fn claims_one_id(observation: &WorkspaceObservation, sample: &[WorkspaceObservat
         .filter(|other| other.workspace_id == observation.workspace_id)
         .count()
         == 1
+}
+
+/// How many recorded buckets fold into one at the live size, or `None` when the
+/// history cannot be re-laid honestly.
+///
+/// `Some(factor)` only for a strict increase that is a whole multiple: those are
+/// the sizes whose bucket boundaries still line up, so every recorded bucket
+/// falls wholly inside exactly one new one. A decrease would have to split a
+/// bucket into several, and a size that is not a whole multiple would have to
+/// split at every boundary — in both cases the split is invention, and the
+/// recorded history is discarded instead.
+fn coarsening_factor(recorded: u64, live: u64) -> Option<u64> {
+    // A width the sampler could never have written is not a scale to fold from.
+    // `Config::clamp` pins every run to this range, so anything outside it came
+    // from a hand-edited or damaged file, and the bucket numbers beside it were
+    // computed at some scale we cannot know. Dividing them by a factor derived
+    // from nonsense would re-lay real-looking bars in invented minutes; the file
+    // takes the discard branch instead, like every other field we cannot
+    // believe.
+    if !(crate::config::MIN_BUCKET_SECONDS..=crate::config::MAX_BUCKET_SECONDS).contains(&recorded)
+    {
+        return None;
+    }
+    if live <= recorded || !live.is_multiple_of(recorded) {
+        return None;
+    }
+    Some(live / recorded)
 }
 
 /// The absolute bucket number containing a Unix timestamp.
@@ -1091,13 +1215,70 @@ pub fn load_from(dir: &Path, config: &Config) -> History {
         return History::empty(config);
     }
     if history.bucket_seconds != config.bucket_seconds {
-        eprintln!(
-            "pulse: starting with an empty history, {} has {}s buckets and this run uses {}s",
-            path.display(),
-            history.bucket_seconds,
-            config.bucket_seconds
-        );
-        return History::empty(config);
+        match coarsening_factor(history.bucket_seconds, config.bucket_seconds) {
+            Some(factor) => {
+                let recorded = history.bucket_seconds;
+                let kept = history.coarsen(factor, config);
+                // Said out loud either way. A fold that kept something changed
+                // the shape of every sparkline the user is about to read, and a
+                // shape that changed for a reason nobody mentioned is a shape
+                // people distrust. A fold that kept nothing is a discard however
+                // it happened, and must not be reported as if history survived
+                // it: a factor large against a short recording leaves no group
+                // that was watched from end to end, and every one of them becomes
+                // the gap it honestly is.
+                if kept > 0 {
+                    eprintln!(
+                        "pulse: {} has {recorded}s buckets and this run uses {}s; \
+                         folded every {factor} recorded buckets into one",
+                        path.display(),
+                        config.bucket_seconds
+                    );
+                } else {
+                    eprintln!(
+                        "pulse: starting with an empty history, {} has {recorded}s buckets and \
+                         this run uses {}s; no run of {factor} buckets was watched end to end, \
+                         so every fold of them is a gap",
+                        path.display(),
+                        config.bucket_seconds
+                    );
+                    // The message and the store have to agree. Every ring came
+                    // back a gap, so what is left is workspace names attached to
+                    // no observations at all; keeping them would draw rows that
+                    // claim a last-seen time beside a sparkline with nothing in
+                    // it, under a line that says the history is gone.
+                    return History::empty(config);
+                }
+            }
+            None => {
+                // Three ways to get here, and the message says which. The new
+                // size is smaller — one bucket cannot become several without
+                // inventing detail nobody recorded. Or it is not a whole
+                // multiple, so the new boundaries fall inside old buckets and
+                // every fold would have to split observations it cannot split.
+                // Or the width in the file is not one any run could have written,
+                // which makes every bucket number beside it unreadable.
+                let believable = (crate::config::MIN_BUCKET_SECONDS
+                    ..=crate::config::MAX_BUCKET_SECONDS)
+                    .contains(&history.bucket_seconds);
+                let why = if !believable {
+                    "no run of pulse could have written that bucket width, so the \
+                     recorded bucket numbers cannot be placed in time"
+                } else if config.bucket_seconds < history.bucket_seconds {
+                    "a smaller bucket cannot be recovered from a larger one"
+                } else {
+                    "the new size is not a whole multiple of the old one"
+                };
+                eprintln!(
+                    "pulse: starting with an empty history, {} has {}s buckets and this run \
+                     uses {}s; {why}",
+                    path.display(),
+                    history.bucket_seconds,
+                    config.bucket_seconds
+                );
+                return History::empty(config);
+            }
+        }
     }
 
     history.normalise(config);

@@ -352,8 +352,13 @@ cycle — cheap enough that the finer resolution is worth having.
   ages out.
 - The badge cannot say which session it is drawing; there is no room in a sidebar
   cell for it. The pane and `--json` can, and do.
-- Changing `bucket_seconds` invalidates the recorded history, which is discarded
-  with a message on the next run. Two bucket scales cannot share one series.
+- Increasing `bucket_seconds` by a whole multiple folds the old buckets, sums
+  their counters and keeps the history. A decrease still discards because a
+  smaller bucket cannot be recovered from a larger one; an increase that is not
+  a whole multiple still discards because its boundaries would split
+  observations that were never recorded separately. Both discard with a message
+  saying why. A folded group containing any unobserved time is unobserved, never
+  quiet.
 
 ## License
 

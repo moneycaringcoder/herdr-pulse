@@ -2683,14 +2683,399 @@ fn a_file_from_an_older_format_is_discarded() {
 }
 
 #[test]
-fn a_file_written_with_a_different_bucket_width_is_discarded() {
+fn a_file_written_with_a_smaller_bucket_width_is_discarded() {
     let dir = TempDir::new("bucket-width");
     let written = config(60, 16, 8);
     history::save_to(dir.path(), &recorded(&written)).expect("save");
 
-    // The same buckets mean something different at thirty seconds each, and
-    // mixing two scales in one series would draw a plausible lie.
+    // One minute cannot become two thirty-second buckets: the detail to split it
+    // by was never recorded, and inventing it would draw a plausible lie.
     let live = config(30, 16, 8);
+    assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
+}
+
+#[test]
+fn a_bucket_width_that_is_not_a_whole_multiple_is_discarded() {
+    let dir = TempDir::new("bucket-width-ragged");
+    let written = config(60, 16, 8);
+    history::save_to(dir.path(), &recorded(&written)).expect("save");
+
+    // 90s boundaries fall inside 60s buckets, so every fold would have to split
+    // observations that cannot be split.
+    let live = config(90, 16, 8);
+    assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
+}
+
+#[test]
+fn a_bigger_bucket_width_folds_the_recorded_history_instead_of_discarding_it() {
+    let dir = TempDir::new("bucket-width-fold");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // Ten minutes of continuous work, watched throughout: two whole five-minute
+    // groups.
+    for minute in 0..10u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    // Five minutes per bucket: every recorded minute lands wholly inside one new
+    // bucket, so the arithmetic is a fold and nothing is lost but resolution.
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    assert_eq!(loaded.bucket_seconds, 300);
+    assert_eq!(
+        loaded.workspaces.len(),
+        1,
+        "the workspace survives the fold"
+    );
+    let mut folded: Vec<Bucket> = loaded.workspaces[0]
+        .buckets
+        .iter()
+        .copied()
+        .filter(|bucket| bucket.samples > 0)
+        .collect();
+    folded.sort_by_key(|bucket| bucket.samples);
+    assert_eq!(
+        folded.len(),
+        2,
+        "ten one-minute buckets fold into two five-minute buckets"
+    );
+    assert_eq!(
+        (folded[1].samples, folded[1].working),
+        (5, 5),
+        "the fold sums the observations rather than averaging them away"
+    );
+
+    // And it still reads as a busy workspace at the new width.
+    let series = series(&loaded, base + 9 * 60, 2, &live);
+    assert!(
+        series
+            .iter()
+            .all(|column| column.is_some_and(|l| !l.is_quiet())),
+        "five minutes of work must not fold into quiet or into a gap: {series:?}"
+    );
+}
+
+/// The start of a five-minute group, so a test can say "this group is whole" and
+/// "this one has a hole in it" and mean it. `T0` is minute-aligned but not
+/// five-minute-aligned, and a fold is only legible against its own boundaries.
+fn group_start() -> u64 {
+    T0 - (T0 % 300)
+}
+
+#[test]
+fn a_folded_bucket_that_contains_a_gap_is_a_gap() {
+    let dir = TempDir::new("bucket-width-gap");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // The first five minutes are watched throughout. In the second five, one
+    // minute is missed.
+    for minute in [0u64, 1, 2, 3, 4, 5, 6, 8, 9] {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    let series = series(&loaded, base + 9 * 60, 2, &live);
+    assert!(
+        series[0].is_some(),
+        "a group that was watched throughout is still data: {series:?}"
+    );
+    assert_eq!(
+        series[1], None,
+        "a group containing unobserved time is unobserved, not quiet: {series:?}"
+    );
+}
+
+#[test]
+fn a_folded_quiet_stretch_stays_quiet_rather_than_becoming_a_gap() {
+    let dir = TempDir::new("bucket-width-quiet");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    for minute in 0..5u64 {
+        history.record(
+            &one(base + minute * 60, "w15", "api", &[("w15:p1", "idle", 500)]),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    // Observed and quiet is not the same fact as unobserved, and the fold must
+    // not turn one into the other in either direction.
+    let series = series(&loaded, base + 4 * 60, 1, &live);
+    assert_eq!(series[0], Some(Level(0)), "{series:?}");
+}
+
+#[test]
+fn a_folded_history_keeps_recording_at_the_new_width() {
+    let dir = TempDir::new("bucket-width-resume");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    for minute in 0..5u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 16, 8);
+    let mut loaded = history::load_from(dir.path(), &live);
+    // The next five-minute bucket, recorded at the new width.
+    loaded.record(
+        &one(base + 5 * 60, "w15", "api", &[("w15:p1", "working", 99)]),
+        &live,
+    );
+
+    assert_eq!(
+        loaded.workspaces.len(),
+        1,
+        "the fold did not split the entry"
+    );
+    let series = series(&loaded, base + 5 * 60, 2, &live);
+    assert!(
+        series.iter().all(Option::is_some),
+        "the folded past and the new present are one continuous series: {series:?}"
+    );
+}
+
+#[test]
+fn the_fold_keeps_a_group_in_its_own_five_minutes() {
+    let dir = TempDir::new("bucket-width-alignment");
+    let written = config(60, 240, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // One whole five-minute group of work, then nothing for ten minutes. At 300s
+    // the work belongs two columns back, not in the newest one — a fold that got
+    // the arithmetic wrong would draw real bars in the wrong minutes, which is
+    // worse than drawing none.
+    for minute in 0..5u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 240, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    let series = series(&loaded, base + 14 * 60, 3, &live);
+    assert_eq!(
+        series,
+        vec![Some(Level(8)), None, None],
+        "the folded work has to sit in the column covering the minutes it happened in"
+    );
+}
+
+#[test]
+fn a_fold_of_an_impossible_anchor_reads_as_gaps_rather_than_panicking() {
+    let dir = TempDir::new("bucket-width-hostile");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    history.record(
+        &one(base, "w15", "api", &[("w15:p1", "working", 10)]),
+        &written,
+    );
+    // A hand-edited anchor at the end of the number line, which is where the
+    // fold's arithmetic — dividing it down and multiplying groups back up — is
+    // most likely to wrap and draw somebody else's minutes.
+    let mut value = serde_json::to_value(&history).unwrap();
+    value["workspaces"][0]["newest_bucket"] = serde_json::json!(u64::MAX);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    // Every group around an anchor nobody can believe reads as a gap, so the
+    // fold keeps nothing and the load says so rather than returning a store full
+    // of workspace names with no observations behind them.
+    assert_eq!(loaded, History::empty(&live));
+}
+
+#[test]
+fn a_fold_keeps_the_identity_of_the_series_it_folds() {
+    let dir = TempDir::new("bucket-width-identity");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    for minute in 0..5u64 {
+        history.record(
+            &sample_in(
+                base + minute * 60,
+                Some(session_a()),
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    // Coarsening is about the shape of time, not about whose time it is: every
+    // answer to "which workspace" and "which watch" has to come through intact,
+    // or the folded series is attributed to nobody.
+    let entry = &loaded.workspaces[0];
+    assert_eq!(entry.workspace_id, "w15");
+    assert_eq!(entry.label, "api");
+    assert_eq!(entry.checkout_path.as_deref(), Some("/home/dev/repos/api"));
+    assert_eq!(
+        entry.session.as_deref(),
+        Some(session_a().fingerprint.as_str())
+    );
+    assert_eq!(entry.session_began, Some(session_a().began));
+    assert_eq!(entry.last_seen, base + 4 * 60);
+    assert_eq!(entry.state, "working");
+    assert_eq!(
+        entry.buckets.len(),
+        16,
+        "the ring is still the configured length"
+    );
+}
+
+#[test]
+fn a_fold_keeps_the_part_finished_bucket_at_the_leading_edge() {
+    let dir = TempDir::new("bucket-width-edge");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // Seven minutes: one whole group of five, and two minutes into the next.
+    // Nobody changes `bucket_seconds` exactly on a group boundary, so this is
+    // the ordinary case rather than the corner one.
+    for minute in 0..7u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(300, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    let series = series(&loaded, base + 6 * 60, 2, &live);
+    assert!(
+        series[1].is_some(),
+        "the minutes of the current group that were watched are data; the ones \
+         after them are the future, not a gap: {series:?}"
+    );
+    assert!(series[0].is_some(), "{series:?}");
+}
+
+#[test]
+fn a_fold_that_keeps_nothing_says_the_history_is_gone() {
+    let dir = TempDir::new("bucket-width-nothing");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // Four minutes recorded, then folded at a factor of sixty. No group of sixty
+    // minutes was watched end to end, so every fold of them is a gap.
+    for minute in 0..4u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    let live = config(3_600, 16, 8);
+    let loaded = history::load_from(dir.path(), &live);
+
+    // A fold that keeps nothing is a discard, and the store has to agree with
+    // the message: workspace names attached to no observations at all would draw
+    // rows claiming a last-seen time beside a sparkline with nothing in it.
+    assert_eq!(
+        loaded,
+        History::empty(&live),
+        "an hour that was watched for four minutes is not an observed hour"
+    );
+}
+
+#[test]
+fn a_recorded_bucket_width_no_run_could_write_is_discarded_not_folded() {
+    let dir = TempDir::new("bucket-width-impossible");
+    let written = config(60, 16, 8);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    // Consecutive minutes, so adjacent bucket numbers are all observed and a
+    // fold of two would succeed if it were allowed to happen.
+    for minute in 0..6u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
+
+    // `Config::clamp` pins every run to 10..=3600 seconds, so five can only come
+    // from a hand-edited or damaged file. Against a live width of ten it divides
+    // exactly, and the buckets beside it are consecutive, so the arithmetic would
+    // happily fold pairs of them and keep the result — real-looking bars laid out
+    // in minutes that never existed, because the numbers were computed at 60s and
+    // the file now claims 5s.
+    let mut value = serde_json::to_value(&history).unwrap();
+    value["bucket_seconds"] = serde_json::json!(5);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let live = config(10, 16, 8);
     assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
 }
 
