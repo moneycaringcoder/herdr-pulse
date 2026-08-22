@@ -853,6 +853,187 @@ fn far_more_workspaces_than_the_cap_stay_capped() {
 }
 
 // ---------------------------------------------------------------------------
+// Blocked time
+// ---------------------------------------------------------------------------
+
+/// The blocked and watched figures for the first workspace, over a window of
+/// `columns` single-bucket columns ending at `as_of`.
+fn blocked(history: &History, as_of: u64, columns: usize, config: &Config) -> (u64, u64) {
+    let activity = &history.activity(as_of, columns, 1, config)[0];
+    (activity.blocked_seconds, activity.watched_seconds)
+}
+
+#[test]
+fn blocked_time_is_the_share_of_watched_samples_that_saw_a_block() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    // One minute, four samples, two of them blocked: half the minute.
+    for step in 0..4u64 {
+        let state = if step < 2 { "blocked" } else { "working" };
+        history.record(
+            &one(
+                T0 + step * 15,
+                "w15",
+                "api",
+                &[("w15:p1", state, 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    assert_eq!(
+        blocked(&history, T0, 1, &config),
+        (30, 60),
+        "two of four samples blocked, over one minute watched"
+    );
+}
+
+#[test]
+fn a_gap_is_unknown_blocked_time_and_not_zero() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Minute 0 watched and blocked throughout, minutes 1 to 3 not watched at
+    // all, minute 4 watched and blocked throughout. The hole is *inside* the
+    // window being measured, which is the only shape that tests the rule: a
+    // window that merely extends past the newest bucket never reaches those
+    // slots.
+    for minute in [0u64, 4] {
+        for step in 0..4u64 {
+            history.record(
+                &one(
+                    T0 + minute * 60 + step * 15,
+                    "w15",
+                    "api",
+                    &[("w15:p1", "blocked", 10 + minute * 4 + step)],
+                ),
+                &config,
+            );
+        }
+    }
+
+    let (blocked_seconds, watched_seconds) = blocked(&history, T0 + 4 * 60, 5, &config);
+    assert_eq!(
+        blocked_seconds, 120,
+        "the two minutes that were watched were blocked throughout"
+    );
+    assert_eq!(
+        watched_seconds, 120,
+        "and the three minutes nobody watched are absent from the denominator \
+         rather than counted as unblocked time"
+    );
+}
+
+#[test]
+fn watching_and_seeing_no_block_is_zero_rather_than_unknown() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for step in 0..4u64 {
+        history.record(
+            &one(
+                T0 + step * 15,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    // Zero blocked out of sixty watched is an observation. Zero out of zero is
+    // not, and the two must not arrive as the same pair of numbers.
+    assert_eq!(blocked(&history, T0, 1, &config), (0, 60));
+}
+
+#[test]
+fn a_workspace_whose_window_is_all_gaps_has_nothing_to_report() {
+    let config = config(60, 240, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &one(T0, "w15", "api", &[("w15:p1", "blocked", 10)]),
+        &config,
+    );
+
+    // Three hours later: the one recorded minute is still in the ring but far
+    // outside this window.
+    let (blocked_seconds, watched_seconds) = blocked(&history, T0 + 3 * 3_600, 8, &config);
+    assert_eq!(
+        (blocked_seconds, watched_seconds),
+        (0, 0),
+        "no watching in this window means no figure, not a figure of zero"
+    );
+}
+
+#[test]
+fn blocked_time_sums_across_the_buckets_of_the_window() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Three minutes: fully blocked, half blocked, not blocked.
+    for step in 0..4u64 {
+        history.record(
+            &one(T0 + step * 15, "w15", "api", &[("w15:p1", "blocked", step)]),
+            &config,
+        );
+    }
+    for step in 0..4u64 {
+        let state = if step < 2 { "blocked" } else { "idle" };
+        history.record(
+            &one(
+                T0 + 60 + step * 15,
+                "w15",
+                "api",
+                &[("w15:p1", state, 10 + step)],
+            ),
+            &config,
+        );
+    }
+    for step in 0..4u64 {
+        history.record(
+            &one(
+                T0 + 120 + step * 15,
+                "w15",
+                "api",
+                &[("w15:p1", "idle", 20 + step)],
+            ),
+            &config,
+        );
+    }
+
+    assert_eq!(
+        blocked(&history, T0 + 120, 3, &config),
+        (90, 180),
+        "sixty seconds plus thirty plus none, over three minutes watched"
+    );
+}
+
+#[test]
+fn a_blocked_count_above_the_sample_count_cannot_claim_more_than_the_bucket() {
+    let dir = TempDir::new("blocked-hostile");
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &one(T0, "w15", "api", &[("w15:p1", "blocked", 10)]),
+        &config,
+    );
+
+    // Hand-edited: more blocked samples than samples. Left alone the estimator
+    // would report more blocked seconds than the bucket has.
+    let mut value = serde_json::to_value(&history).unwrap();
+    let slot = (T0 / 60 % 16) as usize;
+    value["workspaces"][0]["buckets"][slot] = serde_json::json!({
+        "samples": 4,
+        "working": 0,
+        "blocked": 9_999,
+        "transitions": 0,
+    });
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let loaded = history::load_from(dir.path(), &config);
+    let (blocked_seconds, watched_seconds) = blocked(&loaded, T0, 1, &config);
+    assert_eq!(blocked_seconds, 60, "capped at the bucket it describes");
+    assert_eq!(watched_seconds, 60);
+}
+
+// ---------------------------------------------------------------------------
 // The coarse ring: hours, a week of them
 // ---------------------------------------------------------------------------
 
@@ -1098,6 +1279,42 @@ fn a_clock_correction_rewinds_both_rings() {
         coarse.last().expect("columns").is_some(),
         "the corrected hour is being recorded again: {coarse:?}"
     );
+}
+
+#[test]
+fn the_week_reports_its_own_blocked_time_and_not_the_afternoons() {
+    // The two rings cover different stretches, so their blocked figures are
+    // different numbers. A week row drawn beside the fine ring's figure would
+    // report this afternoon under a seven-day sparkline.
+    let config = config(60, 240, 4);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // An hour of blocking, twenty hours ago: inside the week ring, far outside
+    // the fine one.
+    for step in 0..6u64 {
+        history.record(
+            &one(
+                base + step * 600,
+                "w15",
+                "api",
+                &[("w15:p1", "blocked", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    let as_of = base + 20 * 3_600;
+    let activity = &history.activity(as_of, 32, 7, &config)[0];
+    assert_eq!(
+        (activity.blocked_seconds, activity.watched_seconds),
+        (0, 0),
+        "the fine ring watched none of this window"
+    );
+    assert_eq!(
+        activity.week_blocked_seconds, 3_600,
+        "the week ring watched that hour and it was blocked throughout"
+    );
+    assert_eq!(activity.week_watched_seconds, 3_600);
 }
 
 #[test]

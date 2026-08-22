@@ -33,6 +33,14 @@ All notable changes to this project are documented here. The format follows
   fields. At the defaults, 8 workspaces × (240 fine + 168 week) buckets measure
   about 180 KB; the week ring is `168 / (240 + 168) ≈ 41%`, roughly 40%, of the
   history file.
+- The pane now reports `blocked`, an estimate of how long an agent was observed
+  blocked, and `--json` adds `blocked_seconds` alongside `watched_seconds` for
+  every workspace. For each observed bucket, pulse multiplies the bucket
+  duration by blocked samples divided by all samples, then rounds.
+  `watched_seconds` says how much of the same `series` window the sampler
+  actually observed, so the estimate cannot be mistaken for a measurement
+  across the whole window. A gap contributes to neither figure: unobserved time
+  is not time with no blocking in it.
 
 ### Changed
 

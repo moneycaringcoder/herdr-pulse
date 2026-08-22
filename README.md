@@ -176,6 +176,7 @@ pulse --once
 | `activity` | The sparkline, oldest column on the left, newest on the right. |
 | `session` | When the herdr session that recorded this row started listening. Parenthesised — `(20:53)` — for a session other than the one running now, `(?)` when that session's start time is unknown, and `?` when it is unknown and there is no live session to compare it to. With no live session at all — herdr not running — no row is marked as earlier than anything. |
 | `state` | The state the workspace was in **at the last observation**. |
+| `blocked` | The estimated blocked duration alone. It is `?` when the sampler watched none of the row; the legend says the estimate covers time actually watched, not the whole row. |
 | `for` | How long that state had held when we last looked. |
 | `seen` | How long ago that observation was. |
 | `agents` | Agents in the workspace at that observation. |
@@ -194,6 +195,15 @@ to the past tense:
 The sparkline says the same thing in glyphs: a stretch of `╌` is time nobody
 watched. The words and the sparkline are never allowed to disagree.
 
+The pane's `blocked` cell shows the estimated duration alone. Its `?` means
+nothing in the row was watched, not that zero blocking was observed. The legend
+therefore says the figure is estimated over time actually watched rather than
+over the whole row. For each observed bucket, pulse multiplies the bucket
+duration by blocked samples divided by all samples, then rounds. A gap
+contributes to neither blocked nor watched time, because unobserved time is not
+time with no blocking in it. A reader wanting the ratio can take
+`blocked_seconds` over `watched_seconds` from `--json`.
+
 When no sampler is live, `--once`, `--week` and `--watch` print a line on
 standard error naming why the last run stopped and, when known, how long ago.
 The four explanations are disabled, terminated, ended unexpectedly (with detail
@@ -205,6 +215,12 @@ stop to explain; a gap then means herdr was unreachable.
 each workspace has `last_seen`, `observed_ago_seconds` and `state_is_current`,
 and the document has the `staleness_tolerance_seconds` those were judged
 against.
+
+Each workspace also has `blocked_seconds` and `watched_seconds`, both covering
+exactly the window in `series`. The former is the blocked-time estimate; the
+latter is how many seconds of that window the sampler actually observed. They
+must be read together so the estimate is not mistaken for a measurement across
+the whole window. A gap contributes to neither field.
 
 The `--json` document also carries a top-level `sampler` object with `running`
 and `stopped`. Inside `stopped`, the fields are `reason`, `at` and `detail`;

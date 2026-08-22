@@ -284,6 +284,52 @@ impl<'a> RingRef<'a> {
             })
             .collect()
     }
+
+    /// Blocked time and watched time over `first..=last`, both in seconds.
+    ///
+    /// The estimator is the one the sampler itself implies: within an observed
+    /// bucket, the fraction of samples that saw a blocked agent is the fraction
+    /// of that bucket's seconds an agent was blocked. Nothing else in the store
+    /// can say more than that, and nothing less would answer the question at all.
+    ///
+    /// **A gap contributes to neither total.** An hour nobody watched is not an
+    /// hour with no blocking in it; it is an hour we cannot speak for. Adding its
+    /// seconds to the denominator would quietly turn "we saw ten minutes of
+    /// blocking in the twenty minutes we watched" into "ten minutes in four
+    /// hours", which is the same arithmetic that makes a gap read as quiet. So
+    /// the watched total is what the ratio is over, and it is reported alongside
+    /// the blocked figure rather than left for a reader to assume.
+    fn blocked_and_watched(&self, first: u64, last: u64, bucket_seconds: u64) -> (u64, u64) {
+        let len = self.buckets.len() as u64;
+        if len == 0 {
+            return (0, 0);
+        }
+        let first = first.max(self.newest.saturating_sub(len - 1));
+        let last = last.min(self.newest);
+        if first > last {
+            return (0, 0);
+        }
+
+        let mut blocked = 0u64;
+        let mut watched = 0u64;
+        for number in first..=last {
+            let bucket = self.bucket(number);
+            if !bucket.observed() {
+                continue;
+            }
+            let samples = u64::from(bucket.samples);
+            // A `blocked` above `samples` can only come from a hand-edited or
+            // corrupt file, and left alone it would claim more blocked seconds
+            // than the bucket contains.
+            let saw_blocked = u64::from(bucket.blocked.min(bucket.samples));
+            // Rounded, so a bucket blocked in seven samples of twelve does not
+            // read the same as one blocked in six.
+            blocked = blocked
+                .saturating_add((bucket_seconds * saw_blocked + samples / 2) / samples.max(1));
+            watched = watched.saturating_add(bucket_seconds);
+        }
+        (blocked, watched)
+    }
 }
 
 impl<'a> RingMut<'a> {
@@ -1178,6 +1224,32 @@ impl History {
                     crate::config::WEEK_COLUMNS,
                     crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
                 );
+                // Over exactly the window the series covers, so the figure and
+                // the sparkline beside it describe the same stretch of time. A
+                // zero-column request draws nothing, so it measures nothing:
+                // measuring one bucket for a series with no columns in it would
+                // be a figure over a stretch no column shows.
+                let window = (columns as u64).saturating_mul(per_column);
+                let (blocked_seconds, watched_seconds) = if window == 0 {
+                    (0, 0)
+                } else {
+                    workspace.fine().blocked_and_watched(
+                        newest.saturating_sub(window - 1),
+                        newest,
+                        config.bucket_seconds.max(1),
+                    )
+                };
+                // And the same again for the week, because a week row must
+                // report the week's blocked time rather than this afternoon's.
+                let week_newest = week_bucket_number(as_of);
+                let week_window = (crate::config::WEEK_COLUMNS as u64)
+                    .saturating_mul(crate::config::WEEK_BUCKETS_PER_COLUMN as u64);
+                let (week_blocked_seconds, week_watched_seconds) =
+                    workspace.week().blocked_and_watched(
+                        week_newest.saturating_sub(week_window.saturating_sub(1)),
+                        week_newest,
+                        crate::config::WEEK_BUCKET_SECONDS,
+                    );
                 WorkspaceActivity {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
@@ -1210,6 +1282,10 @@ impl History {
                     session: workspace.session.clone(),
                     session_began: workspace.session_began,
                     week,
+                    blocked_seconds,
+                    watched_seconds,
+                    week_blocked_seconds,
+                    week_watched_seconds,
                 }
             })
             .collect()
