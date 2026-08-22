@@ -36,6 +36,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A gap used to say only that nobody was watching, not why. The pane now follows
+  the history with a sampler line, and `--json` carries the same explanation:
+  `disabled`, `terminated`, `failed` or `unknown`. `--disable` clears the enabled
+  marker before signalling the sampler, so a signal received with the marker
+  gone is the user's request (`disabled`); with the marker still set, it came
+  from elsewhere (`terminated`). A panic or an error exit records itself as
+  `failed`. A run that leaves no stop marker while the enabled marker says it was
+  wanted reads as `unknown`, never dressed up as a tidy exit.
 - Series are kept per herdr session, and every interface says which session a
   series belongs to. Workspace ids, pane ids and `state_change_seq` are all
   scoped to one run of the server, so buckets recorded under two sessions were

@@ -274,6 +274,153 @@ fn enabled_flag_round_trips() {
     assert!(daemon::is_enabled());
 }
 
+// ---------------------------------------------------------------------------
+// Why the sampler stopped
+// ---------------------------------------------------------------------------
+
+fn write_stop_marker(contents: &str) {
+    std::fs::write(config::stop_marker(), contents).expect("write stop marker");
+}
+
+#[test]
+fn a_live_sampler_has_nothing_to_explain() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-live");
+    // Our own pid stands in for a live daemon.
+    daemon::write_pid(std::process::id());
+    // Even with a marker left over from an earlier run: a gap while a sampler is
+    // running means herdr was unreachable, not that the sampler stopped.
+    write_stop_marker("disabled\n1700000000\n");
+
+    assert!(daemon::stop_report().is_none());
+
+    daemon::clear_pid_file();
+}
+
+#[test]
+fn a_recorded_stop_is_reported_with_its_reason_and_time() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-recorded");
+
+    for (written, expected) in [
+        ("disabled", daemon::StopReason::Disabled),
+        ("terminated", daemon::StopReason::Terminated),
+        ("failed", daemon::StopReason::Failed),
+    ] {
+        write_stop_marker(&format!("{written}\n1700000000\n"));
+        let stop = daemon::stop_report().expect("a stopped sampler");
+        assert_eq!(stop.reason, expected, "marker {written:?}");
+        assert_eq!(stop.at, Some(1_700_000_000));
+        assert_eq!(stop.detail, None);
+    }
+}
+
+#[test]
+fn a_failure_carries_its_one_line_of_detail() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-detail");
+    write_stop_marker("failed\n1700000000\ncannot reach herdr at /nowhere.sock\n");
+
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    assert_eq!(stop.reason, daemon::StopReason::Failed);
+    assert_eq!(
+        stop.detail.as_deref(),
+        Some("cannot reach herdr at /nowhere.sock")
+    );
+}
+
+#[test]
+fn a_run_that_left_no_marker_reads_as_unknown_and_never_as_disabled() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-killed");
+    // What a SIGKILL leaves: the user still wants a sampler, there is not one,
+    // and nothing was written on the way out.
+    daemon::mark_enabled(true);
+
+    let stop = daemon::stop_report().expect("a sampler that is wanted and absent");
+    assert_eq!(
+        stop.reason,
+        daemon::StopReason::Unknown,
+        "a run that said nothing must not be reported as a tidy shutdown"
+    );
+    assert_eq!(stop.at, None, "nobody was there to record a time");
+}
+
+#[test]
+fn a_marker_nobody_can_read_is_unknown_rather_than_ignored() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-garbage");
+    daemon::mark_enabled(true);
+
+    // A reason from a newer pulse, or a hand-edited file. Either way it is a word
+    // this build cannot interpret, and interpreting it anyway is how a guess gets
+    // in.
+    write_stop_marker("evaporated\n1700000000\n");
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    assert_eq!(stop.reason, daemon::StopReason::Unknown);
+    assert_eq!(
+        stop.at,
+        Some(1_700_000_000),
+        "the marker was parsed, not skipped: without this the enabled-flag \
+         fallback would produce the same reason and the test would prove nothing"
+    );
+
+    // A marker with no timestamp still names its reason; only the "when"
+    // degrades.
+    write_stop_marker("terminated\n");
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    assert_eq!(stop.reason, daemon::StopReason::Terminated);
+    assert_eq!(stop.at, None);
+}
+
+#[test]
+fn a_sampler_that_was_never_enabled_here_has_nothing_to_report() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-fresh");
+
+    // A fresh state dir is not a stopped sampler. Reporting one would put a
+    // reason under every empty pane on a machine that has never run `--enable`.
+    assert!(daemon::stop_report().is_none());
+}
+
+#[test]
+fn a_real_panic_string_keeps_its_message_in_the_marker() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-panic");
+    daemon::mark_enabled(true);
+
+    // What `std` hands a panic hook, verbatim in shape: the location first, the
+    // message on the *next* line. A fold that cut at the first newline would
+    // keep the file and line and throw the sentence away — in the one place a
+    // detached daemon can still say what happened.
+    daemon::record_failure("panicked at src/daemon.rs:412:9:\nthe ring length was zero");
+
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    assert_eq!(stop.reason, daemon::StopReason::Failed);
+    let detail = stop.detail.expect("a failure carries its detail");
+    assert!(
+        detail.contains("the ring length was zero"),
+        "the message is the part a reader needs: {detail:?}"
+    );
+    assert!(
+        !detail.contains('\n'),
+        "the marker is line-delimited: {detail:?}"
+    );
+}
+
+#[test]
+fn an_enormous_detail_is_trimmed_rather_than_written_whole() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("stop-huge");
+    daemon::mark_enabled(true);
+
+    daemon::record_failure(&"x".repeat(10_000));
+
+    let stop = daemon::stop_report().expect("a stopped sampler");
+    let detail = stop.detail.expect("detail");
+    assert!(detail.len() <= 200, "{} chars", detail.len());
+}
+
 #[test]
 fn the_markers_are_created_even_when_the_state_dir_does_not_exist_yet() {
     let _guard = env_lock();

@@ -86,7 +86,10 @@ fn run(args: &[String]) -> Result<()> {
         "--disable" => daemon::disable(),
         "--toggle" => daemon::toggle(args),
         "--restore" => daemon::restore(),
-        "--daemon" => daemon::run(&config::load_with_args(args)?),
+        // The daemon records why it stopped on its way out, including this exit:
+        // an error that ends the run is a reason a gap can carry, and losing it
+        // would leave the run indistinguishable from one that was killed.
+        "--daemon" => daemon::run_daemon(&config::load_with_args(args)?),
         "--forget" => history::forget(),
         "--setup" => setup::run_setup(),
         "--setup-rollback" => setup::run_rollback(),
