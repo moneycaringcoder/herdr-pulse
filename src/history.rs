@@ -721,14 +721,33 @@ impl WorkspaceHistory {
         kept
     }
 
-    /// Re-lays both rings at their configured lengths.
+    /// Re-lays every ring at its configured length, and drops the agent rings
+    /// when the live config is not recording them.
     ///
     /// The fine one follows `retention_buckets`; the week one is fixed, and is
     /// laid out here on the first load of a file written before it existed.
-    fn reshape(&mut self, len: usize) {
-        self.fine_mut().reshape(len);
+    ///
+    /// The agent rings have to be handled here and not only in `observe`,
+    /// because `Config::clamp` budgets the file from the *live* setting while
+    /// the rings on disk were written under whichever setting was live then. A
+    /// workspace that is never sampled again would otherwise keep four rings the
+    /// clamp is no longer counting, and "bounded by construction" would hold only
+    /// for workspaces that happen to still be open.
+    fn reshape(&mut self, config: &Config) {
+        self.fine_mut().reshape(config.retention_buckets);
         self.week_mut()
             .reshape(crate::config::WEEK_RETENTION_BUCKETS);
+        if config.per_agent_series {
+            for agent in &mut self.agents {
+                RingMut {
+                    buckets: &mut agent.buckets,
+                    newest: &mut agent.newest_bucket,
+                }
+                .reshape(config.retention_buckets);
+            }
+        } else {
+            self.agents.clear();
+        }
     }
 
     fn advance(&mut self, number: u64) {
@@ -751,13 +770,30 @@ impl WorkspaceHistory {
     /// freshness from them, so a future `last_seen` left in place would report
     /// "observed just now" forever beside a sparkline of pure gaps.
     ///
-    /// Only the fine anchor is pulled back here. The week ring is rewound by the
-    /// [`RingMut::absorb`] that follows, which meets whatever anchor it finds —
-    /// and it must be rewound, because a stepped clock wrote into both and a
-    /// coarse anchor left in the future would keep the week view deaf for as many
-    /// *hours* as the jump was long.
+    /// The week ring is rewound by the [`RingMut::absorb`] that follows, which
+    /// meets whatever anchor it finds. The **agent** rings cannot rely on that:
+    /// `observe_agents` only reaches an agent present in the sample, and an agent
+    /// that was observed during the fast-clock window but is absent from the
+    /// sample that corrects it would keep an anchor in the future — along with
+    /// the buckets written there, which `slot` starts admitting the moment the
+    /// wall clock catches up. The pane would then draw bars for minutes nobody
+    /// watched, in the same entry whose aggregate row correctly shows gaps for
+    /// them. So every ring in the entry is re-anchored here, by the one
+    /// correction.
     fn rewind(&mut self, number: u64, taken_at: u64) {
         self.fine_mut().rewind(number);
+        for agent in &mut self.agents {
+            RingMut {
+                buckets: &mut agent.buckets,
+                newest: &mut agent.newest_bucket,
+            }
+            .rewind(number);
+            // And the stamp beside it. A `last_seen` the stepped clock wrote
+            // would print "seen 0s" in present tense beside a row of gaps, and
+            // would make the agent unevictable, because eviction takes the
+            // oldest and a future stamp is never that.
+            agent.last_seen = agent.last_seen.min(taken_at);
+        }
         self.last_seen = taken_at;
         if self.state_since.is_some_and(|since| since > taken_at) {
             // We no longer know when this state began: the only stamp we had for
@@ -805,7 +841,7 @@ impl WorkspaceHistory {
         taken_at: u64,
         config: &Config,
     ) -> bool {
-        self.reshape(config.retention_buckets);
+        self.reshape(config);
 
         let number = bucket_number(taken_at, config);
         let mut rewound = false;
@@ -912,7 +948,17 @@ impl WorkspaceHistory {
         taken_at: u64,
         config: &Config,
     ) {
+        let mut handled: Vec<&str> = Vec::new();
         for agent in &observation.agents {
+            // One absorb per pane id per sample. A snapshot that reports an id
+            // twice would otherwise inflate that agent's `samples`, dilute its
+            // level whenever the two entries disagreed about the state, and count
+            // its transition twice — the same contradiction `agent_seqs` already
+            // refuses one invariant below.
+            if handled.contains(&agent.pane_id.as_str()) {
+                continue;
+            }
+            handled.push(agent.pane_id.as_str());
             let transitions = self.agent_transition(agent);
             let index = match self
                 .agents
@@ -952,7 +998,7 @@ impl WorkspaceHistory {
                 transitions,
             );
         }
-        self.evict_agents();
+        self.evict_agents(taken_at);
     }
 
     /// Whether this agent's `state_change_seq` moved since the last observation.
@@ -975,15 +1021,23 @@ impl WorkspaceHistory {
     /// The other half of the size bound for per-agent series: the ring bounds one
     /// agent, this bounds how many rings a workspace holds, and `Config::clamp`
     /// multiplies the two into the file's ceiling.
-    fn evict_agents(&mut self) {
+    ///
+    /// A stamp later than the sample that prompted this was written by a clock
+    /// that has since been corrected, and goes first however fresh it claims to
+    /// be — the same guard `History::evict` uses one level up, and for the same
+    /// reason: otherwise the cap falls on the agent being sampled right now,
+    /// every cycle, until the wall clock catches up with a time that never
+    /// happened.
+    fn evict_agents(&mut self, now: u64) {
         while self.agents.len() > crate::config::MAX_AGENTS_PER_WORKSPACE {
             let victim = self
                 .agents
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
-                    a.last_seen
-                        .cmp(&b.last_seen)
+                    (a.last_seen <= now)
+                        .cmp(&(b.last_seen <= now))
+                        .then_with(|| a.last_seen.cmp(&b.last_seen))
                         // Ties broken by pane id so the same input always evicts
                         // the same agent.
                         .then_with(|| a.pane_id.cmp(&b.pane_id))
@@ -1330,7 +1384,7 @@ impl History {
             true
         });
         for workspace in &mut self.workspaces {
-            workspace.reshape(config.retention_buckets);
+            workspace.reshape(config);
         }
         // No sample to measure against on a load: every stamp in the file is as
         // believable as every other until one arrives.
@@ -1490,6 +1544,13 @@ impl History {
         let mut kept = 0;
         for workspace in &mut self.workspaces {
             kept += workspace.coarsen(factor, config.retention_buckets);
+            // Agent rings are not folded. There is an honest fold for the
+            // workspace's ring because its buckets are the only record of their
+            // span; an agent ring left at the old numbering would put bars at
+            // minutes computed from a scale nobody recorded them at, and the two
+            // numberings do overlap for close-enough sizes. The message that
+            // announces the fold already covers the loss.
+            workspace.agents.clear();
         }
         self.bucket_seconds = config.bucket_seconds;
         kept
@@ -1505,12 +1566,16 @@ impl History {
     /// because the *minutes* beside it were written at another scale would be a
     /// loss with no reason behind it.
     ///
+    /// The agent rings go with the fine ring, for the same reason: they are the
+    /// same minutes at the same scale, and that scale is the one that changed.
+    ///
     /// The identity, state and timestamps come through with the week ring, since
     /// they are what say whose hours those are.
     fn keep_only_week(&mut self, config: &Config) {
         for workspace in &mut self.workspaces {
             workspace.buckets = vec![Bucket::default(); config.retention_buckets];
             workspace.newest_bucket = bucket_number(workspace.last_seen, config);
+            workspace.agents.clear();
         }
         self.bucket_seconds = config.bucket_seconds;
     }

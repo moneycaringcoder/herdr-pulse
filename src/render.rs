@@ -394,9 +394,26 @@ fn render_pane(
         for agent in agents {
             let current = as_of.saturating_sub(agent.last_seen) <= tolerance;
             any_stale |= !current;
-            let label = agent.program.as_deref().unwrap_or(&agent.pane_id);
+            // The pane id goes in the label whenever the program does not
+            // identify the row on its own. Three panes running `claude` in one
+            // workspace is the case this feature exists for, and three rows
+            // labelled `claude` answer "which of them was busy" with a sparkline
+            // and nothing to tie it back to a pane.
+            let unique_program = agent.program.as_deref().is_some_and(|program| {
+                workspace
+                    .agents
+                    .iter()
+                    .filter(|other| other.program.as_deref() == Some(program))
+                    .count()
+                    == 1
+            });
+            let label = match (&agent.program, unique_program) {
+                (Some(program), true) => program.clone(),
+                (Some(program), false) => format!("{program} {}", agent.pane_id),
+                (None, _) => agent.pane_id.clone(),
+            };
             rows.push(vec![
-                format!("  {}", clean_label(label)),
+                format!("  {}", clean_label(&label)),
                 format!("[{}]", sparkline(&agent.series)),
                 String::new(),
                 if current {
@@ -644,6 +661,13 @@ pub fn json_document(
                         "state": agent.state.as_str(),
                         "series": json_series(&agent.series),
                         "last_seen": agent.last_seen,
+                        // The same two fields the workspace object carries, for
+                        // the same reason: a consumer reading `"state":"working"`
+                        // has no way to see that nobody has looked in five hours,
+                        // and the pane already draws `was working` for exactly
+                        // these rows.
+                        "observed_ago_seconds": as_of.saturating_sub(agent.last_seen),
+                        "state_is_current": as_of.saturating_sub(agent.last_seen) <= tolerance,
                         "blocked_seconds": agent.blocked_seconds,
                         "watched_seconds": agent.watched_seconds,
                     }))

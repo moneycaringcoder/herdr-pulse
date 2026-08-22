@@ -270,8 +270,15 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
     }
     // A bare switch rather than a value: it turns a recording behaviour on, and
     // `--agents false` would read as "show me the agents" to anybody skimming.
-    if args.iter().any(|arg| arg == "--agents") {
-        config.per_agent_series = true;
+    // A valued spelling is refused rather than ignored — `--agents=false`
+    // silently meaning the opposite of what it says is exactly the quiet
+    // no-op the bare form was chosen to avoid.
+    for arg in args {
+        if arg == "--agents" {
+            config.per_agent_series = true;
+        } else if arg.starts_with("--agents=") {
+            return Err("--agents takes no value".into());
+        }
     }
     config.clamp();
     Ok(config)

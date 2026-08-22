@@ -1478,30 +1478,147 @@ fn an_agent_that_leaves_keeps_the_history_it_earned() {
 fn agent_rings_are_capped_and_the_least_recently_seen_goes_first() {
     let config = per_agent(60, 16, 4);
     let mut history = History::empty(&config);
-    // Six agents, one arriving each minute: two more than the cap.
-    for minute in 0..6u64 {
-        let agents: Vec<(String, &str, u64)> = (0..=minute)
-            .map(|index| (format!("w15:p{index}"), "working", 10 + index))
-            .collect();
-        let borrowed: Vec<(&str, &str, u64)> = agents
-            .iter()
-            .map(|(pane, state, seq)| (pane.as_str(), *state, *seq))
-            .collect();
-        history.record(&crowd(T0 + minute * 60, &borrowed), &config);
+    // Two agents present throughout, and four more that each appear for one
+    // minute and leave. At the cap the survivors must be the two that are still
+    // here plus the two most recent visitors — which only holds if eviction
+    // really orders by `last_seen`.
+    for minute in 0..4u64 {
+        let visitor = format!("w15:v{minute}");
+        let agents = vec![
+            ("w15:p1", "working", 10 + minute),
+            ("w15:p2", "working", 20 + minute),
+            (visitor.as_str(), "working", 30 + minute),
+        ];
+        history.record(&crowd(T0 + minute * 60, &agents), &config);
     }
 
     let entry = &history.workspaces[0];
-    assert_eq!(
-        entry.agents.len(),
-        pulse::config::MAX_AGENTS_PER_WORKSPACE,
-        "the cap is what keeps the file bounded once agents are recorded"
-    );
-    // Every surviving agent was seen in the last sample, so the cap fell on
-    // nobody who is still here — there were six agents and four rings.
-    assert!(entry
+    let mut kept: Vec<&str> = entry
         .agents
         .iter()
-        .all(|agent| agent.last_seen == T0 + 5 * 60));
+        .map(|agent| agent.pane_id.as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["w15:p1", "w15:p2", "w15:v2", "w15:v3"],
+        "the cap has to fall on the agents nobody has seen for longest"
+    );
+}
+
+#[test]
+fn a_clock_correction_rewinds_the_agent_rings_too() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Both agents observed by a clock running five hours fast.
+    history.record(
+        &crowd(
+            T0 + 5 * 3_600,
+            &[("w15:p1", "working", 10), ("w15:p2", "working", 20)],
+        ),
+        &config,
+    );
+    // The clock is corrected, and only one of them is in that sample. The other
+    // must still be re-anchored: its buckets sit at minutes the wall clock has
+    // not reached, and they would start rendering as bars the moment it does.
+    history.record(&crowd(T0, &[("w15:p1", "working", 11)]), &config);
+
+    let entry = &history.workspaces[0];
+    for agent in &entry.agents {
+        assert!(
+            agent.newest_bucket <= T0 / 60,
+            "{} kept an anchor a stepped clock wrote: {} > {}",
+            agent.pane_id,
+            agent.newest_bucket,
+            T0 / 60
+        );
+        assert!(
+            agent.last_seen <= T0,
+            "{} kept a stamp from a time that has not happened",
+            agent.pane_id
+        );
+    }
+
+    // And nothing from the future window projects as observed.
+    let activity = &history.activity(T0, 8, 1, &config)[0];
+    let absent = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the agent that was not in the correcting sample");
+    assert!(
+        absent.series.iter().all(Option::is_none),
+        "minutes nobody watched, drawn as bars: {:?}",
+        absent.series
+    );
+}
+
+#[test]
+fn turning_recording_off_drops_the_rings_of_a_workspace_nobody_samples_again() {
+    let dir = TempDir::new("agent-rings-off");
+    let recording = per_agent(60, 16, 4);
+    let mut history = History::empty(&recording);
+    history.record(&crowd(T0, &[("w15:p1", "working", 10)]), &recording);
+    history::save_to(dir.path(), &history).expect("save");
+
+    // A load under a config that is not recording them. Waiting for the next
+    // sample would leave the rings on disk for a workspace that is never sampled
+    // again, outside the budget `Config::clamp` is enforcing.
+    let plain = config(60, 16, 4);
+    let loaded = history::load_from(dir.path(), &plain);
+    assert!(loaded.workspaces[0].agents.is_empty());
+}
+
+#[test]
+fn a_bucket_size_change_drops_the_agent_rings_rather_than_re_laying_them() {
+    let dir = TempDir::new("agent-rings-scale");
+    let written = per_agent(60, 16, 4);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    for minute in 0..5u64 {
+        history.record(
+            &crowd(base + minute * 60, &[("w15:p1", "working", 10 + minute)]),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    // The fine ring folds; an agent ring cannot. Its buckets are numbered at the
+    // old scale, and for close-enough sizes the two numberings overlap — which
+    // would draw bars at minutes computed from a scale nobody recorded them at.
+    let live = Config {
+        per_agent_series: true,
+        ..config(300, 16, 4)
+    };
+    let loaded = history::load_from(dir.path(), &live);
+    assert!(
+        loaded.workspaces[0].buckets.iter().any(|b| b.samples > 0),
+        "the workspace's own ring is folded and kept"
+    );
+    assert!(
+        loaded.workspaces[0].agents.is_empty(),
+        "and the agent rings go, because there is no honest fold for them"
+    );
+}
+
+#[test]
+fn one_pane_id_reported_twice_is_absorbed_once() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // herdr should never do this. If it does, folding the id twice inflates the
+    // agent's samples and counts its transition twice.
+    history.record(
+        &crowd(T0, &[("w15:p1", "working", 10), ("w15:p1", "idle", 11)]),
+        &config,
+    );
+
+    let entry = &history.workspaces[0];
+    assert_eq!(entry.agents.len(), 1);
+    let slot = (T0 / 60 % 16) as usize;
+    assert_eq!(
+        entry.agents[0].buckets[slot].samples, 1,
+        "one sample is one sample, however many times the snapshot said it"
+    );
 }
 
 #[test]

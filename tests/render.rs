@@ -1944,6 +1944,11 @@ fn json_carries_each_agent_series_without_flattening_its_gaps() {
             "state": "working",
             "series": [null, 0, 8],
             "last_seen": AS_OF - 7,
+            // The same two fields the workspace object carries: a consumer
+            // reading `"state":"working"` otherwise has no way to see how old
+            // the observation behind it is.
+            "observed_ago_seconds": 7,
+            "state_is_current": true,
             "blocked_seconds": 7,
             "watched_seconds": 120,
         }])

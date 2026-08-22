@@ -55,6 +55,14 @@ const VALUED: [&str; 4] = [
     "--columns",
 ];
 
+/// Options that take no value, and so must never be mistaken for the verb
+/// either.
+///
+/// Separate from [`VALUED`], not folded into it: a switch listed there would
+/// swallow whatever followed it, so `pulse --agents --once` would lose the verb
+/// a different way.
+const SWITCHES: [&str; 1] = ["--agents"];
+
 /// The verb is the first argument that is not an option or an option's value, so
 /// `pulse --interval 10 --once` works as readily as `pulse --once --interval 10`.
 /// Ordering that matters is a papercut nobody should have to learn.
@@ -66,6 +74,9 @@ fn verb_of(args: &[String]) -> &str {
             continue;
         }
         let name = arg.split('=').next().unwrap_or(arg);
+        if SWITCHES.contains(&name) {
+            continue;
+        }
         if VALUED.contains(&name) {
             // `--interval=5` carries its value; bare `--interval 5` does not.
             skip_value = !arg.contains('=');
