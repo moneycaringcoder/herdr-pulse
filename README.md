@@ -430,6 +430,13 @@ hour". The `--once` and `--watch` panes are not so constrained and draw the
 full fine-ring retention across 32 wider columns; `--week` draws its fixed ring
 across 28 columns instead.
 
+Eight is a choice, not a measurement, and it stays one: herdr 0.8.0 / protocol 19
+exposes no sidebar or badge width anywhere, so a wider badge would mean guessing
+how much room there is. The [protocol
+notes](docs/herdr-protocol.md#what-the-protocol-does-not-expose-the-width-a-badge-has)
+record what was checked. Use `--columns <N>` if your sidebar is wider than the
+tightest case this assumes.
+
 **5-second sampling.** One snapshot of a live 10-workspace, 18-agent session
 measured 12.7 ms and 34 KB on the wire, so a 5-second interval is a 0.25% duty
 cycle — cheap enough that the finer resolution is worth having.

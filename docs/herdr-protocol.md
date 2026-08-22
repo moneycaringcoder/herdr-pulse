@@ -282,6 +282,45 @@ marker are needed — one answers "is a daemon live right now", the other answer
 "did the user ever ask for one" — and both writes are best-effort, since an
 unwritable state dir must not fail the user's action.
 
+## What the protocol does not expose: the width a badge has
+
+Checked, not assumed, against `herdr api schema --json` from a live 0.8.0 server
+(protocol 19) and a live `session.snapshot`. **Nothing in the protocol says how
+many columns a sidebar badge has to work with**, so the badge's eight columns are
+a fixed choice rather than a measurement.
+
+The evidence, in the order it rules the possibilities out:
+
+- All 105 request methods were enumerated from the schema's `request.oneOf[]`.
+  None queries sidebar or UI geometry: the closest are `pane.layout` and
+  `pane.list`, which describe terminal panes.
+- `WorkspaceInfo` — the object the badge belongs to — carries `workspace_id`,
+  `number`, `label`, `focused`, `pane_count`, `tab_count`, `active_tab_id`,
+  `agent_status`, `tokens` and `worktree`. There is no width, and no cell budget.
+- The only widths in the whole schema are `PaneLayoutRect { x, y, width, height }`
+  in uint16 cells, and `PaneScrollInfo.viewport_rows`, which is rows. Both
+  describe terminal panes. A badge is not a pane.
+
+There is a tempting derivation, and it is wrong. The observed live session
+reports `layouts[].area.x == 28`, which on that machine is exactly the sidebar's
+width. But `area.x` is where the *pane area* begins, and it equals the sidebar
+width only when the sidebar is visible, on the left, and the only chrome to its
+left. The protocol promises none of those, so the number is a coincidence that
+happens to be right here and would be silently wrong elsewhere.
+
+Even a true sidebar width would not answer the question. The row a badge lands in
+is composed in the user's `config.toml` — `[ui.sidebar.spaces] rows` — where our
+token shares a line with whatever else the user listed, and herdr decides at
+render time how much each of those takes and where to elide. The observed config
+sets no width at all: the 28 is herdr's own layout, computed from data the plugin
+cannot see.
+
+What would unblock it: a field on `WorkspaceInfo`, or a top level of
+`session.snapshot`, giving the cells a token may occupy in that workspace's row
+**after** the row's other tokens and herdr's eliding. Until that exists, widening
+the sparkline means guessing, and a sparkline that is subtly wrong at the edges is
+worse than one that is honestly narrow.
+
 ## Still unverified
 
 Honest list of what this plugin assumes rather than checked:
