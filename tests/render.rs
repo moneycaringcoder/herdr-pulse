@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pulse::config::{Config, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
 use pulse::daemon::{SamplerStop, StopReason};
-use pulse::model::{AgentState, Level, SessionMark, WorkspaceActivity};
+use pulse::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
     badge, display_width, duration, json_document, pane, pane_geometry, sampler_stop_message,
     sparkline, staleness_tolerance, state_glyph, week_pane, SamplerState, GAP, QUIET, RAMP,
@@ -48,7 +48,34 @@ fn activity(
         week: vec![None; pulse::config::WEEK_COLUMNS],
         week_blocked_seconds: 0,
         week_watched_seconds: 0,
+        // No per-agent rings unless a test asks: the sampler only records them
+        // when the user turns them on.
+        agents: Vec::new(),
     }
+}
+
+fn agent(
+    pane_id: &str,
+    program: Option<&str>,
+    series: Vec<Option<Level>>,
+    state: AgentState,
+    seen_ago: u64,
+    blocked_seconds: u64,
+    watched_seconds: u64,
+) -> AgentActivity {
+    AgentActivity {
+        pane_id: pane_id.to_string(),
+        program: program.map(str::to_string),
+        state,
+        series,
+        last_seen: AS_OF - seen_ago,
+        blocked_seconds,
+        watched_seconds,
+    }
+}
+
+fn with_agents(activity: WorkspaceActivity, agents: Vec<AgentActivity>) -> WorkspaceActivity {
+    WorkspaceActivity { agents, ..activity }
 }
 
 /// Sets the blocked estimate and the watched time that supports it.
@@ -126,6 +153,16 @@ fn row_for<'a>(rendered: &'a str, label: &str) -> &'a str {
         .lines()
         .find(|line| line.starts_with(label))
         .unwrap_or_else(|| panic!("no row for {label:?} in\n{rendered}"))
+}
+
+fn agent_row_for<'a>(rendered: &'a str, label: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|line| {
+            line.strip_prefix("  ")
+                .is_some_and(|line| line.starts_with(label))
+        })
+        .unwrap_or_else(|| panic!("no indented row for {label:?} in\n{rendered}"))
 }
 
 fn levels(raw: &[u8]) -> Vec<Option<Level>> {
@@ -892,6 +929,210 @@ fn pane_columns_line_up_when_sparklines_contain_gaps() {
     // The brackets are what make a leading or trailing gap visible at all.
     assert!(rendered.contains(&format!("[{GAP}{GAP}██]")));
     assert!(rendered.contains(&format!("[▁{GAP}{GAP}{GAP}]")));
+}
+
+#[test]
+fn agent_rows_follow_their_workspace_in_most_recent_order() {
+    let live = session("live", 13 * 3_600 + 28 * 60);
+    let workspace = recorded_by(
+        with_agents(
+            activity(
+                "web",
+                levels(&[8, 8, 8, 8]),
+                AgentState::Blocked,
+                Some(60),
+                2,
+            ),
+            vec![
+                agent(
+                    "pane-older",
+                    None,
+                    levels(&[0, 0, 0, 0]),
+                    AgentState::Idle,
+                    40,
+                    0,
+                    60,
+                ),
+                agent(
+                    "pane-newer",
+                    Some("claude"),
+                    levels(&[8, 8, 8, 8]),
+                    AgentState::Blocked,
+                    3,
+                    12,
+                    60,
+                ),
+            ],
+        ),
+        &live,
+    );
+    let rendered = pane(&[workspace], &Config::default(), AS_OF, Some(&live));
+
+    let workspace_at = rendered.find("\nweb").unwrap();
+    let newer_at = rendered.find("\n  claude").unwrap();
+    let older_at = rendered.find("\n  pane-older").unwrap();
+    assert!(workspace_at < newer_at && newer_at < older_at, "{rendered}");
+
+    let newer = agent_row_for(&rendered, "claude");
+    assert!(newer.contains("! blocked"), "{newer:?}");
+    assert!(newer.contains("12s"), "{newer:?}");
+    assert!(newer.contains("3s"), "{newer:?}");
+    assert!(
+        !newer.contains("13:28"),
+        "the agent repeated its workspace session: {newer:?}"
+    );
+    assert!(
+        !newer.ends_with(' '),
+        "the omitted aggregate count left trailing padding: {newer:?}"
+    );
+}
+
+#[test]
+fn an_agent_that_appeared_late_keeps_gaps_before_its_first_bar() {
+    let workspace = with_agents(
+        activity(
+            "web",
+            levels(&[8, 8, 8, 8]),
+            AgentState::Working,
+            Some(1),
+            1,
+        ),
+        vec![agent(
+            "pane-1",
+            Some("claude"),
+            vec![None, None, Some(Level::new(0)), Some(Level::new(8))],
+            AgentState::Working,
+            1,
+            0,
+            120,
+        )],
+    );
+    let rendered = sample_pane(vec![workspace]);
+    let row = agent_row_for(&rendered, "claude");
+
+    assert!(
+        row.contains(&format!("[{GAP}{GAP}{QUIET}█]")),
+        "absence before appearance became observed quiet: {row:?}"
+    );
+}
+
+#[test]
+fn short_and_long_agent_programs_keep_every_table_column_aligned() {
+    let workspace = with_agents(
+        activity(
+            "web",
+            levels(&[8, 8, 8, 8]),
+            AgentState::Working,
+            Some(1),
+            2,
+        ),
+        vec![
+            agent(
+                "pane-short",
+                Some("go"),
+                levels(&[1, 2, 3, 4]),
+                AgentState::Working,
+                1,
+                0,
+                60,
+            ),
+            agent(
+                "pane-long",
+                Some("a-program-name-that-is-deliberately-much-too-long"),
+                levels(&[4, 3, 2, 1]),
+                AgentState::Idle,
+                2,
+                0,
+                60,
+            ),
+        ],
+    );
+    let rendered = sample_pane(vec![workspace]);
+    let rows = [
+        row_for(&rendered, "web"),
+        agent_row_for(&rendered, "go"),
+        agent_row_for(&rendered, "a-program"),
+    ];
+
+    let activity_offsets: Vec<usize> = rows
+        .iter()
+        .map(|row| display_width(&row[..row.rfind('[').unwrap()]))
+        .collect();
+    assert!(
+        activity_offsets.windows(2).all(|pair| pair[0] == pair[1]),
+        "activity columns are not aligned: {activity_offsets:?}\n{rendered}"
+    );
+
+    let state_offsets: Vec<usize> = rows
+        .iter()
+        .map(|row| {
+            let at = row
+                .find("> working")
+                .or_else(|| row.find("- idle"))
+                .unwrap();
+            display_width(&row[..at])
+        })
+        .collect();
+    assert!(
+        state_offsets.windows(2).all(|pair| pair[0] == pair[1]),
+        "state columns are not aligned: {state_offsets:?}\n{rendered}"
+    );
+}
+
+#[test]
+fn the_single_agent_legend_clause_only_appears_with_agent_rows() {
+    const CLAUSE: &str = "indented rows = single agents";
+
+    let without_agents = sample_pane(vec![activity(
+        "web",
+        levels(&[1]),
+        AgentState::Working,
+        Some(1),
+        1,
+    )]);
+    assert!(!without_agents.contains(CLAUSE), "{without_agents}");
+
+    let with_agent = sample_pane(vec![with_agents(
+        activity("web", levels(&[1]), AgentState::Working, Some(1), 1),
+        vec![agent(
+            "pane-1",
+            Some("claude"),
+            levels(&[1]),
+            AgentState::Working,
+            1,
+            0,
+            60,
+        )],
+    )]);
+    assert!(with_agent.contains(CLAUSE), "{with_agent}");
+    assert!(
+        with_agent.contains("not there yet, not idle"),
+        "the legend does not protect the pre-appearance gap meaning:\n{with_agent}"
+    );
+}
+
+#[test]
+fn a_workspace_without_agent_rings_keeps_the_original_pane() {
+    let rendered = sample_pane(vec![activity(
+        "web",
+        levels(&[1]),
+        AgentState::Idle,
+        Some(5),
+        1,
+    )]);
+    let expected = "\
+pulse — 1 workspace — 03:06:40 UTC
+
+workspace  activity  session  state   blocked  for  seen  agents
+web        [▁]       ?        - idle  0s       5s   0s    1
+
+legend  ▁▂▃▄▅▆▇█ busier  |  · observed, nothing happened  |  ╌ not observed
+        for = how long the state had held when last seen  |  seen = how long ago that was
+        blocked = estimated from the samples that saw a blocked agent  |  measured over time actually watched, not the whole row
+        session = when the herdr session that recorded the row began  |  the session running now could not be established, so no row is marked live  |  ? = that session's start could not be established
+";
+
+    assert_eq!(rendered, expected);
 }
 
 #[test]
@@ -1668,6 +1909,45 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     );
     assert_eq!(document["week_bucket_seconds"], WEEK_BUCKET_SECONDS);
     assert_eq!(document["week_columns"], WEEK_COLUMNS);
+}
+
+#[test]
+fn json_carries_each_agent_series_without_flattening_its_gaps() {
+    let workspace = with_agents(
+        activity("w1", levels(&[8, 8, 8]), AgentState::Working, Some(30), 1),
+        vec![agent(
+            "pane-7",
+            Some("claude"),
+            vec![None, Some(Level::new(0)), Some(Level::new(8))],
+            AgentState::Working,
+            7,
+            7,
+            120,
+        )],
+    );
+
+    let document = json_document(
+        &Config::default(),
+        AS_OF,
+        3,
+        1,
+        &[workspace],
+        None,
+        running(),
+    );
+
+    assert_eq!(
+        document["workspaces"][0]["agents"],
+        serde_json::json!([{
+            "pane_id": "pane-7",
+            "program": "claude",
+            "state": "working",
+            "series": [null, 0, 8],
+            "last_seen": AS_OF - 7,
+            "blocked_seconds": 7,
+            "watched_seconds": 120,
+        }])
+    );
 }
 
 #[test]

@@ -304,6 +304,41 @@ pub struct WorkspaceActivity {
     /// looking at.
     pub week_blocked_seconds: u64,
     pub week_watched_seconds: u64,
+    /// One entry per agent the sampler is keeping a separate ring for, empty
+    /// unless `per_agent_series` is on. The workspace's own series stays whatever
+    /// it was: these are beside it, not instead of it.
+    pub agents: Vec<AgentActivity>,
+}
+
+/// One agent's own series inside a workspace, when the sampler is recording
+/// them.
+///
+/// The sidebar keeps a single aggregate line per workspace — there is room for
+/// one series in a sidebar cell and no more — and these are for the pane views,
+/// which have room to separate three agents that the aggregate flattens into
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActivity {
+    /// herdr's pane id, which is what identifies an agent within a session.
+    pub pane_id: String,
+    /// The program herdr reported, when it reported one.
+    pub program: Option<String>,
+    /// The agent's state at the last observation of it.
+    pub state: AgentState,
+    /// Same rules as [`WorkspaceActivity::series`]: `None` is a gap, `0` is
+    /// observed and quiet.
+    ///
+    /// An agent that appeared partway through the window has gaps before it
+    /// appeared, never zeros. Nobody was watching that agent then, because there
+    /// was no such agent to watch, and drawing a quiet bar there would claim it
+    /// was present and idle.
+    pub series: Vec<Option<Level>>,
+    /// Unix seconds this agent was last observed.
+    pub last_seen: u64,
+    /// Blocked and watched seconds for this agent alone, over the same window,
+    /// with the same rule: a gap is in neither total.
+    pub blocked_seconds: u64,
+    pub watched_seconds: u64,
 }
 
 impl WorkspaceActivity {

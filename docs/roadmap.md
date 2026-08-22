@@ -9,12 +9,6 @@ watching" render as "nothing happened" is wrong no matter what else it buys.
 
 ## More useful numbers
 
-### Per-agent series
-
-Three agents in one workspace currently aggregate into one line. That is right
-for the sidebar, where there is room for one series. It is not right for the
-`--watch` pane, which has room to separate them.
-
 ### Mark transitions
 
 A column that shows activity does not show that the agent went `blocked` halfway

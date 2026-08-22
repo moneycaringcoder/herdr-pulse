@@ -34,6 +34,7 @@ Other:
   --bucket-seconds <SECS>   Wall clock per history bucket (default: 60)
   --retention-buckets <N>   Buckets retained per workspace (default: 240)
   --columns <N>             Sparkline columns in the badge (default: 8)
+  --agents                  Record and show one series per agent (costs more disk)
   --version                 Print version and exit
   --help                    Show this help
 ";

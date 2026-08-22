@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
 use crate::model::{
-    AgentState, Level, Sample, SessionMark, WorkspaceActivity, WorkspaceObservation,
+    AgentActivity, AgentState, Level, Sample, SessionMark, WorkspaceActivity, WorkspaceObservation,
 };
 use crate::Result;
 
@@ -530,6 +530,39 @@ pub struct WorkspaceHistory {
     /// Highest `state_change_seq` seen per agent at the last observation, so the
     /// next sample can compute transitions. Keyed by pane id.
     pub agent_seqs: Vec<(String, u64)>,
+    /// One ring per agent, when the sampler is recording them.
+    ///
+    /// Empty unless `per_agent_series` is on, and that is the whole reason it is
+    /// a separate list rather than a field on [`Self::agent_seqs`]: these rings
+    /// are as long as the fine one and there can be four of them, so a workspace
+    /// that records them costs several times what one that does not costs, on
+    /// disk and in every cycle's rewrite. Nobody pays that for a sidebar badge
+    /// they never expand.
+    ///
+    /// Bounded like everything else here: at most
+    /// `config::MAX_AGENTS_PER_WORKSPACE`, least recently seen evicted first, and
+    /// counted into the ceiling `Config::clamp` enforces.
+    #[serde(default)]
+    pub agents: Vec<AgentHistory>,
+}
+
+/// Everything recorded for one agent inside one workspace.
+///
+/// Keyed by pane id, which is session-scoped — and so is the entry this lives
+/// in, so the key is only ever compared against others from the same session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentHistory {
+    pub pane_id: String,
+    /// The program herdr reported (`claude`, `opencode`), when it reported one.
+    pub program: Option<String>,
+    /// The agent's state at the last observation.
+    pub state: String,
+    /// Unix seconds of the last observation of *this agent*, for least recently
+    /// seen eviction and for saying how old its row is.
+    pub last_seen: u64,
+    /// The agent's own ring, at the fine ring's resolution and length.
+    pub buckets: Vec<Bucket>,
+    pub newest_bucket: u64,
 }
 
 impl WorkspaceHistory {
@@ -568,6 +601,9 @@ impl WorkspaceHistory {
             state_since: None,
             last_seen: taken_at,
             agent_seqs: Vec::new(),
+            // Filled by `observe` when the sampler is recording per-agent
+            // series, and left empty when it is not.
+            agents: Vec::new(),
         }
     }
 
@@ -820,6 +856,14 @@ impl WorkspaceHistory {
         // sampled stays one in the afternoon.
         self.week_mut()
             .absorb(week_bucket_number(taken_at), working, blocked, transitions);
+        if config.per_agent_series {
+            self.observe_agents(observation, number, taken_at, config);
+        } else if !self.agents.is_empty() {
+            // The setting was turned off. Keeping the rings would draw agent rows
+            // that stopped updating the moment the user stopped asking for them,
+            // ageing into a sparkline of gaps nobody can explain.
+            self.agents.clear();
+        }
 
         let state = observation.state();
         if self.state != state.as_str() {
@@ -846,6 +890,112 @@ impl WorkspaceHistory {
 
         self.last_seen = self.last_seen.max(taken_at);
         rewound
+    }
+
+    /// Folds this observation into one ring per agent, creating and evicting as
+    /// the workspace's agents come and go.
+    ///
+    /// An agent's ring starts empty at the moment it is first seen. Nothing is
+    /// back-filled from the workspace's aggregate, because the aggregate cannot
+    /// say which agent did what — so the minutes before an agent appeared read as
+    /// gaps, which is exactly what they are: nobody was watching *that agent*
+    /// then, because there was no such agent to watch.
+    ///
+    /// Bounded two ways. At most `MAX_AGENTS_PER_WORKSPACE` rings survive a
+    /// sample, least recently seen evicted first; and an agent that stops being
+    /// reported keeps its ring until it ages out that way, so a row does not
+    /// vanish the instant a pane closes and take its recorded history with it.
+    fn observe_agents(
+        &mut self,
+        observation: &WorkspaceObservation,
+        number: u64,
+        taken_at: u64,
+        config: &Config,
+    ) {
+        for agent in &observation.agents {
+            let transitions = self.agent_transition(agent);
+            let index = match self
+                .agents
+                .iter()
+                .position(|known| known.pane_id == agent.pane_id)
+            {
+                Some(index) => index,
+                None => {
+                    self.agents.push(AgentHistory {
+                        pane_id: agent.pane_id.clone(),
+                        program: agent.program.clone(),
+                        state: agent.state.as_str().to_string(),
+                        last_seen: taken_at,
+                        buckets: vec![Bucket::default(); config.retention_buckets],
+                        newest_bucket: number,
+                    });
+                    self.agents.len() - 1
+                }
+            };
+            let known = &mut self.agents[index];
+            known.program = agent.program.clone();
+            known.state = agent.state.as_str().to_string();
+            known.last_seen = known.last_seen.max(taken_at);
+            RingMut {
+                buckets: &mut known.buckets,
+                newest: &mut known.newest_bucket,
+            }
+            .reshape(config.retention_buckets);
+            RingMut {
+                buckets: &mut known.buckets,
+                newest: &mut known.newest_bucket,
+            }
+            .absorb(
+                number,
+                agent.state == AgentState::Working,
+                agent.state == AgentState::Blocked,
+                transitions,
+            );
+        }
+        self.evict_agents();
+    }
+
+    /// Whether this agent's `state_change_seq` moved since the last observation.
+    ///
+    /// One agent's own movement, unlike [`Self::count_transitions`], which sums
+    /// across the workspace. Same rule: `!=` rather than `>`, because a herdr
+    /// restart begins a fresh sequence, and a first sighting counts nothing.
+    fn agent_transition(&self, agent: &crate::model::AgentObservation) -> u16 {
+        match self
+            .agent_seqs
+            .binary_search_by(|(pane, _)| pane.as_str().cmp(agent.pane_id.as_str()))
+        {
+            Ok(index) if self.agent_seqs[index].1 != agent.state_change_seq => 1,
+            _ => 0,
+        }
+    }
+
+    /// Enforces the per-workspace agent cap, dropping the least recently seen.
+    ///
+    /// The other half of the size bound for per-agent series: the ring bounds one
+    /// agent, this bounds how many rings a workspace holds, and `Config::clamp`
+    /// multiplies the two into the file's ceiling.
+    fn evict_agents(&mut self) {
+        while self.agents.len() > crate::config::MAX_AGENTS_PER_WORKSPACE {
+            let victim = self
+                .agents
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.last_seen
+                        .cmp(&b.last_seen)
+                        // Ties broken by pane id so the same input always evicts
+                        // the same agent.
+                        .then_with(|| a.pane_id.cmp(&b.pane_id))
+                })
+                .map(|(index, _)| index);
+            match victim {
+                Some(index) => {
+                    self.agents.remove(index);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -1250,6 +1400,37 @@ impl History {
                         week_newest,
                         crate::config::WEEK_BUCKET_SECONDS,
                     );
+                // One projection per agent, at the same geometry as the
+                // workspace's own series so the rows under a workspace describe
+                // the same minutes as the row above them.
+                let agents = workspace
+                    .agents
+                    .iter()
+                    .map(|agent| {
+                        let ring = RingRef {
+                            buckets: &agent.buckets,
+                            newest: agent.newest_bucket,
+                        };
+                        let (blocked_seconds, watched_seconds) = if window == 0 {
+                            (0, 0)
+                        } else {
+                            ring.blocked_and_watched(
+                                newest.saturating_sub(window - 1),
+                                newest,
+                                config.bucket_seconds.max(1),
+                            )
+                        };
+                        AgentActivity {
+                            pane_id: agent.pane_id.clone(),
+                            program: agent.program.clone(),
+                            state: AgentState::parse(&agent.state),
+                            series: ring.series(newest, columns, per_column),
+                            last_seen: agent.last_seen,
+                            blocked_seconds,
+                            watched_seconds,
+                        }
+                    })
+                    .collect();
                 WorkspaceActivity {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
@@ -1286,6 +1467,7 @@ impl History {
                     watched_seconds,
                     week_blocked_seconds,
                     week_watched_seconds,
+                    agents,
                 }
             })
             .collect()

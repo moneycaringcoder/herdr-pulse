@@ -25,7 +25,7 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use crate::config::{Config, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
-use crate::model::{AgentState, Level, SessionMark, WorkspaceActivity};
+use crate::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActivity};
 use crate::Result;
 use crate::{daemon, herdr, history};
 
@@ -340,6 +340,9 @@ fn render_pane(
     let explain_sessions = activity
         .iter()
         .any(|workspace| workspace.session.is_none() || !workspace.is_session(session));
+    let explain_agents = activity
+        .iter()
+        .any(|workspace| !workspace.agents.is_empty());
 
     let mut rows = vec![vec![
         "workspace".to_string(),
@@ -378,6 +381,34 @@ fn render_pane(
             duration(workspace.observed_ago(as_of)),
             workspace.agent_count.to_string(),
         ]);
+        // Agent rows share the workspace table rather than building a second,
+        // hand-padded layout. Session provenance belongs to the aggregate, the
+        // per-agent ring has no `for`, and the ragged row omits its agent count.
+        let mut agents: Vec<&AgentActivity> = workspace.agents.iter().collect();
+        agents.sort_by(|left, right| {
+            right
+                .last_seen
+                .cmp(&left.last_seen)
+                .then_with(|| left.pane_id.cmp(&right.pane_id))
+        });
+        for agent in agents {
+            let current = as_of.saturating_sub(agent.last_seen) <= tolerance;
+            any_stale |= !current;
+            let label = agent.program.as_deref().unwrap_or(&agent.pane_id);
+            rows.push(vec![
+                format!("  {}", clean_label(label)),
+                format!("[{}]", sparkline(&agent.series)),
+                String::new(),
+                if current {
+                    format!("{} {}", state_glyph(agent.state), agent.state)
+                } else {
+                    format!("{} was {}", state_glyph(agent.state), agent.state)
+                },
+                duration((agent.watched_seconds > 0).then_some(agent.blocked_seconds)),
+                String::new(),
+                duration(Some(as_of.saturating_sub(agent.last_seen))),
+            ]);
+        }
     }
 
     let mut out = match view.name {
@@ -400,6 +431,7 @@ fn render_pane(
         activity,
         any_stale,
         explain_sessions,
+        explain_agents,
         session,
         view,
     ));
@@ -429,6 +461,10 @@ pub fn week_pane(
             &mut workspace.watched_seconds,
             &mut workspace.week_watched_seconds,
         );
+        // There is no coarse per-agent ring. Drawing the fine ring under a week
+        // row would put an afternoon beside an axis labelled as seven days, so
+        // the week view remains aggregate-only.
+        workspace.agents.clear();
     }
     render_pane(&activity, config, as_of, session, PaneView::week())
 }
@@ -495,6 +531,11 @@ pub fn run_week(config: &Config) -> Result<()> {
 /// reading `"state":"working"` has no way to discover that nobody has looked in
 /// five hours, and would be right to treat it as current.
 ///
+/// Per-agent series cannot be recovered by splitting the workspace series:
+/// the aggregate has already combined simultaneous agents into one level and
+/// discarded which pane contributed each observation. The nested `agents`
+/// arrays preserve both that identity and the gaps before an agent appeared.
+///
 /// A series of `null` buckets only says nobody was watching. The top-level
 /// `sampler` field is the only field that says whether that was on purpose or
 /// because the last run ended.
@@ -518,6 +559,16 @@ pub fn run_json(config: &Config) -> Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&document)?);
     Ok(())
+}
+
+fn json_series(series: &[Option<Level>]) -> Vec<Value> {
+    series
+        .iter()
+        .map(|slot| match slot {
+            Some(level) => json!(level.0.min(Level::MAX)),
+            None => Value::Null,
+        })
+        .collect()
 }
 
 /// Builds the `--json` document from already-loaded activity.
@@ -581,6 +632,22 @@ pub fn json_document(
                 "observed_ago_seconds": workspace.observed_ago(as_of),
                 "state_is_current": workspace.is_current(as_of, tolerance),
                 "agent_count": workspace.agent_count,
+                // These cannot be derived from the aggregate series: once
+                // several panes have contributed to one level, their identities
+                // and their individual absence-before-appearance gaps are gone.
+                "agents": workspace
+                    .agents
+                    .iter()
+                    .map(|agent| json!({
+                        "pane_id": agent.pane_id,
+                        "program": agent.program,
+                        "state": agent.state.as_str(),
+                        "series": json_series(&agent.series),
+                        "last_seen": agent.last_seen,
+                        "blocked_seconds": agent.blocked_seconds,
+                        "watched_seconds": agent.watched_seconds,
+                    }))
+                    .collect::<Vec<Value>>(),
                 // Both describe the fine-series window. `watched_seconds` is
                 // the denominator that keeps gaps out of the blocked estimate;
                 // the row's wall-clock width includes gaps and is not evidence.
@@ -595,22 +662,8 @@ pub fn json_document(
                 // consumer that flattens the two gets the same wrong answer the
                 // glyphs exist to prevent, so the distinction is carried in the
                 // JSON type rather than in a sentinel number.
-                "series": workspace
-                    .series
-                    .iter()
-                    .map(|slot| match slot {
-                        Some(level) => json!(level.0.min(Level::MAX)),
-                        None => Value::Null,
-                    })
-                    .collect::<Vec<Value>>(),
-                "week": workspace
-                    .week
-                    .iter()
-                    .map(|slot| match slot {
-                        Some(level) => json!(level.0.min(Level::MAX)),
-                        None => Value::Null,
-                    })
-                    .collect::<Vec<Value>>(),
+                "series": json_series(&workspace.series),
+                "week": json_series(&workspace.week),
                 // The rendered form too, so a bug report can show what the user
                 // saw without asking them to screenshot a sidebar.
                 "sparkline": sparkline(&workspace.series),
@@ -804,6 +857,7 @@ fn legend(
     activity: &[WorkspaceActivity],
     any_stale: bool,
     explain_sessions: bool,
+    explain_agents: bool,
     session: Option<&SessionMark>,
     view: PaneView,
 ) -> String {
@@ -816,13 +870,22 @@ fn legend(
         "        for = how long the state had held when last seen  |  \
          seen = how long ago that was\n",
     );
-    if activity
-        .iter()
-        .any(|workspace| workspace.watched_seconds > 0)
-    {
+    if activity.iter().any(|workspace| {
+        workspace.watched_seconds > 0
+            || workspace
+                .agents
+                .iter()
+                .any(|agent| agent.watched_seconds > 0)
+    }) {
         out.push_str(
             "        blocked = estimated from the samples that saw a blocked agent  |  \
              measured over time actually watched, not the whole row\n",
+        );
+    }
+    if explain_agents {
+        out.push_str(
+            "        indented rows = single agents  |  \
+             gaps before an agent appeared = not there yet, not idle\n",
         );
     }
     // Only when it applies. A reader whose rows are all fresh does not need to
