@@ -303,12 +303,36 @@ pub fn disable() -> Result<()> {
 
     // Before the stop request, or the supervisor restarts what we are about to
     // stop. "Disabled" has to mean disabled: a sampler that comes back in five
-    // seconds, and again at every boot, is not what the user asked for. The unit
-    // file stays on disk, so `--enable` can start it again without a reinstall.
+    // seconds, and again at every login, is not what the user asked for. The
+    // unit file stays on disk, so `--enable` can start it again without a
+    // reinstall.
+    //
+    // Reported rather than propagated. A supervisor that cannot be reached is a
+    // reason to say so, not a reason to skip the rest: aborting here would leave
+    // the sampler running and the badges lit while the marker says disabled,
+    // which is the one state nothing downstream can make sense of.
     if supervise::is_installed() {
-        supervise::stop()?;
+        if let Err(err) = supervise::stop() {
+            eprintln!("pulse: {err}");
+        }
     }
 
+    stop_sampler()?;
+
+    // Fresh connection, and every current workspace: the daemon may have died
+    // without clearing, and it only ever tracked the workspaces it had seen.
+    let mut client = Herdr::connect()?;
+    sweep(&mut client)
+}
+
+/// Stops a live sampler and clears its pid marker, leaving badges alone.
+///
+/// The half of `--disable` that does not need herdr. Supervision uses it to take
+/// over from an unsupervised sampler: the unit's own sampler relights every
+/// badge within an interval, and refusing to install a unit because herdr is
+/// unreachable right now would be refusing to arrange something for later on the
+/// strength of a fact about now.
+pub fn stop_sampler() -> Result<()> {
     if let Some(pid) = live_pid() {
         request_stop(pid);
         // Load-bearing: the stop request only posts, and the pid file lives
@@ -320,11 +344,7 @@ pub fn disable() -> Result<()> {
         }
     }
     clear_pid_file();
-
-    // Fresh connection, and every current workspace: the daemon may have died
-    // without clearing, and it only ever tracked the workspaces it had seen.
-    let mut client = Herdr::connect()?;
-    sweep(&mut client)
+    Ok(())
 }
 
 pub fn toggle(args: &[String]) -> Result<()> {

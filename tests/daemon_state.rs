@@ -673,28 +673,41 @@ fn restore_spawns_a_detached_daemon_when_it_was_enabled_and_nothing_is_live() {
 /// Points the platform's unit directory into a temp tree and writes a unit
 /// there, so `supervise::is_installed()` is true without touching a real home.
 ///
-/// Both variables, because the directory is `$XDG_CONFIG_HOME/systemd/user` on
-/// Linux and `$HOME/Library/LaunchAgents` on macOS.
+/// `HOME` alone: the Linux path asks the running user manager where it looks and
+/// falls back to `$HOME/.config/systemd/user`, and the macOS path is
+/// `$HOME/Library/LaunchAgents`. Under a temp `HOME` there is no manager to
+/// answer, so the fallback is what both platforms use here.
+///
+/// The previous value is put back on drop rather than removed. `HOME` is not
+/// this guard's to delete: every later test in the binary would inherit a
+/// process with no home, and the first one to rely on a fallback would resolve
+/// somewhere shared across runs.
 struct InstalledUnit {
     path: PathBuf,
+    previous_home: Option<String>,
 }
 
 impl InstalledUnit {
     fn new(root: &Path) -> Self {
-        std::env::set_var("XDG_CONFIG_HOME", root.join("xdg"));
+        let previous_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", root.join("home"));
-        let path = supervise::unit_path().expect("a supervised platform");
+        let path = supervise::unit_path().expect("a supervised platform with a home");
         std::fs::create_dir_all(path.parent().expect("unit dir")).expect("unit dir");
         std::fs::write(&path, "written by a test, never loaded").expect("unit");
-        Self { path }
+        Self {
+            path,
+            previous_home,
+        }
     }
 }
 
 impl Drop for InstalledUnit {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var("HOME");
+        match &self.previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
 

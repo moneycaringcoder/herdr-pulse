@@ -9,11 +9,10 @@
 //!
 //! Nothing about what is recorded, and nothing about how a gap is judged. The
 //! supervised process is the same `pulse --daemon` with the same config, writing
-//! the same buckets to the same file. In particular a restarted unit leaves a
-//! gap for the time it was not running, exactly as a hand-started sampler does:
-//! **continuity of the unit is not continuity of observation**, and a supervisor
-//! that quietly papered over its own downtime would be drawing zeros for minutes
-//! nobody watched.
+//! the same buckets to the same file. In particular every bucket a restarted
+//! sampler did not observe stays a gap: **continuity of the unit is not
+//! continuity of observation**, and a supervisor that quietly papered over its
+//! own downtime would be drawing zeros for minutes nobody watched.
 //!
 //! # Why the environment is baked into the unit
 //!
@@ -23,6 +22,13 @@
 //! the supervised sampler re-derive them would work until the day a variable
 //! changes underneath it, and then it would record history into a directory the
 //! panes never read — a plugin that looks like it is working and is not.
+//!
+//! # Two shapes of command
+//!
+//! Every step says whether a failure is fatal. Removing supervision has to work
+//! when the unit was already stopped by hand, and bootstrapping a launchd agent
+//! has to work when a stale copy is still loaded — so those steps tolerate a
+//! non-zero exit, while the steps that actually install and start do not.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +47,7 @@ pub const LABEL: &str = "dev.herdr.pulse.sampler";
 /// visible hole in the row.
 pub const RESTART_SECONDS: u64 = 5;
 
-/// Which supervisor this build targets.
+/// Which supervisor a plan targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Supervisor {
     Systemd,
@@ -65,10 +71,35 @@ impl Supervisor {
         }
     }
 
-    fn unit_name(self) -> String {
+    pub fn unit_name(self) -> String {
         match self {
             Self::Systemd => format!("{LABEL}.service"),
             Self::Launchd => format!("{LABEL}.plist"),
+        }
+    }
+}
+
+/// One command, and whether its failure stops everything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub argv: Vec<String>,
+    /// A step that may fail without the whole operation having failed: clearing
+    /// a stale registration, or stopping something already stopped.
+    pub tolerated: bool,
+}
+
+impl Step {
+    fn required(parts: &[&str]) -> Self {
+        Self {
+            argv: parts.iter().map(|part| (*part).to_string()).collect(),
+            tolerated: false,
+        }
+    }
+
+    fn tolerated(parts: &[&str]) -> Self {
+        Self {
+            tolerated: true,
+            ..Self::required(parts)
         }
     }
 }
@@ -84,11 +115,11 @@ pub struct Plan {
     pub path: PathBuf,
     /// What the unit file says.
     pub contents: String,
-    /// Commands that install and start it, in order.
-    pub activate: Vec<Vec<String>>,
-    /// Commands that stop it and take it out of the boot sequence, in order.
-    /// The file itself is removed separately, so a stop can be undone.
-    pub deactivate: Vec<Vec<String>>,
+    /// Steps that install and start it, in order.
+    pub activate: Vec<Step>,
+    /// Steps that stop it and take it out of the boot sequence, in order. The
+    /// file itself is removed separately, so a stop can be undone.
+    pub deactivate: Vec<Step>,
 }
 
 /// What the supervised sampler needs handed to it, resolved on this machine.
@@ -115,7 +146,7 @@ impl Environment {
             state_dir: crate::config::state_dir(),
             socket_path: crate::herdr::socket_path().ok(),
             args,
-            unit_dir: unit_dir(supervisor),
+            unit_dir: unit_dir(supervisor)?,
             uid: uid(),
         })
     }
@@ -124,6 +155,12 @@ impl Environment {
 const UNSUPPORTED: &str =
     "supervision is available on Linux (systemd) and macOS (launchd) only; on \
      other systems `pulse --enable` still runs the sampler until the machine stops";
+
+const NO_HOME: &str = "cannot place a supervision unit: HOME is unset or not absolute. \
+                       Writing one relative to the working directory would put it in \
+                       whatever repository you happen to be standing in, and would make \
+                       `--enable` and `--restore` answer differently depending on where \
+                       they were run";
 
 /// Where a unit file lives, per platform convention.
 ///
@@ -134,87 +171,106 @@ const UNSUPPORTED: &str =
 /// writes the unit somewhere the manager never reads, and `enable` fails with
 /// "unit does not exist" while a perfectly good file sits on disk. Observed on
 /// the machine this was written on.
-fn unit_dir(supervisor: Supervisor) -> PathBuf {
+fn unit_dir(supervisor: Supervisor) -> Result<PathBuf> {
     match supervisor {
         Supervisor::Systemd => systemd_unit_dir(),
-        Supervisor::Launchd => home().join("Library").join("LaunchAgents"),
+        Supervisor::Launchd => Ok(home()?.join("Library").join("LaunchAgents")),
     }
 }
 
 /// The manager's own per-user unit directory, from `systemctl --user show`.
 ///
-/// `UnitPath` lists every directory the manager searches, most specific first.
-/// The one wanted is the writable per-user config directory — `user.control` and
-/// the generator directories are systemd's own scratch space and a hand-written
-/// unit does not belong in them. Falls back to the documented default when there
-/// is no manager to ask, which is also the case where enabling would fail
-/// anyway, and where the error is worth more than a guess.
-fn systemd_unit_dir() -> PathBuf {
-    let default = home().join(".config").join("systemd").join("user");
-    let Ok(shown) = capture(&argv(&[
+/// `UnitPath` lists every directory the manager searches. The one wanted is the
+/// writable per-user config directory — `user.control` and the generator
+/// directories are systemd's own scratch space and a hand-written unit does not
+/// belong in them. Falls back to the documented default when there is no manager
+/// to ask, which is also the case where enabling would fail anyway, and where
+/// the error is worth more than a guess.
+fn systemd_unit_dir() -> Result<PathBuf> {
+    let home = home()?;
+    let default = home.join(".config").join("systemd").join("user");
+    let Ok(shown) = capture(&Step::required(&[
         "systemctl",
         "--user",
         "show",
         "--property=UnitPath",
     ])) else {
-        return default;
+        return Ok(default);
     };
-    let home = home();
-    shown
+    Ok(unit_path_entries(&shown)
+        .into_iter()
+        .find(|path| path.starts_with(&home) && path.ends_with("systemd/user"))
+        .unwrap_or(default))
+}
+
+/// The directories in a `UnitPath=` line.
+///
+/// systemd quotes any entry containing a space, so splitting on whitespace
+/// shreds a home directory with a space in it and silently falls back to the
+/// default — which is the one case this function exists to get right.
+fn unit_path_entries(shown: &str) -> Vec<PathBuf> {
+    let list = shown
         .trim()
         .strip_prefix("UnitPath=")
         .unwrap_or_default()
-        .split_whitespace()
-        .map(PathBuf::from)
-        .find(|path| path.starts_with(&home) && path.ends_with("systemd/user"))
-        .unwrap_or(default)
+        .trim();
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in list.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ' ' if !quoted => {
+                if !current.is_empty() {
+                    entries.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        entries.push(PathBuf::from(current));
+    }
+    entries
 }
 
-fn home() -> PathBuf {
-    non_empty_env("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+/// The user's home, refused unless it is absolute.
+///
+/// `config::state_dir` can fall back to a temp directory when there is no home,
+/// because a history file somewhere odd is still a history file. A unit file has
+/// no such fallback: a supervisor reads one fixed set of directories, and a copy
+/// anywhere else is litter that also makes [`is_installed`] answer differently
+/// from different working directories.
+fn home() -> Result<PathBuf> {
+    non_empty_env("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| NO_HOME.into())
 }
 
 fn uid() -> u32 {
     // SAFETY: `getuid` takes no arguments, touches no memory, and cannot fail.
-    unsafe { libc_getuid() }
+    unsafe { libc::getuid() }
 }
 
-unsafe extern "C" {
-    #[link_name = "getuid"]
-    fn libc_getuid() -> u32;
-}
-
-/// The plan for an environment. Pure: it writes nothing and runs nothing.
+/// The plan for an environment, for the supervisor this build targets.
 pub fn plan(env: &Environment) -> Result<Plan> {
-    let supervisor = Supervisor::current().ok_or(UNSUPPORTED)?;
+    plan_for(Supervisor::current().ok_or(UNSUPPORTED)?, env)
+}
+
+/// [`plan`] for a named supervisor. Pure: it writes nothing and runs nothing.
+///
+/// Explicit rather than implied by the target, so the platform this build is not
+/// running on is still exercised by tests. The launchd plist was previously
+/// unreachable on Linux, which is how a `bootout` that does not survive a reboot
+/// got as far as review.
+pub fn plan_for(supervisor: Supervisor, env: &Environment) -> Result<Plan> {
     let path = env.unit_dir.join(supervisor.unit_name());
     let contents = match supervisor {
         Supervisor::Systemd => systemd_unit(env)?,
         Supervisor::Launchd => launchd_plist(env)?,
     };
-    let unit = supervisor.unit_name();
-    let (activate, deactivate) = match supervisor {
-        Supervisor::Systemd => (
-            vec![
-                argv(&["systemctl", "--user", "daemon-reload"]),
-                argv(&["systemctl", "--user", "enable", "--now", &unit]),
-            ],
-            vec![argv(&["systemctl", "--user", "disable", "--now", &unit])],
-        ),
-        Supervisor::Launchd => {
-            let domain = format!("gui/{}", env.uid);
-            let target = format!("{domain}/{LABEL}");
-            (
-                vec![argv(&[
-                    "launchctl",
-                    "bootstrap",
-                    &domain,
-                    &path.to_string_lossy(),
-                ])],
-                vec![argv(&["launchctl", "bootout", &target])],
-            )
-        }
-    };
+    let (activate, deactivate) = steps(supervisor, env.uid, &path);
     Ok(Plan {
         supervisor,
         path,
@@ -224,8 +280,59 @@ pub fn plan(env: &Environment) -> Result<Plan> {
     })
 }
 
-fn argv(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|part| (*part).to_string()).collect()
+/// The commands that start and stop an installed unit.
+///
+/// Deliberately independent of the unit's text: `--disable` and `--unsupervise`
+/// must work on a unit this binary did not write, and on a machine where the
+/// binary has since moved. Rendering the file to find out how to stop it would
+/// make an unrelated failure — a path that acquired a `%`, an executable that
+/// was renamed — into "pulse can no longer turn this off".
+fn steps(supervisor: Supervisor, uid: u32, path: &Path) -> (Vec<Step>, Vec<Step>) {
+    let unit = supervisor.unit_name();
+    match supervisor {
+        Supervisor::Systemd => (
+            vec![
+                Step::required(&["systemctl", "--user", "daemon-reload"]),
+                Step::required(&["systemctl", "--user", "enable", "--now", &unit]),
+            ],
+            vec![Step::required(&[
+                "systemctl",
+                "--user",
+                "disable",
+                "--now",
+                &unit,
+            ])],
+        ),
+        Supervisor::Launchd => {
+            let domain = format!("gui/{uid}");
+            let target = format!("{domain}/{LABEL}");
+            let plist = path.to_string_lossy().to_string();
+            (
+                vec![
+                    // `disable` writes to a database that outlives a reboot, so a
+                    // label disabled by an earlier `--disable` would refuse to
+                    // bootstrap however many times it is asked.
+                    Step::required(&["launchctl", "enable", &target]),
+                    // A stale copy loaded from an earlier install makes
+                    // `bootstrap` fail with "Bootstrap failed: 5". Clearing it
+                    // first is what makes `--supervise` twice mean the same as
+                    // once.
+                    Step::tolerated(&["launchctl", "bootout", &target]),
+                    Step::required(&["launchctl", "bootstrap", &domain, &plist]),
+                ],
+                vec![
+                    // Tolerated: stopping something already stopped is a
+                    // success as far as the user's intent goes.
+                    Step::tolerated(&["launchctl", "bootout", &target]),
+                    // The durable half. `bootout` unloads for this session only,
+                    // and the plist stays in `~/Library/LaunchAgents`, so
+                    // without this the agent is back at the next login and
+                    // `--disable` would have been a lie by morning.
+                    Step::required(&["launchctl", "disable", &target]),
+                ],
+            )
+        }
+    }
 }
 
 /// A systemd user unit.
@@ -284,8 +391,15 @@ fn systemd_value(path: &Path) -> Result<String> {
     systemd_text(&path.to_string_lossy())
 }
 
+/// Refuses anything systemd would read as something other than itself.
+///
+/// `%` starts a specifier and `$` a variable reference; both expand into a path
+/// that is not the one on disk. A backslash continues a line, a newline ends the
+/// directive, and a double quote ends the value. Refused rather than escaped:
+/// the failure lands here, in front of the person who typed the command, instead
+/// of at the next boot.
 fn systemd_text(text: &str) -> Result<String> {
-    if text.contains(['"', '\\', '\n', '%', '$']) {
+    if text.contains(['"', '\\', '\n', '\r', '%', '$', ';']) {
         return Err(format!(
             "cannot write a unit for `{text}`: it contains a character systemd \
              would reinterpret, and a unit that is subtly wrong fails at boot \
@@ -360,42 +474,56 @@ fn xml(text: &str) -> String {
 }
 
 /// Where the unit file would be, whether or not it exists.
-pub fn unit_path() -> Option<PathBuf> {
-    let supervisor = Supervisor::current()?;
-    Some(unit_dir(supervisor).join(supervisor.unit_name()))
+pub fn unit_path() -> Result<PathBuf> {
+    let supervisor = Supervisor::current().ok_or(UNSUPPORTED)?;
+    Ok(unit_dir(supervisor)?.join(supervisor.unit_name()))
 }
 
 /// Whether a unit file this plugin wrote is on disk.
+///
+/// False when there is nowhere a unit could legitimately live — an unsupported
+/// platform, or no absolute `HOME`. Both mean "no supervisor owns the sampler",
+/// which is the answer the lifecycle verbs need.
 pub fn is_installed() -> bool {
-    unit_path().is_some_and(|path| path.exists())
+    unit_path().is_ok_and(|path| path.exists())
 }
 
 /// `pulse --supervise`: write the unit and start it.
 ///
-/// The sampler the user may already have running is stopped first. Two samplers
+/// Any sampler the user already has running is stopped first: two samplers
 /// writing one history file would each rewrite what the other just wrote, and
 /// the supervisor's copy is the one that survives a reboot.
+///
+/// Failure leaves the machine as it was found, as far as it can. The unit file
+/// is removed if activation fails, and the enabled marker goes back to whatever
+/// it said before — an install that half-succeeded and left the marker saying
+/// "the user never wanted a sampler" would stop `--restore` from ever bringing
+/// one back, and nothing would say why.
 pub fn install(args: &[String]) -> Result<()> {
     let forwarded = crate::daemon::forwarded_args(args)?;
     crate::config::load_with_args(args)?;
     let env = Environment::current(forwarded)?;
     let plan = plan(&env)?;
+    let was_enabled = crate::daemon::is_enabled();
 
-    if crate::daemon::live_pid().is_some() {
-        crate::daemon::disable()?;
+    // Not fatal, and badges are not swept: the supervised sampler relights them
+    // within an interval, and a herdr that is unreachable right now is no reason
+    // to refuse to install a unit that will run long after this shell is gone.
+    if let Err(err) = crate::daemon::stop_sampler() {
+        eprintln!("pulse: could not stop the running sampler ({err}); installing anyway");
     }
 
     if let Some(parent) = plan.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&plan.path, &plan.contents)?;
-    for command in &plan.activate {
-        if let Err(err) = run(command) {
+    for step in &plan.activate {
+        if let Err(err) = run(step) {
             // A file on disk that no supervisor loaded is worse than no file at
             // all: `is_installed` would be true, `--enable` would route to a unit
-            // nothing runs, and the sampler would never start again. Undo the
-            // write and hand back the supervisor's own words.
+            // nothing runs, and the sampler would never start again.
             let _ = std::fs::remove_file(&plan.path);
+            crate::daemon::mark_enabled(was_enabled);
             return Err(err);
         }
     }
@@ -404,8 +532,7 @@ pub fn install(args: &[String]) -> Result<()> {
     println!("pulse: supervision installed at {}", plan.path.display());
     println!(
         "pulse: the sampler now starts at login and restarts within {RESTART_SECONDS}s if it \
-         stops. A restart leaves a gap for the time it was not running, which is what a gap \
-         is for."
+         stops. Every bucket it was not running for stays a gap, which is what a gap is for."
     );
     println!("pulse: remove it with `pulse --unsupervise`.");
     Ok(())
@@ -416,19 +543,19 @@ pub fn install(args: &[String]) -> Result<()> {
 /// The sampler stops with it. Anything already recorded stays recorded: this
 /// removes a supervisor, not a history.
 pub fn remove() -> Result<()> {
-    let Some(path) = unit_path() else {
-        return Err(UNSUPPORTED.into());
-    };
+    let path = unit_path()?;
     if !path.exists() {
         println!("pulse: no supervision installed; nothing to remove.");
         return Ok(());
     }
-    let env = Environment::current(Vec::new())?;
-    for command in &plan(&env)?.deactivate {
-        // Best effort: a unit that was already stopped, or a supervisor that has
-        // forgotten it, must not stop the file from being removed. Leaving the
-        // file behind would leave `--enable` routing to a unit nothing runs.
-        let _ = run(command);
+    for step in &deactivation()? {
+        // Best effort even for the required steps: a supervisor that has
+        // forgotten this unit, or a manager that is not running, must not stop
+        // the file from being removed. Leaving it behind would leave `--enable`
+        // routing to a unit nothing runs.
+        if let Err(err) = run(step) {
+            eprintln!("pulse: {err}");
+        }
     }
     std::fs::remove_file(&path)?;
     crate::daemon::mark_enabled(false);
@@ -442,9 +569,9 @@ pub fn remove() -> Result<()> {
 /// Starts the installed unit. Used by `--enable` when supervision is installed,
 /// so one verb means one thing whether or not a supervisor owns the sampler.
 pub fn start() -> Result<()> {
-    let env = Environment::current(Vec::new())?;
-    for command in &plan(&env)?.activate {
-        run(command)?;
+    let (activate, _) = lifecycle_steps()?;
+    for step in &activate {
+        run(step)?;
     }
     Ok(())
 }
@@ -453,17 +580,37 @@ pub fn start() -> Result<()> {
 /// file in place.
 ///
 /// `--disable` has to reach this, or it would be a lie: the supervisor would
-/// restart the sampler seconds later, and on the next boot regardless.
+/// restart the sampler seconds later, and at the next login regardless.
 pub fn stop() -> Result<()> {
-    let env = Environment::current(Vec::new())?;
-    for command in &plan(&env)?.deactivate {
-        run(command)?;
+    for step in &deactivation()? {
+        run(step)?;
     }
     Ok(())
 }
 
-fn run(command: &[String]) -> Result<()> {
-    capture(command).map(|_| ())
+fn deactivation() -> Result<Vec<Step>> {
+    Ok(lifecycle_steps()?.1)
+}
+
+/// The start and stop commands for whatever is installed, without rendering a
+/// unit. See [`steps`] for why those are separate.
+fn lifecycle_steps() -> Result<(Vec<Step>, Vec<Step>)> {
+    let supervisor = Supervisor::current().ok_or(UNSUPPORTED)?;
+    Ok(steps(supervisor, uid(), &unit_path()?))
+}
+
+fn run(step: &Step) -> Result<()> {
+    match capture(step) {
+        Ok(_) => Ok(()),
+        Err(err) if step.tolerated => {
+            // Reported, never fatal. "Already stopped" is the state the caller
+            // wanted, and silence here would hide a supervisor that is missing
+            // entirely.
+            eprintln!("pulse: {err}");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Runs one supervisor command and returns its stdout.
@@ -472,8 +619,9 @@ fn run(command: &[String]) -> Result<()> {
 /// source-level audit in `tests/read_only.rs` has exactly one site to sanction.
 /// A non-zero exit is an error carrying the supervisor's own stderr: "unit does
 /// not exist" from systemd says more than anything this module could invent.
-fn capture(command: &[String]) -> Result<String> {
-    let (program, args) = command
+fn capture(step: &Step) -> Result<String> {
+    let (program, args) = step
+        .argv
         .split_first()
         .ok_or("empty supervision command, which is a bug in pulse")?;
     let mut spawn = Command::new(program);
@@ -481,12 +629,12 @@ fn capture(command: &[String]) -> Result<String> {
     let output = spawn.output().map_err(|err| {
         format!(
             "`{}` could not be run: {err}. Supervision needs it on PATH.",
-            command.join(" ")
+            step.argv.join(" ")
         )
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("`{}` failed: {}", command.join(" "), stderr.trim()).into());
+        return Err(format!("`{}` failed: {}", step.argv.join(" "), stderr.trim()).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

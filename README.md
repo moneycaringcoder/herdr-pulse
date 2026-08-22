@@ -303,10 +303,15 @@ time, and `is_current` per workspace, plus the live session at the top level.
 ### Supervision
 
 Supervision is opt-in: pulse writes nothing until you run `pulse --supervise`.
-On Linux it writes the systemd user unit
-`$XDG_CONFIG_HOME/systemd/user/dev.herdr.pulse.sampler.service`, using
-`~/.config/systemd/user/dev.herdr.pulse.sampler.service` when
-`XDG_CONFIG_HOME` is unset, then activates it with:
+
+On Linux it writes a systemd user unit named `dev.herdr.pulse.sampler.service`,
+into whichever per-user directory the running user manager reports in
+`systemctl --user show --property=UnitPath`, falling back to
+`~/.config/systemd/user` when there is no manager to ask. It asks rather than
+deriving the path because a user manager is started by logind before any shell
+exists and never sees an `XDG_CONFIG_HOME` set in a shell rc — a unit written
+where that variable points would sit on disk in a directory systemd does not
+read. It then activates the unit with:
 
 ```sh
 systemctl --user daemon-reload
@@ -317,6 +322,8 @@ On macOS it writes
 `~/Library/LaunchAgents/dev.herdr.pulse.sampler.plist`, then activates it with:
 
 ```sh
+launchctl enable "gui/$(id -u)/dev.herdr.pulse.sampler"
+launchctl bootout "gui/$(id -u)/dev.herdr.pulse.sampler"   # clears a stale copy
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.herdr.pulse.sampler.plist"
 ```
 
@@ -335,12 +342,14 @@ any unsupervised sampler already running so that two processes cannot overwrite
 the same history file.
 
 Once supervision is installed, `--enable` starts the unit. `--disable` first
-runs `systemctl --user disable --now` or `launchctl bootout`, then stops the
-sampler and clears its badges; otherwise the supervisor would restart what was
-just stopped. The definition stays on disk, so a later `--enable` starts it
-again without a reinstall. `--restore` becomes a no-op because the supervisor
-owns the process. Run `pulse --unsupervise` to stop the unit and delete its
-definition; recorded history is left untouched.
+runs `systemctl --user disable --now`, or `launchctl bootout` followed by
+`launchctl disable`, and then stops the sampler and clears its badges. Both
+halves matter on macOS: `bootout` unloads the agent for this session, and only
+`disable` keeps launchd from loading the plist again at the next login. The
+definition stays on disk either way, so a later `--enable` starts it again
+without a reinstall. `--restore` becomes a no-op because the supervisor owns the
+process. Run `pulse --unsupervise` to stop the unit and delete its definition;
+recorded history is left untouched.
 
 Supervision does not change what pulse records or how a gap is judged. Every
 bucket the sampler did not observe stays a gap, restart or no restart: stop the
