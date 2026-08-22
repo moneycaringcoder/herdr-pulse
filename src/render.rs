@@ -328,11 +328,17 @@ impl PaneView {
         }
     }
 
-    fn week() -> Self {
+    /// The week's own scale, which `--since` can narrow. Derived from the
+    /// window rather than the constants: a legend saying six hours a column
+    /// over a row of hourly columns mislabels its own axis by a factor of six,
+    /// and a column count that disagrees with the series silently drops the
+    /// scale line altogether.
+    fn week(config: &Config) -> Self {
+        let window = week_window(config);
         Self {
             name: Some("week view"),
-            columns: WEEK_COLUMNS,
-            seconds_per_column: (WEEK_BUCKETS_PER_COLUMN as u64)
+            columns: window.columns,
+            seconds_per_column: (window.buckets_per_column as u64)
                 .saturating_mul(WEEK_BUCKET_SECONDS),
         }
     }
@@ -554,7 +560,7 @@ pub fn week_pane(
         // the week view remains aggregate-only.
         workspace.agents.clear();
     }
-    render_pane(&activity, config, as_of, session, PaneView::week())
+    render_pane(&activity, config, as_of, session, PaneView::week(config))
 }
 
 /// The live herdr identity, when both locating and fingerprinting its socket
@@ -614,27 +620,38 @@ pub fn run_week(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Says what happened to a `--since` request the ring could not honour exactly.
+/// What a `--since` request asked for that the ring could not honour exactly.
 ///
-/// On stderr, beside the pane rather than inside it: the pane's business is the
-/// history, and a note about the request is not history. Silence when the window
-/// was honoured as asked, which is the ordinary case.
-fn report_window(window: &PaneWindow, bucket_seconds: u64, retention_buckets: usize) {
+/// Empty when the window was honoured as asked, which is the ordinary case.
+/// Separate from the printing because `--watch` clears the screen on every
+/// frame: a note printed once before the loop is erased milliseconds later, so
+/// that verb has to redraw it inside each frame instead.
+fn window_notes(window: &PaneWindow, bucket_seconds: u64, retention_buckets: usize) -> Vec<String> {
+    let mut notes = Vec::new();
     if let Some(asked) = window.older_than_retention {
         let retained = (retention_buckets as u64).saturating_mul(bucket_seconds.max(1));
-        eprintln!(
-            "pulse: asked for {}, and pulse retains {} here; the pane starts where the \
+        notes.push(format!(
+            "asked for {}, and pulse retains {} here; the pane starts where the \
              recorded history does, and the time before it is not quiet, it is not kept.",
             duration(Some(asked)),
             duration(Some(retained))
-        );
+        ));
     }
     if window.widened_to_bucket {
-        eprintln!(
-            "pulse: that window is shorter than one {} bucket, so the pane draws one bucket; \
+        notes.push(format!(
+            "that window is shorter than one {} bucket, so the pane draws one bucket; \
              there is no finer resolution recorded to narrow to.",
             duration(Some(bucket_seconds.max(1)))
-        );
+        ));
+    }
+    notes
+}
+
+/// [`window_notes`] on stderr, beside the pane rather than inside it: the pane's
+/// business is the history, and a note about the request is not history.
+fn report_window(window: &PaneWindow, bucket_seconds: u64, retention_buckets: usize) {
+    for note in window_notes(window, bucket_seconds, retention_buckets) {
+        eprintln!("pulse: {note}");
     }
 }
 
@@ -863,10 +880,11 @@ pub fn run_watch(config: &Config) -> Result<()> {
 
     let window = fine_window(config);
     let (columns, buckets_per_column) = (window.columns, window.buckets_per_column);
-    // Once, before the first frame: the note is about the request, which does
-    // not change between frames, and repeating it every cycle would scroll the
-    // pane it is describing off the terminal.
-    report_window(&window, config.bucket_seconds, config.retention_buckets);
+    // Inside every frame, not once before the loop: the first frame clears the
+    // screen, so a note printed ahead of it is erased before anyone reads it.
+    // Repeating it costs nothing, because each frame repaints from the top
+    // rather than scrolling.
+    let notes = window_notes(&window, config.bucket_seconds, config.retention_buckets);
     let mut out = std::io::stdout();
     loop {
         // Re-checked every cycle, not just at startup. A sampler that dies under
@@ -899,6 +917,9 @@ pub fn run_watch(config: &Config) -> Result<()> {
             "\nrefreshing every {} — ctrl-c to stop",
             duration(Some(config.interval.as_secs()))
         )?;
+        for note in &notes {
+            writeln!(out, "pulse: {note}")?;
+        }
         out.flush()?;
         std::thread::sleep(config.interval);
     }
@@ -1042,7 +1063,15 @@ pub fn pane_window(
     // are time this ring never had a slot for. A row of them would read as an
     // outage that never happened.
     let buckets_per_column = buckets.div_ceil(full.0.max(1)).max(1);
-    let columns = buckets.div_ceil(buckets_per_column).max(1);
+    // Capped at the columns the ring can actually fill. Rounding the count up
+    // and keeping it would draw up to a column of buckets the ring never had a
+    // slot for, and the legend beside them would state a span wider than the
+    // retention that produced it. Losing under a column at the far edge is the
+    // same rounding an unnarrowed pane has always accepted.
+    let columns = buckets
+        .div_ceil(buckets_per_column)
+        .min((retention_buckets / buckets_per_column).max(1))
+        .max(1);
     PaneWindow {
         columns,
         buckets_per_column,

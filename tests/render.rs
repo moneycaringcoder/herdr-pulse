@@ -1952,14 +1952,39 @@ fn a_window_past_retention_is_reported_rather_than_quietly_shortened() {
 
     assert_eq!(window.older_than_retention, Some(6 * 3_600));
     let covered = window.columns * window.buckets_per_column;
+    let retention = Config::default().retention_buckets;
     assert!(
-        covered >= Config::default().retention_buckets,
-        "the drawn window is the whole ring, which is all there is: {covered} buckets"
+        covered <= retention,
+        "a row never reaches past the ring: {covered} of {retention} buckets"
     );
     assert!(
-        covered <= Config::default().retention_buckets + window.buckets_per_column,
-        "and never wider than the ring by more than the rounding: {covered} buckets"
+        covered > retention - window.buckets_per_column,
+        "and draws everything the ring has, bar the rounding: {covered} buckets"
     );
+}
+
+#[test]
+fn no_window_ever_draws_a_bucket_the_ring_never_had() {
+    // A column past the end of the ring is not an outage: it is time the ring
+    // never had a slot for, and it would render as a gap glyph saying nobody
+    // was watching. The legend beside it would state a span wider than the
+    // retention that produced it.
+    for retention in [1usize, 7, 32, 33, 240, 241, 993, 1_000, 10_000] {
+        for asked in [1u64, 59, 60, 61, 600, 3_600, 4 * 3_600, 30 * 86_400] {
+            let config = Config {
+                retention_buckets: retention,
+                since_seconds: Some(asked),
+                ..Config::default()
+            };
+            let window = fine_window(&config);
+            let covered = window.columns * window.buckets_per_column;
+            assert!(
+                covered <= retention.max(1),
+                "retention {retention}, since {asked}s: drew {covered} buckets"
+            );
+            assert!(window.columns >= 1 && window.buckets_per_column >= 1);
+        }
+    }
 }
 
 #[test]
@@ -1998,19 +2023,44 @@ fn a_narrow_window_still_has_a_column_to_draw_gaps_in() {
 
 #[test]
 fn the_week_answers_since_in_its_own_hours() {
-    // Two days of a ring with an hour per bucket is 48 buckets, not 48 minutes.
+    // Two days of a ring with an hour per bucket is 48 buckets, not 48 minutes,
+    // and it is 48 whether or not the ring's own width divides them evenly.
+    // Pinned exactly rather than bounded: a week that ignored `--since` and
+    // handed back all 168 hours would satisfy every "at least this much" test
+    // there is.
     let window = week_window(&since(2 * 86_400));
 
-    let covered = (window.columns as u64)
-        .saturating_mul(window.buckets_per_column as u64)
-        .saturating_mul(WEEK_BUCKET_SECONDS);
-    assert!(covered >= 2 * 86_400, "covered {covered}s of the week ring");
-    assert!(
-        window.columns <= WEEK_COLUMNS,
-        "a narrowed week is never wider than a whole one"
+    assert_eq!(
+        window.columns * window.buckets_per_column,
+        48,
+        "two days of an hourly ring is 48 buckets"
     );
+    assert_eq!((window.columns, window.buckets_per_column), (24, 2));
     assert_eq!(window.older_than_retention, None);
     assert!(!window.widened_to_bucket, "two days is many hours");
+}
+
+#[test]
+fn the_week_legend_states_the_scale_the_week_actually_drew() {
+    // A narrowed week under a legend reading "one column = 6h00" mislabels its
+    // own axis by a factor of six, and a column count that disagrees with the
+    // series drops the scale line entirely. Both are the pane claiming history
+    // it does not hold.
+    let config = since(2 * 86_400);
+    let window = week_window(&config);
+    let mut workspace = activity("web", vec![None; 8], AgentState::Working, Some(60), 1);
+    workspace.week = vec![Some(Level(4)); window.columns];
+
+    let rendered = week_pane(&[workspace], &config, AS_OF, None);
+
+    assert!(
+        rendered.contains("one column = 2h00"),
+        "the legend states the narrowed scale: {rendered}"
+    );
+    assert!(
+        !rendered.contains("one column = 6h00"),
+        "and not the unnarrowed one: {rendered}"
+    );
 }
 
 #[test]
