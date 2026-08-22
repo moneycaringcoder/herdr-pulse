@@ -34,6 +34,10 @@ fn workspace(id: &str, label: &str, agents: &[(&str, &str, u64)]) -> WorkspaceOb
     WorkspaceObservation {
         workspace_id: id.to_string(),
         label: label.to_string(),
+        // No worktree, which is the majority case in the captured snapshot:
+        // seven of its ten workspaces. These have no durable key, so they
+        // exercise the id-and-label rule.
+        checkout_path: None,
         agents: agents
             .iter()
             .map(|(pane, state, seq)| AgentObservation {
@@ -44,6 +48,20 @@ fn workspace(id: &str, label: &str, agents: &[(&str, &str, u64)]) -> WorkspaceOb
                 state_change_seq: *seq,
             })
             .collect(),
+    }
+}
+
+/// A workspace herdr reports a worktree for, so the store has a durable key to
+/// recognise it by across a reused id.
+fn checkout(
+    id: &str,
+    label: &str,
+    path: &str,
+    agents: &[(&str, &str, u64)],
+) -> WorkspaceObservation {
+    WorkspaceObservation {
+        checkout_path: Some(path.to_string()),
+        ..workspace(id, label, agents)
     }
 }
 
@@ -131,6 +149,13 @@ fn live_sample(taken_at: u64) -> Sample {
         .map(|workspace| WorkspaceObservation {
             workspace_id: workspace["workspace_id"].as_str().unwrap().to_string(),
             label: workspace["label"].as_str().unwrap().to_string(),
+            // Three of the ten fixture workspaces carry a worktree and seven
+            // carry `null`, exactly as captured. That split is the point: a
+            // fixture where every workspace had a durable key would not exercise
+            // the workspaces that have none.
+            checkout_path: workspace["worktree"]["checkout_path"]
+                .as_str()
+                .map(str::to_string),
             agents: Vec::new(),
         })
         .collect();
@@ -629,6 +654,7 @@ fn many_thousands_of_samples_stay_under_a_size_ceiling() {
                 WorkspaceObservation {
                     workspace_id: id.clone(),
                     label: format!("workspace-{index}"),
+                    checkout_path: Some(format!("/home/dev/repos/project-{index}")),
                     agents: (0..4)
                         .map(|slot| AgentObservation {
                             pane_id: pane(slot),
@@ -946,6 +972,589 @@ fn an_unchanged_label_keeps_the_history() {
 
     let series = series(&history, T0 + 4 * 60, 5, &config);
     assert!(series.iter().all(Option::is_some), "{series:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Identity: which workspace a recorded series belongs to
+// ---------------------------------------------------------------------------
+
+/// The ids the store is holding, which must never repeat: an id is what a badge
+/// is pushed to, so two entries sharing one would push two sparklines at one
+/// workspace.
+fn ids(history: &History) -> Vec<&str> {
+    history
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect()
+}
+
+fn assert_ids_are_unique(history: &History) {
+    let mut seen = ids(history);
+    let total = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        total,
+        "duplicate workspace id in {:?}",
+        ids(history)
+    );
+}
+
+#[test]
+fn a_renamed_workspace_keeps_its_history_when_the_checkout_is_the_same() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    for minute in 0..5u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![checkout(
+                    "w15",
+                    "old-name",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+    // A rename, not a reuse: same session, same id, same checkout.
+    history.record(
+        &sample(
+            T0 + 5 * 60,
+            vec![checkout(
+                "w15",
+                "new-name",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 20)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(history.workspaces[0].label, "new-name");
+    let series = series(&history, T0 + 5 * 60, 6, &config);
+    assert!(
+        series.iter().all(Option::is_some),
+        "a rename is not a different workspace: {series:?}"
+    );
+}
+
+#[test]
+fn a_workspace_that_comes_back_under_a_new_id_keeps_its_history() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    for minute in 0..5u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+    // A fresh herdr session numbers the same workspace differently.
+    history.record(
+        &sample(
+            T0 + 5 * 60,
+            vec![checkout(
+                "w3",
+                "api",
+                "/home/dev/repos/api",
+                &[("w3:p1", "working", 4)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(
+        history.workspaces[0].workspace_id, "w3",
+        "the entry has to follow the id herdr is using now, or the badge goes nowhere"
+    );
+    let series = series(&history, T0 + 5 * 60, 6, &config);
+    assert!(
+        series.iter().all(Option::is_some),
+        "the checkout is the same, so the series continues: {series:?}"
+    );
+}
+
+#[test]
+fn an_id_reused_by_another_checkout_under_a_new_label_drops_the_displaced_history() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    for minute in 0..5u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+    // A new session hands `w15` to a workspace on a different checkout, and the
+    // one we were recording is nowhere in this sample.
+    history.record(
+        &sample(
+            T0 + 5 * 60,
+            vec![checkout(
+                "w15",
+                "web",
+                "/home/dev/repos/web",
+                &[("w15:p1", "idle", 900)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_ids_are_unique(&history);
+    assert_eq!(
+        history.workspaces[0].checkout_path.as_deref(),
+        Some("/home/dev/repos/web")
+    );
+    let activity = &history.activity(T0 + 5 * 60, 6, 1, &config)[0];
+    assert_eq!(activity.label, "web");
+    assert_eq!(
+        activity.series[..5].iter().filter(|c| c.is_some()).count(),
+        0,
+        "the previous tenant's minutes must not be attributed here: {:?}",
+        activity.series
+    );
+    assert_eq!(activity.series[5], Some(Level(0)));
+}
+
+#[test]
+fn an_id_reused_under_the_same_label_but_a_different_checkout_drops_the_history() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    // Two linked worktrees of one repo, which herdr labels alike. The label
+    // agreeing is exactly why this case needs the path: on the label alone these
+    // two would look like one workspace.
+    for minute in 0..5u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![checkout(
+                    "w15",
+                    "project",
+                    "/home/dev/.herdr/worktrees/project/one",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+    history.record(
+        &sample(
+            T0 + 5 * 60,
+            vec![checkout(
+                "w15",
+                "project",
+                "/home/dev/.herdr/worktrees/project/two",
+                &[("w15:p1", "working", 40)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_eq!(
+        history.workspaces[0].checkout_path.as_deref(),
+        Some("/home/dev/.herdr/worktrees/project/two")
+    );
+    let activity = &history.activity(T0 + 5 * 60, 6, 1, &config)[0];
+    assert_eq!(
+        activity.series[..5].iter().filter(|c| c.is_some()).count(),
+        0,
+        "same label, different checkout: the minutes belong to the other worktree: {:?}",
+        activity.series
+    );
+}
+
+#[test]
+fn two_workspaces_that_swap_ids_keep_their_own_series() {
+    // Whichever order the swapped observations arrive in, both series survive:
+    // judging a displaced id before the whole sample has been read would drop
+    // the workspace that is about to claim it.
+    for reversed in [false, true] {
+        let config = config(60, 16, 4);
+        let mut history = History::empty(&config);
+        for minute in 0..4u64 {
+            history.record(
+                &sample(
+                    T0 + minute * 60,
+                    vec![
+                        checkout(
+                            "w15",
+                            "api",
+                            "/home/dev/repos/api",
+                            &[("w15:p1", "working", 10 + minute)],
+                        ),
+                        checkout(
+                            "w16",
+                            "web",
+                            "/home/dev/repos/web",
+                            &[("w16:p1", "idle", 500)],
+                        ),
+                    ],
+                ),
+                &config,
+            );
+        }
+
+        let mut swapped = vec![
+            checkout(
+                "w16",
+                "api",
+                "/home/dev/repos/api",
+                &[("w16:p1", "working", 90)],
+            ),
+            checkout(
+                "w15",
+                "web",
+                "/home/dev/repos/web",
+                &[("w15:p1", "idle", 91)],
+            ),
+        ];
+        if reversed {
+            swapped.reverse();
+        }
+        history.record(&sample(T0 + 4 * 60, swapped), &config);
+
+        assert_eq!(history.workspaces.len(), 2, "reversed: {reversed}");
+        assert_ids_are_unique(&history);
+        let activity = history.activity(T0 + 4 * 60, 5, 1, &config);
+        let api = activity.iter().find(|a| a.label == "api").expect("api");
+        let web = activity.iter().find(|a| a.label == "web").expect("web");
+        assert_eq!(api.workspace_id, "w16", "reversed: {reversed}");
+        assert_eq!(web.workspace_id, "w15", "reversed: {reversed}");
+        assert!(
+            api.series.iter().all(|c| c.is_some_and(|l| !l.is_quiet())),
+            "reversed: {reversed}, {:?}",
+            api.series
+        );
+        assert!(
+            web.series.iter().all(|c| c == &Some(Level(0))),
+            "reversed: {reversed}, {:?}",
+            web.series
+        );
+    }
+}
+
+#[test]
+fn a_checkout_path_two_workspaces_share_is_not_an_identity() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    // herdr will open two workspaces on one checkout, and then the path says
+    // "one of these two", which is a guess. Falling back to the id keeps the two
+    // series apart instead of merging them under whichever label came last.
+    for minute in 0..4u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![
+                    checkout(
+                        "wA",
+                        "first",
+                        "/home/dev/repos/shared",
+                        &[("wA:p1", "working", 10 + minute)],
+                    ),
+                    checkout(
+                        "wB",
+                        "second",
+                        "/home/dev/repos/shared",
+                        &[("wB:p1", "idle", 500)],
+                    ),
+                ],
+            ),
+            &config,
+        );
+    }
+
+    assert_eq!(history.workspaces.len(), 2);
+    assert_ids_are_unique(&history);
+    for entry in &history.workspaces {
+        assert_eq!(
+            entry.checkout_path, None,
+            "a path this sample refused must not be recorded as a key: {entry:?}"
+        );
+    }
+    let activity = history.activity(T0 + 3 * 60, 4, 1, &config);
+    let first = activity.iter().find(|a| a.label == "first").expect("first");
+    let second = activity
+        .iter()
+        .find(|a| a.label == "second")
+        .expect("second");
+    assert!(first
+        .series
+        .iter()
+        .all(|c| c.is_some_and(|l| !l.is_quiet())));
+    assert!(second.series.iter().all(|c| c == &Some(Level(0))));
+}
+
+#[test]
+fn the_survivor_of_a_shared_checkout_does_not_inherit_the_other_series() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    // Four minutes with both workspaces on one checkout: one working throughout,
+    // one idle throughout.
+    for minute in 0..4u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![
+                    checkout(
+                        "wA",
+                        "first",
+                        "/home/dev/repos/shared",
+                        &[("wA:p1", "working", 10 + minute)],
+                    ),
+                    checkout(
+                        "wB",
+                        "second",
+                        "/home/dev/repos/shared",
+                        &[("wB:p1", "idle", 500)],
+                    ),
+                ],
+            ),
+            &config,
+        );
+    }
+    // The busy one closes, so the path is unambiguous again — and it must not
+    // hand the idle workspace four minutes of somebody else's work.
+    history.record(
+        &sample(
+            T0 + 4 * 60,
+            vec![checkout(
+                "wB",
+                "second",
+                "/home/dev/repos/shared",
+                &[("wB:p1", "idle", 500)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 2, "{:?}", ids(&history));
+    assert_ids_are_unique(&history);
+    let activity = history.activity(T0 + 4 * 60, 5, 1, &config);
+    let second = activity
+        .iter()
+        .find(|a| a.label == "second")
+        .expect("second");
+    assert!(
+        second.series.iter().all(|c| c == &Some(Level(0))),
+        "the idle workspace was idle for every observed minute: {:?}",
+        second.series
+    );
+    let first = activity.iter().find(|a| a.label == "first").expect("first");
+    assert_eq!(
+        first.series[4], None,
+        "the closed workspace was not observed in the last minute: {:?}",
+        first.series
+    );
+    assert!(
+        first.series[..4]
+            .iter()
+            .all(|c| c.is_some_and(|l| !l.is_quiet())),
+        "and it keeps the minutes it did work: {:?}",
+        first.series
+    );
+}
+
+#[test]
+fn a_workspace_whose_worktree_stops_being_reported_keeps_its_history() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    for minute in 0..5u64 {
+        history.record(
+            &sample(
+                T0 + minute * 60,
+                vec![checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 10 + minute)],
+                )],
+            ),
+            &config,
+        );
+    }
+    // The worktree goes away — the checkout was deleted, or herdr stopped
+    // resolving it. Losing the evidence is not proof of a different workspace,
+    // and the id and label still agree, so the series continues.
+    history.record(
+        &one(T0 + 5 * 60, "w15", "api", &[("w15:p1", "working", 40)]),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    let series = series(&history, T0 + 5 * 60, 6, &config);
+    assert!(series.iter().all(Option::is_some), "{series:?}");
+}
+
+#[test]
+fn a_history_file_written_before_checkout_paths_keeps_its_buckets() {
+    let dir = TempDir::new("pre-checkout-file");
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..5u64 {
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    // Exactly what the previous release wrote: no `checkout_path` key at all.
+    let mut value = serde_json::to_value(&history).unwrap();
+    let entry = value["workspaces"][0].as_object_mut().unwrap();
+    assert!(
+        entry.remove("checkout_path").is_some(),
+        "the field is written"
+    );
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let mut loaded = history::load_from(dir.path(), &config);
+    assert_eq!(loaded.workspaces.len(), 1);
+    assert_eq!(loaded.workspaces[0].checkout_path, None);
+
+    // The first sample that carries a worktree adopts the entry on the evidence
+    // the file was recorded with, and stamps the durable key onto it.
+    loaded.record(
+        &sample(
+            T0 + 5 * 60,
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 40)],
+            )],
+        ),
+        &config,
+    );
+
+    assert_eq!(loaded.workspaces.len(), 1);
+    assert_eq!(
+        loaded.workspaces[0].checkout_path.as_deref(),
+        Some("/home/dev/repos/api")
+    );
+    let series = series(&loaded, T0 + 5 * 60, 6, &config);
+    assert!(
+        series.iter().all(Option::is_some),
+        "an upgrade must not cost the recorded history: {series:?}"
+    );
+}
+
+#[test]
+fn two_entries_on_one_checkout_path_do_not_survive_a_load() {
+    let dir = TempDir::new("duplicate-checkout");
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample(
+            T0,
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 10)],
+            )],
+        ),
+        &config,
+    );
+
+    // A hand-edited file: one checkout under two ids. `locate` would find the
+    // first every time, leaving the second frozen and still being drawn.
+    let mut value = serde_json::to_value(&history).unwrap();
+    let mut clone = value["workspaces"][0].clone();
+    clone["workspace_id"] = serde_json::json!("w16");
+    value["workspaces"].as_array_mut().unwrap().push(clone);
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let loaded = history::load_from(dir.path(), &config);
+    assert_eq!(loaded.workspaces.len(), 1);
+    assert_eq!(loaded.workspaces[0].workspace_id, "w15");
+}
+
+#[test]
+fn a_snapshot_that_reports_one_id_twice_records_neither_workspace() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &sample(
+            T0,
+            vec![checkout(
+                "w15",
+                "api",
+                "/home/dev/repos/api",
+                &[("w15:p1", "working", 10)],
+            )],
+        ),
+        &config,
+    );
+
+    // herdr should never do this. If it does, both observations claim the id a
+    // badge is pushed to, and recording either would decide which workspace owns
+    // the other's sparkline.
+    history.record(
+        &sample(
+            T0 + 60,
+            vec![
+                checkout(
+                    "w15",
+                    "api",
+                    "/home/dev/repos/api",
+                    &[("w15:p1", "working", 11)],
+                ),
+                checkout(
+                    "w15",
+                    "web",
+                    "/home/dev/repos/web",
+                    &[("w15:p2", "working", 12)],
+                ),
+            ],
+        ),
+        &config,
+    );
+
+    assert_eq!(history.workspaces.len(), 1);
+    assert_ids_are_unique(&history);
+    assert_eq!(
+        history.workspaces[0].checkout_path.as_deref(),
+        Some("/home/dev/repos/api"),
+        "the entry already holding the id is left as it was"
+    );
+    let series = series(&history, T0 + 60, 2, &config);
+    assert_eq!(
+        series[1], None,
+        "a self-contradicting snapshot observed nothing: {series:?}"
+    );
 }
 
 #[test]

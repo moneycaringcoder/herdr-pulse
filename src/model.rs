@@ -116,9 +116,19 @@ pub struct AgentObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceObservation {
     pub workspace_id: String,
-    /// The user's label for the workspace. Also our guard against workspace-id
-    /// reuse across herdr restarts — see `history::History`.
+    /// The user's label for the workspace.
     pub label: String,
+    /// The absolute path of the checkout herdr has this workspace open on, from
+    /// `workspaces[].worktree.checkout_path`, or `None` for a workspace with no
+    /// worktree at all.
+    ///
+    /// This is the durable identity the sample history is keyed on. herdr's
+    /// `workspace_id` is session-scoped and gets reused, whereas a checkout path
+    /// is the same path tomorrow — so a workspace that comes back under a
+    /// different id can still be recognised as the same one. `None` is not a
+    /// weaker key, it is the absence of one: see `history::History::locate` for
+    /// what identity means when herdr reports no worktree.
+    pub checkout_path: Option<String>,
     pub agents: Vec<AgentObservation>,
 }
 

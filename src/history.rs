@@ -30,6 +30,23 @@
 //!    history — never as a hard failure that stops the sampler, and never
 //!    silently.
 //!
+//! # Which workspace a series belongs to
+//!
+//! A series is only worth keeping if we can say whose it is. herdr's
+//! `workspace_id` cannot answer that on its own: it is session-scoped and a
+//! fresh server reissues the same `w15` to whatever workspace it likes. The
+//! store therefore keys on the workspace's checkout path when herdr reports one,
+//! which means the same thing in every session and lets a series survive a
+//! reused id instead of being thrown away.
+//!
+//! A workspace with no worktree has no durable key, and for those the id and the
+//! label together are the only evidence there is: a label that changes under an
+//! id is treated as a different workspace and its buckets are dropped. Both
+//! cases obey one rule — where identity cannot be established, drop rather than
+//! guess. A recovered series must be provably the same workspace, never probably
+//! one, because a sparkline drawn under the wrong name is wrong in a way nobody
+//! can see.
+//!
 //! # Recording activity
 //!
 //! Each bucket counts observations rather than storing a pre-computed level, so
@@ -151,16 +168,28 @@ impl Bucket {
 /// Everything recorded for one workspace.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceHistory {
+    /// The session-scoped id herdr used for this workspace at the last
+    /// observation. Unique across the store, because it is what a badge is
+    /// pushed to: two entries sharing an id would push two different sparklines
+    /// to one workspace and the last write would win.
     pub workspace_id: String,
     /// The workspace's label when it was last seen.
-    ///
-    /// This is the guard against workspace-id reuse. herdr's ids (`w15`, `wM`)
-    /// are session-scoped, and nothing promises that the `w15` of tomorrow's
-    /// session is the `w15` whose history we recorded today. When the label for
-    /// an id changes, the recorded buckets belong to a different workspace and
-    /// are dropped rather than attributed to the new one — a wrong attribution
-    /// is invisible and unfalsifiable, an empty sparkline is neither.
     pub label: String,
+    /// The checkout path herdr reported for this workspace, and the durable
+    /// identity the series is keyed on when there is one.
+    ///
+    /// A path outlives the session that observed it, so a workspace that comes
+    /// back under a reused id is still recognisably itself and its buckets are
+    /// kept. `None` means herdr reported no worktree, and there is no durable
+    /// identity to key on — for those the id and the label together are all the
+    /// evidence there is, and a label that changes under an id means the buckets
+    /// belong to somebody else and are dropped. See [`History::locate`].
+    ///
+    /// Defaulted on load so a history file written before this field existed
+    /// keeps its buckets: the first observation carrying a path adopts the entry
+    /// on the old evidence and stamps the path onto it.
+    #[serde(default)]
+    pub checkout_path: Option<String>,
     /// Ring of buckets, indexed by absolute bucket number modulo the ring
     /// length. Fixed length; never grown.
     pub buckets: Vec<Bucket>,
@@ -185,15 +214,27 @@ impl WorkspaceHistory {
     /// A workspace with a ring but nothing in it, seeded from the observation
     /// that introduced it.
     ///
+    /// `durable` is the key [`History::record`] resolved for this observation,
+    /// not the path the observation carries: a path two workspaces in one
+    /// snapshot share identifies neither of them, and writing it down anyway
+    /// would make it a key again on the first sample where only one of the two is
+    /// reported.
+    ///
     /// `state_since` starts `None` on purpose. The state we are seeding with may
     /// have held for hours before this process started, and stamping it with
     /// "now" would report a five-second-old block on a workspace that has been
     /// waiting since lunch. We only know a duration once we have watched a
     /// change happen.
-    fn new(observation: &WorkspaceObservation, taken_at: u64, config: &Config) -> Self {
+    fn new(
+        observation: &WorkspaceObservation,
+        durable: Option<&str>,
+        taken_at: u64,
+        config: &Config,
+    ) -> Self {
         Self {
             workspace_id: observation.workspace_id.clone(),
             label: observation.label.clone(),
+            checkout_path: durable.map(str::to_string),
             buckets: vec![Bucket::default(); config.retention_buckets],
             newest_bucket: bucket_number(taken_at, config),
             state: observation.state().as_str().to_string(),
@@ -513,12 +554,43 @@ impl History {
     /// behind that the recorded anchor cannot be believed re-anchors the store
     /// and says so, because a clock that steps forward and comes back must not
     /// leave the store permanently deaf.
+    ///
+    /// Identity is resolved against the whole sample rather than one observation
+    /// at a time, because a session that reissues ids can *swap* two of them: if
+    /// `w15` and `w16` exchange checkouts, both entries must be re-keyed before
+    /// either stale id is judged, or whichever was processed first would take
+    /// the other's history down with it. See [`Self::locate`] and
+    /// [`Self::drop_reused_ids`].
     pub fn record(&mut self, sample: &Sample, config: &Config) {
         let mut rewound = 0usize;
+        let mut contradicted = 0usize;
+        let mut live: Vec<usize> = Vec::new();
         for observation in &sample.workspaces {
-            if self.record_workspace(observation, sample.taken_at, config) {
+            if !claims_one_id(observation, &sample.workspaces) {
+                // One id reported twice in one snapshot. Both observations claim
+                // the handle a badge is pushed to, so recording either would
+                // decide which of two workspaces owns the other's sparkline.
+                // Neither is recorded, and the entry already holding that id is
+                // left exactly as it was: a stalled series that goes to gaps is
+                // the honest reading of a snapshot that contradicts itself.
+                contradicted += 1;
+                continue;
+            }
+            let durable = durable_key(observation, &sample.workspaces);
+            let (index, was_rewound) =
+                self.record_workspace(observation, durable, sample.taken_at, config);
+            if was_rewound {
                 rewound += 1;
             }
+            if !live.contains(&index) {
+                live.push(index);
+            }
+        }
+        if contradicted > 0 {
+            eprintln!(
+                "pulse: the snapshot reported {contradicted} workspace(s) under an id it \
+                 also gave to another; recorded none of them"
+            );
         }
         // Once for the sample, not once per workspace: one clock step moves every
         // workspace at the same instant, and the next sample is already
@@ -531,42 +603,131 @@ impl History {
                  discarded the unreachable buckets for {rewound} workspace(s) and resumed recording"
             );
         }
+        let displaced = self.drop_reused_ids(&live);
+        if displaced > 0 {
+            eprintln!(
+                "pulse: herdr reused {displaced} workspace id(s) for a different workspace; \
+                 discarded the history recorded under them"
+            );
+        }
         // After, not before: a workspace introduced by this sample is the most
         // recently seen thing in the store and must never be the one evicted.
         self.evict(config);
     }
 
-    /// Returns whether folding this observation in had to re-anchor the
-    /// workspace's ring.
+    /// Folds one observation in, returning the entry it landed on and whether
+    /// that entry's ring had to be re-anchored.
     fn record_workspace(
         &mut self,
         observation: &WorkspaceObservation,
+        durable: Option<&str>,
         taken_at: u64,
         config: &Config,
-    ) -> bool {
-        let existing = self
-            .workspaces
-            .iter()
-            .position(|w| w.workspace_id == observation.workspace_id);
-        let index = match existing {
+    ) -> (usize, bool) {
+        let index = match self.locate(observation, durable) {
             Some(index) => {
-                if self.workspaces[index].label != observation.label {
-                    // Same id, different workspace. herdr's ids are
-                    // session-scoped and get reused, so the recorded buckets
-                    // describe somebody else's afternoon. Start over: an empty
-                    // sparkline is a fact the user can check, a borrowed one is
-                    // not.
-                    self.workspaces[index] = WorkspaceHistory::new(observation, taken_at, config);
+                // The same workspace, so the series continues. Everything herdr
+                // may have changed about it since the last sample — the
+                // session-scoped id, the label, a checkout it did not report
+                // before — is restamped onto the entry we already have.
+                let entry = &mut self.workspaces[index];
+                entry.workspace_id = observation.workspace_id.clone();
+                entry.label = observation.label.clone();
+                match durable {
+                    Some(path) => entry.checkout_path = Some(path.to_string()),
+                    // A path this sample refused must not stay on the entry as a
+                    // key: the next sample that reports only one of the two
+                    // workspaces sharing it would match on it and be handed the
+                    // other's buckets. Ambiguity is not evidence of anything, so
+                    // both fall back to the id and label until it clears.
+                    None if observation.checkout_path.is_some() => entry.checkout_path = None,
+                    // No worktree reported at all. Losing the evidence is not
+                    // proof of a different workspace, so the recorded key stays
+                    // and the workspace is still recognisable if it comes back.
+                    None => {}
                 }
                 index
             }
             None => {
-                self.workspaces
-                    .push(WorkspaceHistory::new(observation, taken_at, config));
+                // Not identifiable as anything on record: a new workspace, or an
+                // id whose history belongs to somebody else. Either way this
+                // starts an empty series, and [`Self::drop_reused_ids`] deals
+                // with the entry still holding the id.
+                self.workspaces.push(WorkspaceHistory::new(
+                    observation,
+                    durable,
+                    taken_at,
+                    config,
+                ));
                 self.workspaces.len() - 1
             }
         };
-        self.workspaces[index].observe(observation, taken_at, config)
+        let rewound = self.workspaces[index].observe(observation, taken_at, config);
+        (index, rewound)
+    }
+
+    /// The entry this observation is provably the continuation of, or `None` when
+    /// no recorded workspace can be shown to be this one.
+    ///
+    /// The rule the whole module turns on applies here too: where identity cannot
+    /// be established, drop rather than guess. A recovered series must be
+    /// *provably* the same workspace, so the only two things that count as proof
+    /// are the durable checkout path, and — for a workspace herdr reports no
+    /// worktree for — an unchanged id and label together.
+    ///
+    /// Note what a durable key deliberately does *not* fall back to. An
+    /// observation carrying a checkout path that matches no entry is not the
+    /// workspace whose entry merely shares its id and label: two worktrees of one
+    /// repo can carry the same label, and attributing one's buckets to the other
+    /// is exactly the invisible wrong answer this module exists to refuse. The
+    /// one exception is an entry with no recorded path at all, which is either a
+    /// file written before this field existed or a workspace herdr has only just
+    /// started reporting a worktree for — there the old evidence is all there
+    /// ever was, and it is the same evidence the store used when it recorded it.
+    fn locate(&self, observation: &WorkspaceObservation, durable: Option<&str>) -> Option<usize> {
+        let named = |entry: &WorkspaceHistory| {
+            entry.workspace_id == observation.workspace_id && entry.label == observation.label
+        };
+        match durable {
+            Some(path) => self
+                .workspaces
+                .iter()
+                .position(|entry| entry.checkout_path.as_deref() == Some(path))
+                .or_else(|| {
+                    self.workspaces
+                        .iter()
+                        .position(|entry| entry.checkout_path.is_none() && named(entry))
+                }),
+            None => self.workspaces.iter().position(named),
+        }
+    }
+
+    /// Drops the entries whose ids this sample proved belong to a different
+    /// workspace, and returns how many.
+    ///
+    /// `live` are the entries this sample landed on, by index. An entry outside
+    /// that set whose id one of them now holds has been displaced: herdr handed
+    /// its id to a workspace we have just shown to be another one, and nothing
+    /// remains that can identify it — a session-scoped id is the only handle a
+    /// badge has, so it cannot be kept beside the workspace that now owns the id.
+    ///
+    /// Deliberately once per sample rather than per observation: an id that looks
+    /// displaced halfway through a sample may be re-keyed by a later observation
+    /// in the same one, which is what a two-workspace swap looks like.
+    fn drop_reused_ids(&mut self, live: &[usize]) -> usize {
+        let claimed: Vec<String> = live
+            .iter()
+            .map(|index| self.workspaces[*index].workspace_id.clone())
+            .collect();
+        let before = self.workspaces.len();
+        let kept: Vec<WorkspaceHistory> = std::mem::take(&mut self.workspaces)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, entry)| live.contains(index) || !claimed.contains(&entry.workspace_id))
+            .map(|(_, entry)| entry)
+            .collect();
+        self.workspaces = kept;
+        before - self.workspaces.len()
     }
 
     /// Enforces the workspace cap, dropping the least recently seen first.
@@ -605,13 +766,23 @@ impl History {
     /// configured run — or hand-edited.
     fn normalise(&mut self, config: &Config) {
         // A duplicate id would have `record` updating one entry while `activity`
-        // reported both, so one of the two sparklines would quietly freeze.
-        let mut seen: Vec<String> = Vec::new();
+        // reported both, so one of the two sparklines would quietly freeze. A
+        // duplicate checkout path is the same failure through the durable key:
+        // `locate` would find the first entry every time and the second would sit
+        // there frozen, still being drawn. First occurrence wins in both cases.
+        let mut ids: Vec<String> = Vec::new();
+        let mut paths: Vec<String> = Vec::new();
         self.workspaces.retain(|workspace| {
-            if seen.iter().any(|id| id == &workspace.workspace_id) {
+            if ids.iter().any(|id| id == &workspace.workspace_id) {
                 return false;
             }
-            seen.push(workspace.workspace_id.clone());
+            if let Some(path) = &workspace.checkout_path {
+                if paths.contains(path) {
+                    return false;
+                }
+                paths.push(path.clone());
+            }
+            ids.push(workspace.workspace_id.clone());
             true
         });
         for workspace in &mut self.workspaces {
@@ -694,6 +865,43 @@ impl History {
     pub fn encoded_len(&self) -> usize {
         serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
+}
+
+/// This observation's durable identity, or `None` when it has none this sample
+/// can rely on.
+///
+/// A checkout path identifies a workspace only while it names exactly one of
+/// them. herdr will happily open two workspaces on the same checkout, and then
+/// the path says "one of these two" — which is a guess, and a guess would merge
+/// two workspaces' activity into one series under whichever label was seen last.
+/// An ambiguous path is therefore no key at all, and both observations fall back
+/// to the id and label they can still be told apart by.
+fn durable_key<'a>(
+    observation: &'a WorkspaceObservation,
+    sample: &[WorkspaceObservation],
+) -> Option<&'a str> {
+    let path = observation.checkout_path.as_deref()?;
+    let shared = sample
+        .iter()
+        .filter(|other| other.checkout_path.as_deref() == Some(path))
+        .count();
+    (shared == 1).then_some(path)
+}
+
+/// Whether this observation is the only one in its sample claiming its
+/// `workspace_id`.
+///
+/// herdr should never report one id twice in a snapshot, and the store's own
+/// invariant is that no two entries share one — an id is the handle a badge is
+/// pushed to, so a second entry holding it would push a second sparkline at the
+/// same workspace and the last write would win. A snapshot that contradicts
+/// itself is not evidence about either workspace, so neither is recorded.
+fn claims_one_id(observation: &WorkspaceObservation, sample: &[WorkspaceObservation]) -> bool {
+    sample
+        .iter()
+        .filter(|other| other.workspace_id == observation.workspace_id)
+        .count()
+        == 1
 }
 
 /// The absolute bucket number containing a Unix timestamp.

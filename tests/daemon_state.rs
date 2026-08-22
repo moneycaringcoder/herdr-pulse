@@ -951,6 +951,7 @@ fn sample_of(workspace_id: &str, state: AgentState, taken_at: u64, seq: u64) -> 
         workspaces: vec![WorkspaceObservation {
             workspace_id: workspace_id.to_string(),
             label: format!("label-{workspace_id}"),
+            checkout_path: Some(format!("/home/dev/repos/{workspace_id}")),
             agents: vec![AgentObservation {
                 pane_id: format!("{workspace_id}:p1"),
                 workspace_id: workspace_id.to_string(),

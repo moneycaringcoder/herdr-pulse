@@ -583,6 +583,44 @@ fn workspaces_are_kept_whether_or_not_they_are_git_repos() {
 }
 
 #[test]
+fn the_checkout_path_is_carried_when_the_workspace_has_a_worktree() {
+    let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
+    let path = |id: &str| {
+        sample
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == id)
+            .unwrap_or_else(|| panic!("{id} missing"))
+            .checkout_path
+            .clone()
+    };
+
+    // The durable key the store recognises a workspace by across a reused id.
+    // Two of these three are linked worktrees of one repo, which is why the
+    // checkout path is the field carried and not `repo_root` or `repo_name`:
+    // those are equal for both and would make the two workspaces one.
+    assert_eq!(
+        path("w6").as_deref(),
+        Some("/home/dev/repos/project-1"),
+        "a workspace on its own checkout"
+    );
+    assert_eq!(
+        path("wE").as_deref(),
+        Some("/home/dev/.herdr/worktrees/project-1/fix-media-fetch-throughput")
+    );
+    assert_eq!(
+        path("wY").as_deref(),
+        Some("/home/dev/.herdr/worktrees/project-1/fix-mart-promote-budget")
+    );
+
+    // `worktree` is null for the other seven. That is the absence of a durable
+    // key, not an empty one, so it must arrive as `None` rather than as `""`.
+    for id in ["wM", "w3", "w15", "w16", "w1B", "w1C", "w1D"] {
+        assert_eq!(path(id), None, "{id} has no worktree");
+    }
+}
+
+#[test]
 fn agents_are_attributed_to_their_own_workspace() {
     let sample = reduce_snapshot(&live_result(), 0).expect("reduce");
     let by_id = |id: &str| {

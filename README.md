@@ -317,10 +317,12 @@ cycle — cheap enough that the finer resolution is worth having.
   exits until you run `pulse --disable`.
 - Badges are pushed with a TTL of three refresh cycles, so they self-clear if the
   sampler is killed rather than lingering as stale claims.
-- herdr's workspace ids are session-scoped and can be reused. When a workspace's
-  label changes under an id, the recorded buckets are dropped rather than
-  attributed to the new workspace — an empty sparkline is a visible loss, a wrong
-  one is not.
+- herdr's workspace ids are session-scoped and can be reused. History is keyed on
+  the workspace's checkout path where herdr reports one, so a series survives an
+  id it shares with somebody else tomorrow. A workspace with no worktree has no
+  such key: for those, a label that changes under an id is treated as a different
+  workspace and the recorded buckets are dropped rather than attributed to it —
+  an empty sparkline is a visible loss, a wrong one is not.
 - Changing `bucket_seconds` invalidates the recorded history, which is discarded
   with a message on the next run. Two bucket scales cannot share one series.
 

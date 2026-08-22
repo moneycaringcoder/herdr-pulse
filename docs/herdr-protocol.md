@@ -262,11 +262,16 @@ Honest list of what this plugin assumes rather than checked:
 
 - **Workspace id stability across a server restart.** herdr's ids (`w1D`, `wM`)
   are session-scoped and nothing observed here says whether a fresh server
-  reissues them to different workspaces. The store therefore keys history on the
-  id *and* the label, and drops a workspace's buckets when the label for an id
-  changes. If ids turn out to be durable, that guard costs an occasional reset
-  after a rename; if they turn out to be recycled, it is the only thing
-  preventing one workspace's history from being shown under another's name.
+  reissues them to different workspaces, so the store does not rely on the
+  answer. It keys history on `workspaces[].worktree.checkout_path`, which names
+  the same checkout in every session, and falls back to the id *and* the label
+  for a workspace herdr reports no worktree for — dropping that workspace's
+  buckets when the label under an id changes. Whether ids turn out to be durable
+  or recycled, no series is attributed on the strength of an id alone.
+- **Whether two workspaces can share one checkout path.** Nothing observed says
+  they cannot, and the three worktrees in the capture are distinct, so a path
+  seen twice in one snapshot is treated as no identity at all rather than as a
+  reason to merge two workspaces' histories.
 - **`blocked` in a real snapshot.** The status appears in the server's schema and
   in the write-side enum, but no agent in the observed session entered it during
   the capture window, so the fixture carrying it is structurally real with that
