@@ -2914,9 +2914,9 @@ fn a_fold_of_an_impossible_anchor_reads_as_gaps_rather_than_panicking() {
         &one(base, "w15", "api", &[("w15:p1", "working", 10)]),
         &written,
     );
-    // A hand-edited anchor at the end of the number line. Folding multiplies
-    // bucket numbers back up, which is exactly where an unchecked multiply would
-    // wrap and draw somebody else's minutes.
+    // A hand-edited anchor at the end of the number line, which is where the
+    // fold's arithmetic — dividing it down and multiplying groups back up — is
+    // most likely to wrap and draw somebody else's minutes.
     let mut value = serde_json::to_value(&history).unwrap();
     value["workspaces"][0]["newest_bucket"] = serde_json::json!(u64::MAX);
     std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
@@ -2924,11 +2924,10 @@ fn a_fold_of_an_impossible_anchor_reads_as_gaps_rather_than_panicking() {
     let live = config(300, 16, 8);
     let loaded = history::load_from(dir.path(), &live);
 
-    let projected = series(&loaded, base + 3 * 300, 4, &live);
-    assert!(
-        projected.iter().all(Option::is_none),
-        "an anchor that cannot be believed projects nothing: {projected:?}"
-    );
+    // Every group around an anchor nobody can believe reads as a gap, so the
+    // fold keeps nothing and the load says so rather than returning a store full
+    // of workspace names with no observations behind them.
+    assert_eq!(loaded, History::empty(&live));
 }
 
 #[test]
@@ -3036,18 +3035,14 @@ fn a_fold_that_keeps_nothing_says_the_history_is_gone() {
     let live = config(3_600, 16, 8);
     let loaded = history::load_from(dir.path(), &live);
 
-    let observed = loaded
-        .workspaces
-        .iter()
-        .flat_map(|workspace| workspace.buckets.iter())
-        .filter(|bucket| bucket.samples > 0)
-        .count();
+    // A fold that keeps nothing is a discard, and the store has to agree with
+    // the message: workspace names attached to no observations at all would draw
+    // rows claiming a last-seen time beside a sparkline with nothing in it.
     assert_eq!(
-        observed, 0,
+        loaded,
+        History::empty(&live),
         "an hour that was watched for four minutes is not an observed hour"
     );
-    let series = series(&loaded, base + 3 * 60, 4, &live);
-    assert!(series.iter().all(Option::is_none), "{series:?}");
 }
 
 #[test]
@@ -3056,20 +3051,31 @@ fn a_recorded_bucket_width_no_run_could_write_is_discarded_not_folded() {
     let written = config(60, 16, 8);
     let base = group_start();
     let mut history = History::empty(&written);
-    history.record(
-        &one(base, "w15", "api", &[("w15:p1", "working", 10)]),
-        &written,
-    );
+    // Consecutive minutes, so adjacent bucket numbers are all observed and a
+    // fold of two would succeed if it were allowed to happen.
+    for minute in 0..6u64 {
+        history.record(
+            &one(
+                base + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &written,
+        );
+    }
 
-    // `Config::clamp` pins every run to 10..=3600 seconds, so a zero can only
-    // come from a hand-edited or damaged file. Folding by a factor derived from
-    // it would divide bucket numbers computed at an unknown scale and re-lay
-    // real-looking bars in invented minutes.
+    // `Config::clamp` pins every run to 10..=3600 seconds, so five can only come
+    // from a hand-edited or damaged file. Against a live width of ten it divides
+    // exactly, and the buckets beside it are consecutive, so the arithmetic would
+    // happily fold pairs of them and keep the result — real-looking bars laid out
+    // in minutes that never existed, because the numbers were computed at 60s and
+    // the file now claims 5s.
     let mut value = serde_json::to_value(&history).unwrap();
-    value["bucket_seconds"] = serde_json::json!(0);
+    value["bucket_seconds"] = serde_json::json!(5);
     std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
 
-    let live = config(300, 16, 8);
+    let live = config(10, 16, 8);
     assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
 }
 

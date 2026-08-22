@@ -356,15 +356,15 @@ impl WorkspaceHistory {
         let mut kept = 0usize;
         for number in oldest..=newest {
             // No overflow to check on the way up: `number <= newest_bucket /
-            // factor`, so `number * factor <= newest_bucket`. The addition below
-            // is a different matter — it walks past the group's first bucket.
+            // factor`, so `number * factor <= newest_bucket`.
             let first = number * factor;
             let mut folded = Bucket::default();
             let mut missed = false;
             for step in 0..factor {
-                // A `newest_bucket` read off disk can sit anywhere in the number
-                // line, including at its very end, and a group that runs past it
-                // must stop rather than wrap into somebody else's minutes.
+                // The same division identity says `first + factor - 1` cannot
+                // pass `newest_bucket` either, so this is belt and braces. It
+                // costs nothing, and the alternative if that reasoning is ever
+                // wrong is an arithmetic panic in somebody's sidebar.
                 let Some(old) = first.checked_add(step) else {
                     break;
                 };
@@ -1242,6 +1242,12 @@ pub fn load_from(dir: &Path, config: &Config) -> History {
                         path.display(),
                         config.bucket_seconds
                     );
+                    // The message and the store have to agree. Every ring came
+                    // back a gap, so what is left is workspace names attached to
+                    // no observations at all; keeping them would draw rows that
+                    // claim a last-seen time beside a sparkline with nothing in
+                    // it, under a line that says the history is gone.
+                    return History::empty(config);
                 }
             }
             None => {
