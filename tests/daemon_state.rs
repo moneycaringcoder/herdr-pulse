@@ -856,6 +856,13 @@ fn recognised_arguments_are_forwarded_to_the_detached_child() {
         daemon::forwarded_args(&owned(&["--interval="])).expect("forward"),
         owned(&["--interval", ""])
     );
+    // A reading window is not a recording setting. Forwarding it would make the
+    // sampler behave differently for the rest of its life because of how
+    // somebody once looked at a pane.
+    assert_eq!(
+        daemon::forwarded_args(&owned(&["--enable", "--since", "30m"])).expect("forward"),
+        Vec::<String>::new()
+    );
 
     assert!(daemon::forwarded_args(&owned(&["--enable", "--interval"])).is_err());
 }

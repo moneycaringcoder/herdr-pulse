@@ -328,11 +328,17 @@ impl PaneView {
         }
     }
 
-    fn week() -> Self {
+    /// The week's own scale, which `--since` can narrow. Derived from the
+    /// window rather than the constants: a legend saying six hours a column
+    /// over a row of hourly columns mislabels its own axis by a factor of six,
+    /// and a column count that disagrees with the series silently drops the
+    /// scale line altogether.
+    fn week(config: &Config) -> Self {
+        let window = week_window(config);
         Self {
             name: Some("week view"),
-            columns: WEEK_COLUMNS,
-            seconds_per_column: (WEEK_BUCKETS_PER_COLUMN as u64)
+            columns: window.columns,
+            seconds_per_column: (window.buckets_per_column as u64)
                 .saturating_mul(WEEK_BUCKET_SECONDS),
         }
     }
@@ -554,7 +560,7 @@ pub fn week_pane(
         // the week view remains aggregate-only.
         workspace.agents.clear();
     }
-    render_pane(&activity, config, as_of, session, PaneView::week())
+    render_pane(&activity, config, as_of, session, PaneView::week(config))
 }
 
 /// The live herdr identity, when both locating and fingerprinting its socket
@@ -571,9 +577,11 @@ fn live_session() -> Option<SessionMark> {
 pub fn run_once(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let session = live_session();
-    let (columns, buckets_per_column) = pane_geometry(config);
-    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    let window = fine_window(config);
+    let activity =
+        history::load(config).activity(as_of, window.columns, window.buckets_per_column, config);
     print!("{}", pane(&activity, config, as_of, session.as_ref()));
+    report_window(&window, config.bucket_seconds, config.retention_buckets);
 
     // A stopped sampler can leave either an empty report or a convincing stretch
     // of saved history. Say what stopped in both cases. On stderr, so
@@ -588,14 +596,63 @@ pub fn run_once(config: &Config) -> Result<()> {
 pub fn run_week(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let session = live_session();
-    let (columns, buckets_per_column) = pane_geometry(config);
-    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    // Each ring answers `--since` in its own units: the fine geometry still
+    // drives the store's fine projection, and the week's window is computed
+    // against the week ring's hours.
+    let fine = fine_window(config);
+    let week = week_window(config);
+    let activity = history::load(config).activity_with(
+        as_of,
+        (fine.columns, fine.buckets_per_column),
+        (week.columns, week.buckets_per_column),
+        config,
+    );
     print!("{}", week_pane(&activity, config, as_of, session.as_ref()));
+    report_window(
+        &week,
+        crate::config::WEEK_BUCKET_SECONDS,
+        crate::config::WEEK_RETENTION_BUCKETS,
+    );
 
     if let Some(message) = sampler_stop_message(current_sampler_stop().as_ref(), as_of) {
         eprintln!("pulse: {message}");
     }
     Ok(())
+}
+
+/// What a `--since` request asked for that the ring could not honour exactly.
+///
+/// Empty when the window was honoured as asked, which is the ordinary case.
+/// Separate from the printing because `--watch` clears the screen on every
+/// frame: a note printed once before the loop is erased milliseconds later, so
+/// that verb has to redraw it inside each frame instead.
+fn window_notes(window: &PaneWindow, bucket_seconds: u64, retention_buckets: usize) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(asked) = window.older_than_retention {
+        let retained = (retention_buckets as u64).saturating_mul(bucket_seconds.max(1));
+        notes.push(format!(
+            "asked for {}, and pulse retains {} here; the pane starts where the \
+             recorded history does, and the time before it is not quiet, it is not kept.",
+            duration(Some(asked)),
+            duration(Some(retained))
+        ));
+    }
+    if window.widened_to_bucket {
+        notes.push(format!(
+            "that window is shorter than one {} bucket, so the pane draws one bucket; \
+             there is no finer resolution recorded to narrow to.",
+            duration(Some(bucket_seconds.max(1)))
+        ));
+    }
+    notes
+}
+
+/// [`window_notes`] on stderr, beside the pane rather than inside it: the pane's
+/// business is the history, and a note about the request is not history.
+fn report_window(window: &PaneWindow, bucket_seconds: u64, retention_buckets: usize) {
+    for note in window_notes(window, bucket_seconds, retention_buckets) {
+        eprintln!("pulse: {note}");
+    }
 }
 
 /// `--json`: the recorded history as machine-readable JSON.
@@ -636,8 +693,13 @@ pub fn run_json(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let session = live_session();
     let stop = current_sampler_stop();
-    let (columns, buckets_per_column) = pane_geometry(config);
+    let window = fine_window(config);
+    let (columns, buckets_per_column) = (window.columns, window.buckets_per_column);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    // On stderr, so `pulse --json | jq` still reads one clean document. The
+    // document's own `columns` and `seconds_per_column` describe what was drawn
+    // truthfully either way; this says what was asked for and could not be.
+    report_window(&window, config.bucket_seconds, config.retention_buckets);
     let document = json_document(
         config,
         as_of,
@@ -816,7 +878,13 @@ pub fn run_watch(config: &Config) -> Result<()> {
         return Err(no_sampler_error(current_sampler_stop().as_ref(), crate::now_unix()).into());
     }
 
-    let (columns, buckets_per_column) = pane_geometry(config);
+    let window = fine_window(config);
+    let (columns, buckets_per_column) = (window.columns, window.buckets_per_column);
+    // Inside every frame, not once before the loop: the first frame clears the
+    // screen, so a note printed ahead of it is erased before anyone reads it.
+    // Repeating it costs nothing, because each frame repaints from the top
+    // rather than scrolling.
+    let notes = window_notes(&window, config.bucket_seconds, config.retention_buckets);
     let mut out = std::io::stdout();
     loop {
         // Re-checked every cycle, not just at startup. A sampler that dies under
@@ -849,6 +917,9 @@ pub fn run_watch(config: &Config) -> Result<()> {
             "\nrefreshing every {} — ctrl-c to stop",
             duration(Some(config.interval.as_secs()))
         )?;
+        for note in &notes {
+            writeln!(out, "pulse: {note}")?;
+        }
         out.flush()?;
         std::thread::sleep(config.interval);
     }
@@ -891,6 +962,22 @@ fn sampler_is_running() -> bool {
     daemon::live_pid().is_some()
 }
 
+/// What a pane will draw: its geometry, and anything about the request that the
+/// reader has to be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneWindow {
+    pub columns: usize,
+    pub buckets_per_column: usize,
+    /// The window asked for reached further back than the ring retains. The
+    /// columns beyond it are gaps, and a gap means "not observed" — which is
+    /// true, but not the whole truth here, so the pane says which.
+    pub older_than_retention: Option<u64>,
+    /// The window asked for was narrower than one bucket, so it was widened to
+    /// one. Drawing a 5-second window from 60-second buckets would claim a
+    /// resolution the store does not have.
+    pub widened_to_bucket: bool,
+}
+
 /// How many pane columns to ask the store for, and how many buckets each one
 /// aggregates.
 ///
@@ -900,9 +987,97 @@ fn sampler_is_running() -> bool {
 /// retention draws a short row rather than a long row of gaps that were never
 /// recordable in the first place.
 pub fn pane_geometry(config: &Config) -> (usize, usize) {
+    let window = fine_window(config);
+    (window.columns, window.buckets_per_column)
+}
+
+/// The fine ring's window: what `--once`, `--watch` and `--json` draw.
+pub fn fine_window(config: &Config) -> PaneWindow {
     let columns = PANE_COLUMNS.min(config.retention_buckets).max(1);
-    let buckets_per_column = (config.retention_buckets / columns).max(1);
-    (columns, buckets_per_column)
+    let full = (columns, (config.retention_buckets / columns).max(1));
+    pane_window(
+        config,
+        config.bucket_seconds,
+        config.retention_buckets,
+        full,
+    )
+}
+
+/// The week ring's window. Its full geometry is fixed, because the ring is.
+pub fn week_window(config: &Config) -> PaneWindow {
+    pane_window(
+        config,
+        crate::config::WEEK_BUCKET_SECONDS,
+        crate::config::WEEK_RETENTION_BUCKETS,
+        (
+            crate::config::WEEK_COLUMNS,
+            crate::config::WEEK_BUCKETS_PER_COLUMN,
+        ),
+    )
+}
+
+/// [`pane_geometry`] for one ring, honouring `--since`.
+///
+/// `bucket_seconds` and `retention_buckets` are the ring's, not always the
+/// config's: the week pane asks the same question of a ring with hours in it,
+/// and `full` is the geometry that ring draws when nobody narrows it.
+///
+/// Three things this refuses to do quietly. A window longer than the ring
+/// retains is drawn at the ring's length and *reported*, because silently
+/// starting where the data happens to begin answers a question the user did not
+/// ask. A window shorter than one bucket is widened to one and reported, because
+/// the store has no finer resolution to honour. And a window that rounds to no
+/// columns at all never happens: there is always at least one, so an empty
+/// window and a window full of gaps stay different things — the first cannot
+/// occur, and the second draws gap glyphs like anywhere else.
+pub fn pane_window(
+    config: &Config,
+    bucket_seconds: u64,
+    retention_buckets: usize,
+    full: (usize, usize),
+) -> PaneWindow {
+    let bucket_seconds = bucket_seconds.max(1);
+    let retained = (retention_buckets as u64).saturating_mul(bucket_seconds);
+    let Some(asked) = config.since_seconds else {
+        // Unnarrowed, the ring draws exactly what it has always drawn. Deriving
+        // it here instead would re-answer a question two callers have already
+        // answered, and a week that came back 32 columns wide when the week is
+        // 28 columns would be this function inventing history it does not have.
+        return PaneWindow {
+            columns: full.0.max(1),
+            buckets_per_column: full.1.max(1),
+            older_than_retention: None,
+            widened_to_bucket: false,
+        };
+    };
+
+    // Round up: a window of 90 seconds over 60-second buckets covers two
+    // buckets, not one and a half, and drawing one would leave out the half the
+    // user asked for.
+    let wanted = asked.min(retained).max(bucket_seconds);
+    let buckets = (wanted.div_ceil(bucket_seconds).max(1) as usize).min(retention_buckets.max(1));
+
+    // Widen the columns first, then take only as many as the window fills.
+    // Rounding the width up and keeping every column would reach past the ring
+    // by up to a column, and those buckets are not gaps in the recording - they
+    // are time this ring never had a slot for. A row of them would read as an
+    // outage that never happened.
+    let buckets_per_column = buckets.div_ceil(full.0.max(1)).max(1);
+    // Capped at the columns the ring can actually fill. Rounding the count up
+    // and keeping it would draw up to a column of buckets the ring never had a
+    // slot for, and the legend beside them would state a span wider than the
+    // retention that produced it. Losing under a column at the far edge is the
+    // same rounding an unnarrowed pane has always accepted.
+    let columns = buckets
+        .div_ceil(buckets_per_column)
+        .min((retention_buckets / buckets_per_column).max(1))
+        .max(1);
+    PaneWindow {
+        columns,
+        buckets_per_column,
+        older_than_retention: (asked > retained).then_some(asked),
+        widened_to_bucket: asked < bucket_seconds,
+    }
 }
 
 /// Time of day in UTC.

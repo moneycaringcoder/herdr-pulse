@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `--since <WINDOW>` narrows `--once`, `--watch`, `--json` and `--week` to a
+  requested reading window without changing what the sampler records. Each ring
+  answers in its own bucket size and rounds the window up to at least one
+  bucket. A window beyond retention draws only the recorded history, never
+  invented quiet time; a window shorter than one bucket draws that one bucket.
+  Both limits are explained on standard error.
 - Tag-triggered release automation. Pushing `vX.Y.Z` runs the full suite on
   Linux and macOS and publishes the GitHub release with notes taken from that
   version's changelog section — but only after an identity gate has confirmed

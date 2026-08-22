@@ -181,6 +181,15 @@ pulse --once
 | `seen` | How long ago that observation was. |
 | `agents` | Agents in the workspace at that observation. |
 
+`--since <WINDOW>` narrows the history read by `--once`, `--watch`, `--json`
+and `--week`. Each ring answers in its own units: the fine ring uses
+`bucket_seconds`, while `--week --since 2d` draws two days of the hourly ring.
+It is a reading setting and never changes what the sampler records, so there is
+no config-file key for it. If the window reaches past retention, pulse says on
+standard error that the pane starts where the recorded history does; the time
+before it is not drawn as quiet. If the window is narrower than one bucket,
+pulse draws one bucket and says that there is no finer resolution recorded.
+
 `--agents` governs *recording*, not display: it tells the sampler to keep a
 separate ring per agent. The panes then draw one indented line per recorded
 agent under its workspace whenever those rings exist, whether or not the switch
@@ -310,6 +319,7 @@ time, and `is_current` per workspace, plus the live session at the top level.
 | `--bucket-seconds <SECS>` | Wall clock per history bucket (default 60). |
 | `--retention-buckets <N>` | Buckets retained per workspace (default 240). |
 | `--columns <N>` | Sparkline columns in the badge (default 8). |
+| `--since <WINDOW>` | Narrow the pane views: 90s, 30m, 2h, 3d (default: all). |
 | `--agents` | Record separate per-agent rings, used by `--once` and `--watch`. Off by default. |
 | `--version` | Print version and exit. |
 | `--help` | Show help. |

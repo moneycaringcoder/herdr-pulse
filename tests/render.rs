@@ -10,13 +10,13 @@
 
 use std::time::Duration;
 
-use pulse::config::{Config, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
+use pulse::config::{Config, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
 use pulse::daemon::{SamplerStop, StopReason};
 use pulse::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
-    badge, display_width, duration, json_document, pane, pane_geometry, sampler_stop_message,
-    sparkline, staleness_tolerance, state_glyph, week_pane, SamplerState, GAP, QUIET, RAMP,
-    TRANSITION_MARKER,
+    badge, display_width, duration, fine_window, json_document, pane, pane_geometry,
+    sampler_stop_message, sparkline, staleness_tolerance, state_glyph, week_pane, week_window,
+    SamplerState, GAP, QUIET, RAMP, TRANSITION_MARKER,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -1897,6 +1897,182 @@ fn pane_geometry_never_asks_for_more_columns_than_there_are_buckets() {
         assert!(columns <= retention.max(1), "retention {retention}");
         assert!(columns <= 32);
     }
+}
+
+/// A config narrowed to `since`, with everything else left at the defaults.
+fn since(seconds: u64) -> Config {
+    Config {
+        since_seconds: Some(seconds),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn an_unnarrowed_pane_draws_exactly_what_it_always_drew() {
+    // The defaults are 240 one-minute buckets over 32 columns, and a fixed week
+    // of 168 hours over 28 six-hour columns. `--since` arriving must not move
+    // either of them by a bucket.
+    let config = Config::default();
+    let fine = fine_window(&config);
+    let week = week_window(&config);
+
+    assert_eq!((fine.columns, fine.buckets_per_column), (32, 7));
+    assert_eq!(
+        (week.columns, week.buckets_per_column),
+        (WEEK_COLUMNS, WEEK_BUCKETS_PER_COLUMN)
+    );
+    assert_eq!(fine.older_than_retention, None);
+    assert!(!fine.widened_to_bucket);
+}
+
+#[test]
+fn a_window_covers_the_time_it_asks_for_and_no_less() {
+    // Rounded up, in both the bucket count and the column arithmetic: a window
+    // that came back short would draw a stretch the user did not ask about and
+    // silently drop the part they did.
+    for seconds in [60u64, 61, 90, 600, 3_600, 4 * 3_600] {
+        let window = fine_window(&since(seconds));
+        let covered = (window.columns as u64)
+            .saturating_mul(window.buckets_per_column as u64)
+            .saturating_mul(60);
+        assert!(
+            covered >= seconds,
+            "asked for {seconds}s, covered {covered}s"
+        );
+        assert!(window.columns >= 1 && window.buckets_per_column >= 1);
+    }
+}
+
+#[test]
+fn a_window_past_retention_is_reported_rather_than_quietly_shortened() {
+    // The pane can only start where the recorded history does. Starting there
+    // without a word would answer "was it quiet before lunch?" with a sparkline
+    // that never had lunch in it.
+    let window = fine_window(&since(6 * 3_600));
+
+    assert_eq!(window.older_than_retention, Some(6 * 3_600));
+    let covered = window.columns * window.buckets_per_column;
+    let retention = Config::default().retention_buckets;
+    assert!(
+        covered <= retention,
+        "a row never reaches past the ring: {covered} of {retention} buckets"
+    );
+    assert!(
+        covered > retention - window.buckets_per_column,
+        "and draws everything the ring has, bar the rounding: {covered} buckets"
+    );
+}
+
+#[test]
+fn no_window_ever_draws_a_bucket_the_ring_never_had() {
+    // A column past the end of the ring is not an outage: it is time the ring
+    // never had a slot for, and it would render as a gap glyph saying nobody
+    // was watching. The legend beside it would state a span wider than the
+    // retention that produced it.
+    for retention in [1usize, 7, 32, 33, 240, 241, 993, 1_000, 10_000] {
+        for asked in [1u64, 59, 60, 61, 600, 3_600, 4 * 3_600, 30 * 86_400] {
+            let config = Config {
+                retention_buckets: retention,
+                since_seconds: Some(asked),
+                ..Config::default()
+            };
+            let window = fine_window(&config);
+            let covered = window.columns * window.buckets_per_column;
+            assert!(
+                covered <= retention.max(1),
+                "retention {retention}, since {asked}s: drew {covered} buckets"
+            );
+            assert!(window.columns >= 1 && window.buckets_per_column >= 1);
+        }
+    }
+}
+
+#[test]
+fn a_window_narrower_than_a_bucket_is_widened_and_says_so() {
+    // Five seconds of a sixty-second bucket is not a fifth of a bar; the store
+    // has no such thing. One bucket is the honest answer, and the note is what
+    // keeps it from looking like the five seconds were drawn.
+    let window = fine_window(&since(5));
+
+    assert!(window.widened_to_bucket);
+    assert_eq!((window.columns, window.buckets_per_column), (1, 1));
+    assert_eq!(window.older_than_retention, None);
+}
+
+#[test]
+fn a_narrow_window_still_has_a_column_to_draw_gaps_in() {
+    // There is no such thing as an empty window: a window nobody watched has to
+    // stay distinguishable from one that does not exist, and it is the gap
+    // glyphs in its columns that say so.
+    for seconds in [1u64, 5, 59, 60] {
+        let window = fine_window(&since(seconds));
+        assert_eq!(window.columns, 1, "{seconds}s");
+        let drawn = sample_pane(vec![activity(
+            "web",
+            vec![None; window.columns],
+            AgentState::Unknown,
+            None,
+            0,
+        )]);
+        assert!(
+            drawn.contains(GAP),
+            "a window nobody watched draws gaps, not nothing: {drawn}"
+        );
+    }
+}
+
+#[test]
+fn the_week_answers_since_in_its_own_hours() {
+    // Two days of a ring with an hour per bucket is 48 buckets, not 48 minutes,
+    // and it is 48 whether or not the ring's own width divides them evenly.
+    // Pinned exactly rather than bounded: a week that ignored `--since` and
+    // handed back all 168 hours would satisfy every "at least this much" test
+    // there is.
+    let window = week_window(&since(2 * 86_400));
+
+    assert_eq!(
+        window.columns * window.buckets_per_column,
+        48,
+        "two days of an hourly ring is 48 buckets"
+    );
+    assert_eq!((window.columns, window.buckets_per_column), (24, 2));
+    assert_eq!(window.older_than_retention, None);
+    assert!(!window.widened_to_bucket, "two days is many hours");
+}
+
+#[test]
+fn the_week_legend_states_the_scale_the_week_actually_drew() {
+    // A narrowed week under a legend reading "one column = 6h00" mislabels its
+    // own axis by a factor of six, and a column count that disagrees with the
+    // series drops the scale line entirely. Both are the pane claiming history
+    // it does not hold.
+    let config = since(2 * 86_400);
+    let window = week_window(&config);
+    let mut workspace = activity("web", vec![None; 8], AgentState::Working, Some(60), 1);
+    workspace.week = vec![Some(Level(4)); window.columns];
+
+    let rendered = week_pane(&[workspace], &config, AS_OF, None);
+
+    assert!(
+        rendered.contains("one column = 2h00"),
+        "the legend states the narrowed scale: {rendered}"
+    );
+    assert!(
+        !rendered.contains("one column = 6h00"),
+        "and not the unnarrowed one: {rendered}"
+    );
+}
+
+#[test]
+fn a_week_window_past_the_week_is_reported_too() {
+    // The week ring is 168 hours whatever anyone asks for.
+    let window = week_window(&since(30 * 86_400));
+
+    assert_eq!(window.older_than_retention, Some(30 * 86_400));
+    assert_eq!(
+        (window.columns, window.buckets_per_column),
+        (WEEK_COLUMNS, WEEK_BUCKETS_PER_COLUMN)
+    );
 }
 
 #[test]

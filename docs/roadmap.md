@@ -31,8 +31,3 @@ use it rather than assuming the tightest case.
 `--json` already distinguishes gaps as `null` from observed-quiet as `0`, which is
 the distinction the whole plugin exists to preserve. A schema version makes that
 contract explicit for anything scripting against it.
-
-### `--since` in the pane views
-
-The panes draw the full retention. Narrowing to a window is a small addition and
-the obvious next question once someone is looking at four hours of history.

@@ -339,6 +339,75 @@ fn no_verb_panics_without_a_server() {
     }
 }
 
+#[test]
+fn a_since_window_is_read_as_a_window_or_refused_outright() {
+    // The window is the one argument whose spelling can quietly mean something
+    // else: `--since 2` meaning two seconds when two hours were wanted is a
+    // plausible wrong answer, and a rejected unit is how it stays impossible.
+    let temp = TempDir::new("since");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    for window in ["90s", "30m", "2h", "3d", "600"] {
+        let out = run_plugin(&["--once", "--since", window], temp.path(), &state);
+        assert_clean_exit(&out, &["--once", "--since", window], "a window");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`pulse --once --since {window}` should be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Refused rather than defaulted: a window pulse does not understand is a
+    // question it must not answer with the whole retention and no comment.
+    for window in ["0", "2w", "later", "-5m", ""] {
+        let out = run_plugin(&["--once", "--since", window], temp.path(), &state);
+        assert_clean_exit(&out, &["--once", "--since", window], "a bad window");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "`pulse --once --since {window}` should be refused",
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--since"),
+            "the refusal has to name the option: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_window_the_ring_cannot_honour_is_said_out_loud() {
+    // The pane draws what it has. What it does not have has to be a sentence,
+    // not a shorter row the reader is left to notice.
+    let temp = TempDir::new("since-edges");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let past = run_plugin(&["--once", "--since", "30d"], temp.path(), &state);
+    let stderr = String::from_utf8_lossy(&past.stderr);
+    assert!(
+        stderr.contains("not kept"),
+        "a window past retention says the time before it was not kept: {stderr}"
+    );
+
+    let narrow = run_plugin(&["--once", "--since", "5s"], temp.path(), &state);
+    let stderr = String::from_utf8_lossy(&narrow.stderr);
+    assert!(
+        stderr.contains("shorter than one"),
+        "a window under one bucket says it was widened: {stderr}"
+    );
+
+    // And the ordinary case says nothing at all about the window.
+    let plain = run_plugin(&["--once", "--since", "30m"], temp.path(), &state);
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !stderr.contains("not kept") && !stderr.contains("shorter than one"),
+        "an honoured window is not worth a sentence: {stderr}"
+    );
+}
+
 /// Every verb that needs no socket.
 const VERBS: [[&str; 1]; 8] = [
     ["--help"],

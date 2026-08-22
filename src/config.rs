@@ -134,6 +134,15 @@ pub struct Config {
     /// per-agent history from that moment: the minutes before it read as gaps,
     /// which is what they are.
     pub per_agent_series: bool,
+    /// How far back the pane views should draw, or `None` for the whole
+    /// retention.
+    ///
+    /// A reading setting, not a recording one: it narrows what a pane shows and
+    /// changes nothing about what the sampler keeps. It is therefore not
+    /// forwarded to the daemon and not read from the config file — a window is
+    /// what you want *this time you look*, and a permanent one is what
+    /// `retention_buckets` already is.
+    pub since_seconds: Option<u64>,
 }
 
 impl Default for Config {
@@ -146,6 +155,7 @@ impl Default for Config {
             badge_window_minutes: DEFAULT_BADGE_WINDOW_MINUTES,
             max_workspaces: DEFAULT_MAX_WORKSPACES,
             per_agent_series: false,
+            since_seconds: None,
         }
     }
 }
@@ -280,6 +290,9 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
             return Err("--agents takes no value".into());
         }
     }
+    if let Some(raw) = value_arg(args, "--since")? {
+        config.since_seconds = Some(parse_window(&raw)?);
+    }
     config.clamp();
     Ok(config)
 }
@@ -288,6 +301,36 @@ fn parse_number(raw: &str, name: &str) -> Result<u64> {
     raw.trim()
         .parse::<u64>()
         .map_err(|err| format!("{name} {raw}: {err}").into())
+}
+
+/// A `--since` window: a count with an optional unit, `s` `m` `h` or `d`.
+///
+/// Bare digits are seconds, matching the other numeric options, and the units
+/// exist because the answer to "how far back" is `2h` far more often than it is
+/// `7200`. A zero or a unit nobody recognises is an error rather than a silent
+/// fallback to the whole retention: the user typed a window, and quietly
+/// drawing four hours when they asked for something else is the kind of
+/// plausible wrong answer this plugin refuses everywhere else.
+fn parse_window(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    let (digits, multiplier) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 3_600),
+        Some('d') => (&raw[..raw.len() - 1], 86_400),
+        Some(last) if last.is_ascii_digit() => (raw, 1),
+        _ => return Err(format!("--since {raw}: expected a count and s, m, h or d").into()),
+    };
+    let count: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|err| format!("--since {raw}: {err}"))?;
+    if count == 0 {
+        return Err("--since 0: a window has to contain something".into());
+    }
+    count
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("--since {raw}: that is longer than time").into())
 }
 
 /// The on-disk form. Every field is optional so a partial file overrides only
