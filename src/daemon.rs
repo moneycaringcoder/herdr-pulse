@@ -69,14 +69,22 @@ const STOP_POLL: Duration = Duration::from_millis(25);
 /// even with a long sampling interval.
 const LOOP_TICK: Duration = Duration::from_millis(250);
 
-/// Arguments the detached child is given a copy of. It re-reads the config file
-/// but never sees the user's command line.
+/// Valued options the detached child is given a copy of. It re-reads the config
+/// file but never sees the user's command line.
 pub const FORWARDED: [&str; 4] = [
     "--interval",
     "--bucket-seconds",
     "--retention-buckets",
     "--columns",
 ];
+
+/// Bare switches the child needs too.
+///
+/// Separate from [`FORWARDED`] because they take no value, and folded in for the
+/// same reason the valued ones are: `--agents` changes what the sampler
+/// *records*, so a `pulse --enable --agents` that did not reach the child would
+/// quietly record nothing and leave the user reading empty agent rows.
+pub const FORWARDED_SWITCHES: [&str; 1] = ["--agents"];
 
 /// Why the last sampler run ended, as far as it was able to say.
 ///
@@ -860,6 +868,15 @@ pub fn forwarded_args(args: &[String]) -> Result<Vec<String>> {
     let mut forwarded = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
+        if let Some(switch) = FORWARDED_SWITCHES.into_iter().find(|switch| arg == switch) {
+            // Once, however many times the user typed it: a repeated switch is
+            // the same instruction, and a child argv that grows with it is a
+            // child argv nobody can read in `ps`.
+            if !forwarded.iter().any(|held| held == switch) {
+                forwarded.push(switch.to_string());
+            }
+            continue;
+        }
         let Some(name) = FORWARDED.into_iter().find(|name| {
             arg == name
                 || arg

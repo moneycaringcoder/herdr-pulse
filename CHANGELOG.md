@@ -33,6 +33,17 @@ All notable changes to this project are documented here. The format follows
   fields. At the defaults, 8 workspaces × (240 fine + 168 week) buckets measure
   about 180 KB; the week ring is `168 / (240 + 168) ≈ 41%`, roughly 40%, of the
   history file.
+- The `--once` and `--watch` pane views can now show a separate series for
+  each recorded agent. Recording is opt-in through the bare `--agents` switch
+  or the `per_agent_series` config key, and is off by default: an agent ring is
+  as long as the fine ring and a workspace can retain up to four of them, so
+  recording the rings multiplies what that workspace costs on disk and in every
+  cycle's history rewrite. The cap is four agents per workspace, with the least
+  recently seen evicted first.
+
+  The sidebar badge keeps its single aggregate line. An agent first seen
+  partway through the window has gaps before its first observation, so its line
+  reads as absent-then-present rather than quiet-then-active.
 - The pane now reports `blocked`, an estimate of how long an agent was observed
   blocked, and `--json` adds `blocked_seconds` alongside `watched_seconds` for
   every workspace. For each observed bucket, pulse multiplies the bucket

@@ -1317,6 +1317,390 @@ fn the_week_reports_its_own_blocked_time_and_not_the_afternoons() {
     assert_eq!(activity.week_watched_seconds, 3_600);
 }
 
+// ---------------------------------------------------------------------------
+// Per-agent series
+// ---------------------------------------------------------------------------
+
+fn per_agent(bucket_seconds: u64, retention_buckets: usize, max_workspaces: usize) -> Config {
+    Config {
+        per_agent_series: true,
+        ..config(bucket_seconds, retention_buckets, max_workspaces)
+    }
+}
+
+/// A sample of one workspace with several agents in it.
+fn crowd(taken_at: u64, agents: &[(&str, &str, u64)]) -> Sample {
+    sample(taken_at, vec![workspace("w15", "api", agents)])
+}
+
+#[test]
+fn nothing_per_agent_is_recorded_unless_it_is_turned_on() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &crowd(T0, &[("w15:p1", "working", 10), ("w15:p2", "idle", 11)]),
+        &config,
+    );
+
+    assert!(
+        history.workspaces[0].agents.is_empty(),
+        "an agent ring is as long as the fine one; nobody pays for four of them \
+         by accident"
+    );
+    assert!(history.activity(T0, 8, 1, &config)[0].agents.is_empty());
+}
+
+#[test]
+fn each_agent_gets_its_own_series_when_it_is_turned_on() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..3u64 {
+        history.record(
+            &crowd(
+                T0 + minute * 60,
+                &[("w15:p1", "working", 10 + minute), ("w15:p2", "idle", 500)],
+            ),
+            &config,
+        );
+    }
+
+    let activity = &history.activity(T0 + 2 * 60, 3, 1, &config)[0];
+    assert_eq!(activity.agents.len(), 2);
+    let busy = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p1")
+        .expect("the working agent");
+    let quiet = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the idle agent");
+
+    assert!(
+        busy.series.iter().all(|c| c.is_some_and(|l| !l.is_quiet())),
+        "the agent that was working: {:?}",
+        busy.series
+    );
+    assert!(
+        quiet.series.iter().all(|c| c == &Some(Level(0))),
+        "the agent that was idle, observed and quiet rather than absent: {:?}",
+        quiet.series
+    );
+    assert_eq!(busy.state, AgentState::Working);
+    assert_eq!(quiet.state, AgentState::Idle);
+    assert_eq!(busy.program.as_deref(), Some("claude"));
+}
+
+#[test]
+fn an_agent_that_arrived_partway_is_absent_before_it_and_present_after() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // One agent for two minutes, then a second joins for two more.
+    for minute in 0..2u64 {
+        history.record(
+            &crowd(T0 + minute * 60, &[("w15:p1", "working", 10 + minute)]),
+            &config,
+        );
+    }
+    for minute in 2..4u64 {
+        history.record(
+            &crowd(
+                T0 + minute * 60,
+                &[
+                    ("w15:p1", "working", 10 + minute),
+                    ("w15:p2", "working", 50 + minute),
+                ],
+            ),
+            &config,
+        );
+    }
+
+    let activity = &history.activity(T0 + 3 * 60, 4, 1, &config)[0];
+    let latecomer = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the agent that joined");
+
+    assert_eq!(
+        &latecomer.series[..2],
+        &[None, None],
+        "the minutes before an agent existed are not minutes it was idle: {:?}",
+        latecomer.series
+    );
+    assert!(
+        latecomer.series[2..].iter().all(Option::is_some),
+        "{:?}",
+        latecomer.series
+    );
+}
+
+#[test]
+fn an_agent_that_leaves_keeps_the_history_it_earned() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    for minute in 0..2u64 {
+        history.record(
+            &crowd(
+                T0 + minute * 60,
+                &[
+                    ("w15:p1", "working", 10 + minute),
+                    ("w15:p2", "working", 50 + minute),
+                ],
+            ),
+            &config,
+        );
+    }
+    // The second pane closes.
+    history.record(&crowd(T0 + 2 * 60, &[("w15:p1", "working", 20)]), &config);
+
+    let activity = &history.activity(T0 + 2 * 60, 3, 1, &config)[0];
+    let departed = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("a closed pane does not erase what it did");
+    assert!(
+        departed.series[..2].iter().all(Option::is_some),
+        "the minutes it worked: {:?}",
+        departed.series
+    );
+    assert_eq!(
+        departed.series[2], None,
+        "and a gap once it was gone, not a quiet bar: {:?}",
+        departed.series
+    );
+    assert_eq!(departed.last_seen, T0 + 60);
+}
+
+#[test]
+fn agent_rings_are_capped_and_the_least_recently_seen_goes_first() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Two agents present throughout, and four more that each appear for one
+    // minute and leave. At the cap the survivors must be the two that are still
+    // here plus the two most recent visitors — which only holds if eviction
+    // really orders by `last_seen`.
+    for minute in 0..4u64 {
+        let visitor = format!("w15:v{minute}");
+        let agents = vec![
+            ("w15:p1", "working", 10 + minute),
+            ("w15:p2", "working", 20 + minute),
+            (visitor.as_str(), "working", 30 + minute),
+        ];
+        history.record(&crowd(T0 + minute * 60, &agents), &config);
+    }
+
+    let entry = &history.workspaces[0];
+    let mut kept: Vec<&str> = entry
+        .agents
+        .iter()
+        .map(|agent| agent.pane_id.as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["w15:p1", "w15:p2", "w15:v2", "w15:v3"],
+        "the cap has to fall on the agents nobody has seen for longest"
+    );
+}
+
+#[test]
+fn a_clock_correction_rewinds_the_agent_rings_too() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Both agents observed by a clock running five hours fast.
+    history.record(
+        &crowd(
+            T0 + 5 * 3_600,
+            &[("w15:p1", "working", 10), ("w15:p2", "working", 20)],
+        ),
+        &config,
+    );
+    // The clock is corrected, and only one of them is in that sample. The other
+    // must still be re-anchored: its buckets sit at minutes the wall clock has
+    // not reached, and they would start rendering as bars the moment it does.
+    history.record(&crowd(T0, &[("w15:p1", "working", 11)]), &config);
+
+    let entry = &history.workspaces[0];
+    for agent in &entry.agents {
+        assert!(
+            agent.newest_bucket <= T0 / 60,
+            "{} kept an anchor a stepped clock wrote: {} > {}",
+            agent.pane_id,
+            agent.newest_bucket,
+            T0 / 60
+        );
+        assert!(
+            agent.last_seen <= T0,
+            "{} kept a stamp from a time that has not happened",
+            agent.pane_id
+        );
+    }
+
+    // And nothing from the future window projects as observed.
+    let activity = &history.activity(T0, 8, 1, &config)[0];
+    let absent = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the agent that was not in the correcting sample");
+    assert!(
+        absent.series.iter().all(Option::is_none),
+        "minutes nobody watched, drawn as bars: {:?}",
+        absent.series
+    );
+}
+
+#[test]
+fn turning_recording_off_drops_the_rings_of_a_workspace_nobody_samples_again() {
+    let dir = TempDir::new("agent-rings-off");
+    let recording = per_agent(60, 16, 4);
+    let mut history = History::empty(&recording);
+    history.record(&crowd(T0, &[("w15:p1", "working", 10)]), &recording);
+    history::save_to(dir.path(), &history).expect("save");
+
+    // A load under a config that is not recording them. Waiting for the next
+    // sample would leave the rings on disk for a workspace that is never sampled
+    // again, outside the budget `Config::clamp` is enforcing.
+    let plain = config(60, 16, 4);
+    let loaded = history::load_from(dir.path(), &plain);
+    assert!(loaded.workspaces[0].agents.is_empty());
+}
+
+#[test]
+fn a_bucket_size_change_drops_the_agent_rings_rather_than_re_laying_them() {
+    let dir = TempDir::new("agent-rings-scale");
+    let written = per_agent(60, 16, 4);
+    let base = group_start();
+    let mut history = History::empty(&written);
+    for minute in 0..5u64 {
+        history.record(
+            &crowd(base + minute * 60, &[("w15:p1", "working", 10 + minute)]),
+            &written,
+        );
+    }
+    history::save_to(dir.path(), &history).expect("save");
+
+    // The fine ring folds; an agent ring cannot. Its buckets are numbered at the
+    // old scale, and for close-enough sizes the two numberings overlap — which
+    // would draw bars at minutes computed from a scale nobody recorded them at.
+    let live = Config {
+        per_agent_series: true,
+        ..config(300, 16, 4)
+    };
+    let loaded = history::load_from(dir.path(), &live);
+    assert!(
+        loaded.workspaces[0].buckets.iter().any(|b| b.samples > 0),
+        "the workspace's own ring is folded and kept"
+    );
+    assert!(
+        loaded.workspaces[0].agents.is_empty(),
+        "and the agent rings go, because there is no honest fold for them"
+    );
+}
+
+#[test]
+fn one_pane_id_reported_twice_is_absorbed_once() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // herdr should never do this. If it does, folding the id twice inflates the
+    // agent's samples and counts its transition twice.
+    history.record(
+        &crowd(T0, &[("w15:p1", "working", 10), ("w15:p1", "idle", 11)]),
+        &config,
+    );
+
+    let entry = &history.workspaces[0];
+    assert_eq!(entry.agents.len(), 1);
+    let slot = (T0 / 60 % 16) as usize;
+    assert_eq!(
+        entry.agents[0].buckets[slot].samples, 1,
+        "one sample is one sample, however many times the snapshot said it"
+    );
+}
+
+#[test]
+fn turning_per_agent_series_off_drops_the_rings_rather_than_freezing_them() {
+    let recording = per_agent(60, 16, 4);
+    let mut history = History::empty(&recording);
+    history.record(&crowd(T0, &[("w15:p1", "working", 10)]), &recording);
+    assert_eq!(history.workspaces[0].agents.len(), 1);
+
+    // The user turns it off. Keeping the rings would draw agent rows that stopped
+    // updating the moment they stopped being recorded, ageing into a sparkline of
+    // gaps with nothing to explain them.
+    let plain = config(60, 16, 4);
+    history.record(&crowd(T0 + 60, &[("w15:p1", "working", 11)]), &plain);
+    assert!(history.workspaces[0].agents.is_empty());
+}
+
+#[test]
+fn an_agents_blocked_time_is_its_own() {
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    // Four samples in one minute: one agent blocked throughout, one never.
+    for step in 0..4u64 {
+        history.record(
+            &crowd(
+                T0 + step * 15,
+                &[
+                    ("w15:p1", "blocked", 10 + step),
+                    ("w15:p2", "working", 50 + step),
+                ],
+            ),
+            &config,
+        );
+    }
+
+    let activity = &history.activity(T0, 1, 1, &config)[0];
+    let stuck = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p1")
+        .expect("the blocked agent");
+    let busy = activity
+        .agents
+        .iter()
+        .find(|agent| agent.pane_id == "w15:p2")
+        .expect("the working agent");
+
+    assert_eq!((stuck.blocked_seconds, stuck.watched_seconds), (60, 60));
+    assert_eq!(
+        (busy.blocked_seconds, busy.watched_seconds),
+        (0, 60),
+        "the workspace was blocked, this agent was not, and the rows must not \
+         say the same thing"
+    );
+}
+
+#[test]
+fn a_file_written_before_agent_rings_gains_an_empty_list() {
+    let dir = TempDir::new("pre-agent-file");
+    let config = per_agent(60, 16, 4);
+    let mut history = History::empty(&config);
+    history.record(&crowd(T0, &[("w15:p1", "working", 10)]), &config);
+
+    let mut value = serde_json::to_value(&history).unwrap();
+    let entry = value["workspaces"][0].as_object_mut().unwrap();
+    assert!(entry.remove("agents").is_some(), "the field is written");
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let mut loaded = history::load_from(dir.path(), &config);
+    assert!(loaded.workspaces[0].agents.is_empty());
+
+    // And recording starts from the next sample, with gaps behind it.
+    loaded.record(&crowd(T0 + 60, &[("w15:p1", "working", 11)]), &config);
+    let activity = &loaded.activity(T0 + 60, 2, 1, &config)[0];
+    assert_eq!(activity.agents.len(), 1);
+    assert_eq!(
+        activity.agents[0].series[0], None,
+        "nothing is back-filled from the workspace's own ring: {:?}",
+        activity.agents[0].series
+    );
+}
+
 #[test]
 fn eviction_breaks_ties_deterministically() {
     let config = config(60, 8, 2);

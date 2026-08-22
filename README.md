@@ -168,7 +168,7 @@ pulse --once
 
 ### Reading the pane
 
-`--once`, `--week` and `--watch` print one row per workspace:
+`--once`, `--week` and `--watch` always print one aggregate row per workspace:
 
 | Column | Meaning |
 |---|---|
@@ -180,6 +180,19 @@ pulse --once
 | `for` | How long that state had held when we last looked. |
 | `seen` | How long ago that observation was. |
 | `agents` | Agents in the workspace at that observation. |
+
+`--agents` governs *recording*, not display: it tells the sampler to keep a
+separate ring per agent. The panes then draw one indented line per recorded
+agent under its workspace whenever those rings exist, whether or not the switch
+is repeated on the reading command — the rings are what there is to draw. The
+sidebar badge still keeps its single aggregate line, and `--week` stays
+aggregate-only because agent rings are recorded at the fine ring's resolution
+only.
+
+If an agent first appears partway through the window, the earlier columns are
+gaps: the line reads as absent-then-present, never as quiet-then-active. Turning
+recording off drops the rings rather than freezing them, so a line cannot age
+into a sparkline of gaps that nothing explains.
 
 Every state in the pane is a past observation. While the sampler is running the
 last observation is seconds old, so reading it as the present is fair and the row
@@ -278,6 +291,7 @@ time, and `is_current` per workspace, plus the live session at the top level.
 | `--bucket-seconds <SECS>` | Wall clock per history bucket (default 60). |
 | `--retention-buckets <N>` | Buckets retained per workspace (default 240). |
 | `--columns <N>` | Sparkline columns in the badge (default 8). |
+| `--agents` | Record separate per-agent rings, used by `--once` and `--watch`. Off by default. |
 | `--version` | Print version and exit. |
 | `--help` | Show help. |
 
@@ -305,19 +319,29 @@ from rendering.
 | `badge_columns` | `8` | 1–64 | Sparkline columns in the sidebar badge. |
 | `badge_window_minutes` | `64` | 1–1440 | Minutes of history those columns span. |
 | `max_workspaces` | `64` | 1–512 | Ceiling on tracked workspaces; least recently seen are evicted first. |
+| `per_agent_series` | `false` | `true` / `false` | Record separate per-agent rings, used by `--once` and `--watch`. |
 
-Command-line options override the file. Every value is clamped into its range,
-so no configuration can produce output the renderer has to defend against.
+Command-line options override the file. `--agents` is the command-line form of
+`per_agent_series`; for example, `pulse --agents --enable` starts a sampler that
+records the agent rings. This is a recording setting, not a display-only toggle:
+the sampler only keeps separate agent history while it is on.
 
-Two of those ranges interact, and pulse says so rather than quietly obeying:
+Per-agent recording is deliberately off by default. Each agent ring is as long
+as the fine ring, and a workspace may retain up to four of them, evicting the
+least recently seen agent first. Those rings multiply both the workspace's
+on-disk cost and the history rewritten on every sampling cycle.
 
-- **`retention_buckets × max_workspaces` is capped at 65,536 buckets**, which is
-  what actually determines the history file's size — clamping each field on its
-  own would leave "bounded by construction" untrue, since their maxima multiply
-  out to a file of tens of megabytes rewritten every few seconds. When the pair
-  exceeds the cap the workspace ceiling gives way, and the reason is printed on
-  stderr. `retention_buckets` wins because it is your explicit statement about
-  how far back you want to see.
+Every value is clamped into its range, so no configuration can produce output
+the renderer has to defend against. The ranges and per-agent recording interact,
+and pulse says so rather than quietly obeying:
+
+- **All stored rings across `max_workspaces` are capped at 65,536 buckets.**
+  `Config::clamp` counts each workspace's fine ring, fixed 168-bucket week ring
+  and, when per-agent recording is on, up to four more rings the length of the
+  fine one. When the configured workspace ceiling would exceed the bucket cap,
+  the workspace ceiling gives way and the reason is printed on stderr.
+  `retention_buckets` wins because it is your explicit statement about how far
+  back you want to see.
 - **The badge never asks for more history than the ring holds.** `--bucket-seconds
   10` with the default 64-minute window would want 384 buckets from a 240-bucket
   ring, leaving three columns permanently gapped on a workspace that was in fact
@@ -331,7 +355,8 @@ Two of those ranges interact, and pulse says so rather than quietly obeying:
   "retention_buckets": 240,
   "badge_columns": 8,
   "badge_window_minutes": 64,
-  "max_workspaces": 64
+  "max_workspaces": 64,
+  "per_agent_series": false
 }
 ```
 
@@ -362,6 +387,12 @@ means exactly seven days.
 **8 workspaces × (240 fine + 168 week) buckets ≈ 180 KB.** That is the measured
 history-file size at the defaults. The week ring accounts for
 `168 / (240 + 168) ≈ 41%`, roughly 40%, of the file.
+
+**Per-agent recording: 240 fine + 168 week + up to 4 × 240 agent buckets =
+1,368 buckets per workspace.** `Config::clamp` counts all of them against the
+65,536-bucket ceiling. At the defaults, enabling the agent rings therefore
+reduces the tracked-workspace cap from 64 to
+`floor(65,536 / 1,368) = 47`; the clamp prints that reduction and its reason.
 
 **8 badge columns over 64 minutes = 8 minutes per column.** Sidebar cells are
 narrow; eight columns plus a state glyph is about as much as fits before herdr

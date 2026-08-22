@@ -79,6 +79,16 @@ pub const WEEK_RETENTION_BUCKETS: usize = 168;
 pub const WEEK_COLUMNS: usize = 28;
 pub const WEEK_BUCKETS_PER_COLUMN: usize = 6;
 
+/// How many agents a workspace may keep a separate ring for, least recently seen
+/// evicted first.
+///
+/// Four, because that is where the cost stops being an afterthought: each agent
+/// ring is as long as the fine one, so four of them triple what a workspace
+/// costs on disk and in the daemon's per-cycle rewrite. A workspace with more
+/// agents than this still has all of them in its aggregate series and its agent
+/// count; what it loses is a separate line for the fifth.
+pub const MAX_AGENTS_PER_WORKSPACE: usize = 4;
+
 /// Ceiling on `(retention_buckets + WEEK_RETENTION_BUCKETS) × max_workspaces`,
 /// which is what actually determines the history file's size.
 ///
@@ -111,6 +121,19 @@ pub struct Config {
     pub badge_window_minutes: u64,
     /// Ceiling on tracked workspaces.
     pub max_workspaces: usize,
+    /// Whether the sampler records a separate ring per agent.
+    ///
+    /// Off by default, and the default is the point. An agent ring is as long as
+    /// the fine one, so turning this on multiplies what every workspace costs on
+    /// disk *and* what the daemon rewrites every cycle — a cost worth paying to
+    /// see which of three agents was the busy one, and not worth charging to
+    /// somebody who only reads the sidebar.
+    ///
+    /// It is a recording setting rather than a display one because a series
+    /// cannot be drawn from observations nobody kept. Turning it on starts the
+    /// per-agent history from that moment: the minutes before it read as gaps,
+    /// which is what they are.
+    pub per_agent_series: bool,
 }
 
 impl Default for Config {
@@ -122,6 +145,7 @@ impl Default for Config {
             badge_columns: DEFAULT_BADGE_COLUMNS,
             badge_window_minutes: DEFAULT_BADGE_WINDOW_MINUTES,
             max_workspaces: DEFAULT_MAX_WORKSPACES,
+            per_agent_series: false,
         }
     }
 }
@@ -185,24 +209,37 @@ impl Config {
         // The file's size is the product of the per-workspace bucket count and
         // the workspace cap, not either one alone, so clamping them separately
         // leaves "bounded by construction" untrue. Every workspace carries the
-        // fine ring *and* the fixed week ring, so the week's 168 buckets are part
-        // of the count being bounded — leaving them out would let the file exceed
-        // the ceiling by 168 buckets per workspace, which is the whole ceiling
-        // over at a few hundred workspaces.
+        // fine ring, the fixed week ring, and — when per-agent series are on —
+        // up to `MAX_AGENTS_PER_WORKSPACE` more rings the length of the fine
+        // one. All of them are part of the count being bounded; leaving any out
+        // would let the file exceed the ceiling by that much per workspace.
         //
         // `retention_buckets` is the user's explicit statement about how far back
         // they want to see, so the workspace cap gives way instead — losing the
         // least recently seen workspace is a smaller loss than silently
         // shortening everyone's history.
+        let agent_rings = if self.per_agent_series {
+            self.retention_buckets
+                .saturating_mul(MAX_AGENTS_PER_WORKSPACE)
+        } else {
+            0
+        };
         let per_workspace = self
             .retention_buckets
-            .saturating_add(WEEK_RETENTION_BUCKETS);
+            .saturating_add(WEEK_RETENTION_BUCKETS)
+            .saturating_add(agent_rings);
         if per_workspace.saturating_mul(self.max_workspaces) > MAX_TOTAL_BUCKETS {
             let affordable = (MAX_TOTAL_BUCKETS / per_workspace.max(1)).max(1);
             // Loud, because a user who asked to track 400 workspaces and is
-            // silently given 6 would have no way to discover it.
+            // silently given 6 would have no way to discover it — and doubly so
+            // here, where turning on per-agent series is what moved the number.
+            let agents = if self.per_agent_series {
+                format!(" plus {MAX_AGENTS_PER_WORKSPACE} agent rings")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "pulse: retention_buckets {} plus the {WEEK_RETENTION_BUCKETS}-bucket week ring, \
+                "pulse: retention_buckets {} plus the {WEEK_RETENTION_BUCKETS}-bucket week ring{agents}, \
                  x max_workspaces {}, exceeds the {} bucket ceiling; \
                  tracking {} workspaces instead",
                 self.retention_buckets, self.max_workspaces, MAX_TOTAL_BUCKETS, affordable
@@ -231,6 +268,18 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
     if let Some(raw) = value_arg(args, "--columns")? {
         config.badge_columns = parse_number(&raw, "--columns")? as usize;
     }
+    // A bare switch rather than a value: it turns a recording behaviour on, and
+    // `--agents false` would read as "show me the agents" to anybody skimming.
+    // A valued spelling is refused rather than ignored — `--agents=false`
+    // silently meaning the opposite of what it says is exactly the quiet
+    // no-op the bare form was chosen to avoid.
+    for arg in args {
+        if arg == "--agents" {
+            config.per_agent_series = true;
+        } else if arg.starts_with("--agents=") {
+            return Err("--agents takes no value".into());
+        }
+    }
     config.clamp();
     Ok(config)
 }
@@ -253,6 +302,7 @@ struct FileConfig {
     badge_columns: Option<usize>,
     badge_window_minutes: Option<u64>,
     max_workspaces: Option<usize>,
+    per_agent_series: Option<bool>,
 }
 
 fn config_file() -> PathBuf {
@@ -299,6 +349,9 @@ fn load_file() -> Config {
     }
     if let Some(value) = file.max_workspaces {
         config.max_workspaces = value;
+    }
+    if let Some(value) = file.per_agent_series {
+        config.per_agent_series = value;
     }
     config
 }
