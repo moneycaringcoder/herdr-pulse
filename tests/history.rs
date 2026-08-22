@@ -1752,6 +1752,54 @@ fn each_agent_counts_only_its_own_movements() {
 }
 
 #[test]
+fn the_levels_and_the_transitions_describe_the_same_columns() {
+    // The two projections walk the same columns, and a renderer marks a column
+    // only if both agree it was watched. If they ever disagreed the mark would
+    // land under a minute the sparkline says nobody saw — so they share one
+    // derivation, and this is what says so.
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    // A wrapped ring with a hole in the middle: sixteen minutes through an
+    // eight-bucket ring, skipping three of them.
+    for minute in 0..16u64 {
+        if (7..10).contains(&minute) {
+            continue;
+        }
+        history.record(
+            &one(
+                T0 + minute * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + minute)],
+            ),
+            &config,
+        );
+    }
+
+    for (as_of, columns, per_column) in [
+        (T0 + 15 * 60, 8, 1),
+        (T0 + 15 * 60, 4, 2),
+        (T0 + 15 * 60, 32, 1),
+        (T0 + 40 * 60, 8, 1),
+        (T0, 8, 1),
+    ] {
+        let activity = &history.activity(as_of, columns, per_column, &config)[0];
+        assert_eq!(
+            activity.series.len(),
+            activity.transitions.len(),
+            "as_of {as_of}, {columns}x{per_column}"
+        );
+        let series_shape: Vec<bool> = activity.series.iter().map(Option::is_some).collect();
+        let marks_shape: Vec<bool> = activity.transitions.iter().map(Option::is_some).collect();
+        assert_eq!(
+            series_shape, marks_shape,
+            "as_of {as_of}, {columns}x{per_column}: a column is watched in one \
+             projection and not the other"
+        );
+    }
+}
+
+#[test]
 fn turning_per_agent_series_off_drops_the_rings_rather_than_freezing_them() {
     let recording = per_agent(60, 16, 4);
     let mut history = History::empty(&recording);
