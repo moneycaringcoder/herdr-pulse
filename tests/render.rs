@@ -33,6 +33,8 @@ fn activity(
     WorkspaceActivity {
         workspace_id: format!("w-{label}"),
         label: label.to_string(),
+        blocked_seconds: 0,
+        watched_seconds: 1,
         series,
         state,
         state_for,
@@ -43,6 +45,19 @@ fn activity(
         // A week of gaps unless a test says otherwise: the pane tests are about
         // the fine series, and an unset coarse ring must not change what they see.
         week: vec![None; pulse::config::WEEK_COLUMNS],
+    }
+}
+
+/// Sets the blocked estimate and the watched time that supports it.
+fn with_blocked_time(
+    activity: WorkspaceActivity,
+    blocked_seconds: u64,
+    watched_seconds: u64,
+) -> WorkspaceActivity {
+    WorkspaceActivity {
+        blocked_seconds,
+        watched_seconds,
+        ..activity
     }
 }
 
@@ -654,6 +669,7 @@ fn a_live_session_and_an_earlier_session_are_labelled_differently() {
             "activity",
             "session",
             "state",
+            "blocked",
             "for",
             "seen",
             "agents"
@@ -954,6 +970,131 @@ fn an_unobserved_state_duration_shows_a_question_mark_not_a_zero() {
         // for = unknown, seen = five seconds ago, agents = none.
         &["?", "5s", "0"],
         "{row:?}"
+    );
+}
+
+#[test]
+fn blocked_time_renders_as_a_duration_in_its_own_column() {
+    let rendered = sample_pane(vec![with_blocked_time(
+        activity("web", levels(&[1, 2]), AgentState::Blocked, Some(30), 1),
+        4_800,
+        7_200,
+    )]);
+    let cells: Vec<&str> = row_for(&rendered, "web")
+        .split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+
+    assert_eq!(cells[4], "1h20", "{rendered}");
+}
+
+#[test]
+fn blocked_time_is_unknown_when_nothing_was_watched() {
+    let rendered = sample_pane(vec![with_blocked_time(
+        activity("web", vec![None; 2], AgentState::Unknown, None, 0),
+        0,
+        0,
+    )]);
+    let cells: Vec<&str> = row_for(&rendered, "web")
+        .split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+
+    assert_eq!(cells[4], "?", "{rendered}");
+}
+
+#[test]
+fn zero_blocked_time_is_an_observation_when_time_was_watched() {
+    let rendered = sample_pane(vec![with_blocked_time(
+        activity("web", levels(&[0, 0]), AgentState::Idle, Some(30), 1),
+        0,
+        120,
+    )]);
+    let cells: Vec<&str> = row_for(&rendered, "web")
+        .split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+
+    assert_eq!(cells[4], "0s", "{rendered}");
+}
+
+#[test]
+fn the_blocked_legend_appears_only_when_a_row_was_watched() {
+    const CLAUSE: &str = "blocked = time estimated from samples that saw a blocked agent, \
+                          over time actually watched rather than the whole row";
+
+    let watched = sample_pane(vec![with_blocked_time(
+        activity("web", levels(&[0]), AgentState::Idle, Some(1), 1),
+        0,
+        60,
+    )]);
+    assert!(
+        watched.contains(CLAUSE),
+        "a blocked figure is unexplained:\n{watched}"
+    );
+
+    let unwatched = sample_pane(vec![with_blocked_time(
+        activity("web", vec![None], AgentState::Unknown, None, 0),
+        0,
+        0,
+    )]);
+    assert!(
+        !unwatched.contains(CLAUSE),
+        "a pane with no blocked figure explains one anyway:\n{unwatched}"
+    );
+}
+
+#[test]
+fn the_blocked_column_and_the_columns_after_it_stay_aligned() {
+    let rendered = sample_pane(vec![
+        with_blocked_time(
+            activity("short", levels(&[4]), AgentState::Blocked, Some(240), 1),
+            70,
+            120,
+        ),
+        with_blocked_time(
+            seen_ago(
+                activity(
+                    "a-longer-label",
+                    levels(&[8]),
+                    AgentState::Working,
+                    Some(540),
+                    2,
+                ),
+                18_000,
+            ),
+            3,
+            120,
+        ),
+    ]);
+    let header = rendered
+        .lines()
+        .find(|line| line.starts_with("workspace"))
+        .unwrap_or_default();
+    let short = row_for(&rendered, "short");
+    let longer = row_for(&rendered, "a-longer-label");
+
+    let blocked_offsets = [
+        display_width(&header[..header.find("blocked").unwrap()]),
+        display_width(&short[..short.find("1m").unwrap()]),
+        display_width(&longer[..longer.find("3s").unwrap()]),
+    ];
+    assert!(
+        blocked_offsets.windows(2).all(|pair| pair[0] == pair[1]),
+        "blocked cells do not line up: {blocked_offsets:?}\n{rendered}"
+    );
+
+    let for_offsets = [
+        display_width(&header[..header.find("for").unwrap()]),
+        display_width(&short[..short.find("4m").unwrap()]),
+        display_width(&longer[..longer.find("9m").unwrap()]),
+    ];
+    assert!(
+        for_offsets.windows(2).all(|pair| pair[0] == pair[1]),
+        "cells after blocked do not line up: {for_offsets:?}\n{rendered}"
     );
 }
 
@@ -1490,6 +1631,22 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     );
     assert_eq!(document["week_bucket_seconds"], WEEK_BUCKET_SECONDS);
     assert_eq!(document["week_columns"], WEEK_COLUMNS);
+}
+
+#[test]
+fn json_carries_blocked_time_and_the_watched_time_that_supports_it() {
+    let config = Config::default();
+    let workspace = with_blocked_time(
+        activity("w1", levels(&[5]), AgentState::Blocked, Some(30), 1),
+        42,
+        120,
+    );
+
+    let document = json_document(&config, AS_OF, 1, 1, &[workspace], None, running());
+    let workspace = &document["workspaces"][0];
+
+    assert_eq!(workspace["blocked_seconds"], 42);
+    assert_eq!(workspace["watched_seconds"], 120);
 }
 
 #[test]

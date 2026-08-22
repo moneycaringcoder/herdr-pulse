@@ -282,6 +282,19 @@ pub struct WorkspaceActivity {
     /// observed and quiet — and recorded from the same samples rather than folded
     /// out of the fine ring, which cannot reach back that far.
     pub week: Vec<Option<Level>>,
+    /// Seconds an agent was observed blocked, over the window [`Self::series`]
+    /// covers.
+    ///
+    /// Estimated from the samples that saw a blocked agent, which is the only
+    /// thing the store records — and reported next to [`Self::watched_seconds`]
+    /// for a reason. Alone it invites the reading "blocked ten minutes in the
+    /// last four hours", which is false when only twenty minutes of those four
+    /// hours were watched. Together they say what was seen and how much watching
+    /// it rests on.
+    pub blocked_seconds: u64,
+    /// Seconds of the same window the sampler actually observed. A gap adds
+    /// nothing to it: unobserved time is not time with no blocking in it.
+    pub watched_seconds: u64,
 }
 
 impl WorkspaceActivity {

@@ -9,13 +9,6 @@ watching" render as "nothing happened" is wrong no matter what else it buys.
 
 ## More useful numbers
 
-### Blocked time, not just activity
-
-The sparkline shows that an agent was active. The number people actually act on
-is how long agents sat *blocked* waiting for input, because that is the time a
-human could have given back. The sampler already records the state; this is a
-question of surfacing it.
-
 ### Per-agent series
 
 Three agents in one workspace currently aggregate into one line. That is right

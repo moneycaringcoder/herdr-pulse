@@ -346,6 +346,7 @@ fn render_pane(
         "activity".to_string(),
         "session".to_string(),
         "state".to_string(),
+        "blocked".to_string(),
         "for".to_string(),
         "seen".to_string(),
         "agents".to_string(),
@@ -368,6 +369,9 @@ fn render_pane(
             } else {
                 format!("{} was {}", state_glyph(workspace.state), workspace.state)
             },
+            // A zero backed by watching is an observation; the same zero with no
+            // watched time is no observation at all and must remain unknown.
+            duration((workspace.watched_seconds > 0).then_some(workspace.blocked_seconds)),
             // Measured to `last_seen` by the store, so this is the duration we
             // actually observed rather than one extrapolated to now.
             duration(workspace.state_for),
@@ -465,6 +469,12 @@ pub fn run_week(config: &Config) -> Result<()> {
 /// answers "did anything happen yesterday"; neither can be derived from the
 /// other.
 ///
+/// `blocked_seconds` is estimated only over buckets the sampler observed, so it
+/// is paired with `watched_seconds` to expose the evidence behind that estimate.
+/// A consumer must not divide by the row's wall-clock width: gaps contribute to
+/// neither value, and treating them as unblocked time would turn "not watched"
+/// into "watched and quiet".
+///
 /// `state` carries the same freshness problem the pane solves with a tense, and
 /// a consumer cannot see a tense. So every workspace also carries `last_seen`,
 /// `observed_ago_seconds` and `state_is_current`, and the document carries the
@@ -558,6 +568,11 @@ pub fn json_document(
                 "observed_ago_seconds": workspace.observed_ago(as_of),
                 "state_is_current": workspace.is_current(as_of, tolerance),
                 "agent_count": workspace.agent_count,
+                // Both describe the fine-series window. `watched_seconds` is
+                // the denominator that keeps gaps out of the blocked estimate;
+                // the row's wall-clock width includes gaps and is not evidence.
+                "blocked_seconds": workspace.blocked_seconds,
+                "watched_seconds": workspace.watched_seconds,
                 // `null` is a gap and `0` is an observed quiet bucket. A
                 // consumer that flattens the two gets the same wrong answer the
                 // glyphs exist to prevent, so the distinction is carried in the
@@ -783,6 +798,15 @@ fn legend(
         "        for = how long the state had held when last seen  |  \
          seen = how long ago that was\n",
     );
+    if activity
+        .iter()
+        .any(|workspace| workspace.watched_seconds > 0)
+    {
+        out.push_str(
+            "        blocked = time estimated from samples that saw a blocked agent, \
+             over time actually watched rather than the whole row\n",
+        );
+    }
     // Only when it applies. A reader whose rows are all fresh does not need to
     // be taught a distinction none of them makes, and a line that is always
     // there is a line nobody reads on the day it matters.
