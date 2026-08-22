@@ -35,6 +35,7 @@ Other:
   --retention-buckets <N>   Buckets retained per workspace (default: 240)
   --columns <N>             Sparkline columns in the badge (default: 8)
   --agents                  Record and show one series per agent (costs more disk)
+  --since <WINDOW>          Narrow the pane views: 90s, 30m, 2h, 3d (default: all)
   --version                 Print version and exit
   --help                    Show this help
 ";
@@ -48,11 +49,12 @@ fn main() {
 }
 
 /// Options that take a value, and so must never be mistaken for the verb.
-const VALUED: [&str; 4] = [
+const VALUED: [&str; 5] = [
     "--interval",
     "--bucket-seconds",
     "--retention-buckets",
     "--columns",
+    "--since",
 ];
 
 /// Options that take no value, and so must never be mistaken for the verb

@@ -1473,20 +1473,48 @@ impl History {
         buckets_per_column: usize,
         config: &Config,
     ) -> Vec<WorkspaceActivity> {
+        self.activity_with(
+            as_of,
+            (columns, buckets_per_column),
+            (
+                crate::config::WEEK_COLUMNS,
+                crate::config::WEEK_BUCKETS_PER_COLUMN,
+            ),
+            config,
+        )
+    }
+
+    /// [`Self::activity`] with the week's geometry chosen by the caller.
+    ///
+    /// Only `--week --since` needs it: every other caller wants the whole week,
+    /// which is what [`Self::activity`] passes. Narrowing the week from the
+    /// outside rather than inside keeps one rule for both rings — the window a
+    /// pane draws is the window its figures describe — instead of a second
+    /// notion of "the week window" living in the store.
+    pub fn activity_with(
+        &self,
+        as_of: u64,
+        fine: (usize, usize),
+        week_geometry: (usize, usize),
+        config: &Config,
+    ) -> Vec<WorkspaceActivity> {
+        let (columns, buckets_per_column) = fine;
+        let (week_columns, week_per_column) = week_geometry;
+        let week_per_column = week_per_column.max(1) as u64;
         let per_column = buckets_per_column.max(1) as u64;
         let newest = bucket_number(as_of, config);
         self.workspaces
             .iter()
             .map(|workspace| {
                 let series = workspace.fine().series(newest, columns, per_column);
-                // The week is always projected, at its own fixed geometry: it is
-                // one series per workspace either way, and a consumer that asks
-                // for the afternoon should not have to ask twice to find out
-                // whether yesterday happened.
+                // The week is always projected, at whatever geometry the caller
+                // asked for: it is one series per workspace either way, and a
+                // consumer that asks for the afternoon should not have to ask
+                // twice to find out whether yesterday happened.
                 let week = workspace.week().series(
                     week_bucket_number(as_of),
-                    crate::config::WEEK_COLUMNS,
-                    crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
+                    week_columns,
+                    week_per_column,
                 );
                 // Over exactly the window the series covers, so the figure and
                 // the sparkline beside it describe the same stretch of time. A
@@ -1506,8 +1534,7 @@ impl History {
                 // And the same again for the week, because a week row must
                 // report the week's blocked time rather than this afternoon's.
                 let week_newest = week_bucket_number(as_of);
-                let week_window = (crate::config::WEEK_COLUMNS as u64)
-                    .saturating_mul(crate::config::WEEK_BUCKETS_PER_COLUMN as u64);
+                let week_window = (week_columns as u64).saturating_mul(week_per_column);
                 let (week_blocked_seconds, week_watched_seconds) =
                     workspace.week().blocked_and_watched(
                         week_newest.saturating_sub(week_window.saturating_sub(1)),
@@ -1553,8 +1580,8 @@ impl History {
                     transitions: workspace.fine().transitions(newest, columns, per_column),
                     week_transitions: workspace.week().transitions(
                         week_newest,
-                        crate::config::WEEK_COLUMNS,
-                        crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
+                        week_columns,
+                        week_per_column,
                     ),
                     state: AgentState::parse(&workspace.state),
                     // Measured to the last observation, never to `as_of`. The

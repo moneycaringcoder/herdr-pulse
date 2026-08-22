@@ -1317,6 +1317,51 @@ fn the_week_reports_its_own_blocked_time_and_not_the_afternoons() {
     assert_eq!(activity.week_watched_seconds, 3_600);
 }
 
+#[test]
+fn a_narrowed_week_projects_the_window_it_was_asked_for() {
+    // `--week --since 2d` narrows the week ring, and every figure beside the
+    // series has to narrow with it: a two-day sparkline over a seven-day
+    // blocked figure would be two numbers describing different weeks.
+    let config = config(60, 240, 4);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // An hour of blocked work, five days back: inside the week, outside two days.
+    let long_ago = base.saturating_sub(5 * 24 * 3_600);
+    for step in 0..6u64 {
+        history.record(
+            &one(
+                long_ago + step * 600,
+                "w15",
+                "api",
+                &[("w15:p1", "blocked", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    let whole = &history.activity(base, 8, 1, &config)[0];
+    assert_eq!(
+        whole.week.len(),
+        pulse::config::WEEK_COLUMNS,
+        "unnarrowed, the week is the whole week"
+    );
+    assert_eq!(whole.week_blocked_seconds, 3_600);
+
+    // Two days at one hour per bucket, drawn eight columns wide.
+    let narrowed = &history.activity_with(base, (8, 1), (8, 6), &config)[0];
+    assert_eq!(narrowed.week.len(), 8);
+    assert!(
+        narrowed.week.iter().all(Option::is_none),
+        "nobody watched the last two days: {:?}",
+        narrowed.week
+    );
+    assert_eq!(
+        (narrowed.week_blocked_seconds, narrowed.week_watched_seconds),
+        (0, 0),
+        "the figure covers the window the series covers, not the week behind it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-agent series
 // ---------------------------------------------------------------------------
