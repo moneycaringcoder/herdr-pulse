@@ -9,17 +9,6 @@ watching" render as "nothing happened" is wrong no matter what else it buys.
 
 ## Keeping history that is currently lost
 
-### Survive workspace-id reuse
-
-herdr's workspace ids are session-scoped and can be reused. When a label changes
-under an id, the recorded buckets are dropped rather than attributed to the wrong
-workspace. That is the right call — a wrong sparkline is worse than an empty one —
-but it is a workaround, not a fix.
-
-Keying history on something more durable than the session-scoped id would let the
-history survive the reuse instead of being discarded. The correctness rule stays
-the same: if identity cannot be established, drop rather than guess.
-
 ### Downsample instead of discarding on a bucket-size change
 
 Changing `bucket_seconds` invalidates the recorded history, which is discarded

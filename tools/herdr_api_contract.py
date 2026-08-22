@@ -65,9 +65,20 @@ OBJECTS: dict[str, dict[str, tuple[str, ...]]] = {
         "optional": (),
     },
     "WorkspaceInfo": {
-        # `label` doubles as the guard against workspace-id reuse in the sample
-        # history, so it is load-bearing beyond display.
+        # `label` is the only identity evidence there is for a workspace with no
+        # worktree, so it is load-bearing beyond display.
         "required": ("workspace_id", "label"),
+        # `worktree` is null for a workspace that is not on a checkout, and
+        # carries the durable key the sample history is keyed on when it is not.
+        "optional": ("worktree",),
+    },
+    "WorkspaceWorktreeInfo": {
+        # The one field in a snapshot that means the same thing in tomorrow's
+        # session: it is what lets a series survive a reused workspace id. Read
+        # from `herdr api schema --json` on a live 0.8.0 server, where this
+        # object is `WorkspaceInfo.worktree` and lists `checkout_path` as
+        # required.
+        "required": ("checkout_path",),
         "optional": (),
     },
     "AgentInfo": {

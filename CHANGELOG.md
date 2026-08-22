@@ -24,6 +24,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- History survives a reused workspace id. herdr's ids are session-scoped, and a
+  workspace that came back under an id somebody else had been using lost every
+  recorded bucket. The store now keys a series on the workspace's checkout path
+  (`workspaces[].worktree.checkout_path`), which means the same thing in every
+  session, so a renamed workspace, a workspace renumbered by a fresh server, and
+  two workspaces that swap ids all keep their own history.
+
+  The correctness rule is unchanged: where identity cannot be established, drop
+  rather than guess. A workspace herdr reports no worktree for has no durable
+  key, so the id and the label together are still all the evidence there is, and
+  a label that changes under an id still drops the buckets. Two workspaces on one
+  checkout path make that path ambiguous, so it is not recorded as a key for
+  either of them and neither can inherit the other's minutes when the checkout
+  becomes unambiguous again. A snapshot that reports one workspace id twice
+  contradicts itself and records nothing, since both observations claim the
+  handle a badge is pushed to. A history file written by 0.1.0 keeps its buckets:
+  the first sample carrying a worktree adopts the entry and stamps the path onto
+  it.
 - `min_herdr_version` is now `0.8.0`, up from `0.7.5`. The old floor was reasoned
   from when the socket APIs pulse calls first appeared; it was never exercised
   against a 0.7.x server. 0.8.0 is the latest stable herdr and the only version

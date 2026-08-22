@@ -40,6 +40,15 @@
 //! with a user label would make the type lie. `name` is deliberately not
 //! carried: nothing in this plugin renders it, and a field nobody reads is a
 //! field nobody keeps correct.
+//!
+//! # Durable identity
+//!
+//! `workspaces[].worktree` is `null` for a workspace that is not open on a
+//! checkout, and otherwise carries `checkout_path` — the one field in a snapshot
+//! that means the same thing in tomorrow's session, which is what the store
+//! keys history on. It is read as an `Option` and never defaulted: a workspace
+//! with no worktree has no durable identity, which is a different thing from
+//! having one that happens to be empty.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
@@ -368,10 +377,19 @@ pub fn reduce_snapshot(result: &Value, taken_at: u64) -> Result<Sample> {
         };
         workspaces.push(WorkspaceObservation {
             workspace_id: workspace_id.to_string(),
-            // The label doubles as `history`'s guard against workspace-id reuse,
-            // so falling back to the id keeps that comparison stable rather than
-            // making an unlabelled workspace look like it was renamed each time.
+            // Falling back to the id keeps a label-less workspace from looking
+            // renamed on every sample, which still matters: the label is the
+            // only identity evidence there is for a workspace herdr reports no
+            // worktree for.
             label: text(workspace, "label").unwrap_or(workspace_id).to_string(),
+            // `worktree` is null for a workspace that is not on a checkout —
+            // seven of the ten in the captured fixture. Absent means "no durable
+            // identity", never "a different workspace", so it is an `Option` all
+            // the way into the store rather than an empty string.
+            checkout_path: workspace
+                .get("worktree")
+                .and_then(|worktree| text(worktree, "checkout_path"))
+                .map(str::to_string),
             agents: by_workspace
                 .iter()
                 .find(|(id, _)| id == workspace_id)
