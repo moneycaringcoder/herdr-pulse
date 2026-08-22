@@ -7,14 +7,6 @@ Everything below is measured against the one rule the plugin rests on: **a gap
 column is not a quiet column.** Any feature that would make "we were not
 watching" render as "nothing happened" is wrong no matter what else it buys.
 
-## Keeping history that is currently lost
-
-### A second, coarser ring
-
-The 240-bucket ring covers four hours, chosen for "since lunch". A separate
-hourly ring covering a week would answer "did this workspace do anything
-yesterday" without touching the fine-grained one or its fixed size ceiling.
-
 ## More useful numbers
 
 ### Blocked time, not just activity

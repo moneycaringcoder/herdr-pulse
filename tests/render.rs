@@ -10,11 +10,11 @@
 
 use std::time::Duration;
 
-use pulse::config::Config;
+use pulse::config::{Config, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
 use pulse::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
     badge, display_width, duration, json_document, pane, pane_geometry, sparkline,
-    staleness_tolerance, state_glyph, GAP, QUIET, RAMP,
+    staleness_tolerance, state_glyph, week_pane, GAP, QUIET, RAMP,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -39,6 +39,9 @@ fn activity(
         agent_count,
         session: None,
         session_began: None,
+        // A week of gaps unless a test says otherwise: the pane tests are about
+        // the fine series, and an unset coarse ring must not change what they see.
+        week: vec![None; pulse::config::WEEK_COLUMNS],
     }
 }
 
@@ -1064,6 +1067,77 @@ fn the_pane_labels_its_timescale_only_when_the_series_matches_the_configuration(
 }
 
 #[test]
+fn the_week_pane_draws_the_week_series_instead_of_the_fine_series() {
+    let config = Config::default();
+    let (columns, _) = pane_geometry(&config);
+    let mut workspace = activity("web", vec![None; columns], AgentState::Working, Some(60), 1);
+    workspace.week = levels(&[8; WEEK_COLUMNS]);
+
+    let rendered = week_pane(&[workspace], &config, AS_OF, None);
+    let row = row_for(&rendered, "web");
+    assert!(
+        row.contains(&format!("[{}]", "█".repeat(WEEK_COLUMNS))),
+        "the busy week was not drawn: {row:?}"
+    );
+    assert!(
+        !row.contains(&GAP.to_string().repeat(columns)),
+        "the all-gap fine series was drawn instead: {row:?}"
+    );
+    assert!(
+        rendered.starts_with("pulse — week view — 1 workspace — "),
+        "the week pane is not identifiable from its header: {rendered}"
+    );
+}
+
+#[test]
+fn the_week_pane_keeps_a_gap_distinct_from_an_observed_quiet_hour() {
+    let mut workspace = activity("web", levels(&[8]), AgentState::Idle, Some(60), 1);
+    workspace.week = vec![None; WEEK_COLUMNS];
+    workspace.week[1] = Some(Level::new(0));
+
+    let rendered = week_pane(&[workspace], &Config::default(), AS_OF, None);
+    let row = row_for(&rendered, "web");
+    assert!(
+        row.contains(&format!("[{GAP}{QUIET}")),
+        "gap and observed quiet were not drawn distinctly: {row:?}"
+    );
+}
+
+#[test]
+fn the_week_and_once_legends_state_the_scale_of_the_series_they_draw() {
+    let config = Config::default();
+    let (columns, _) = pane_geometry(&config);
+    let mut workspace = activity(
+        "web",
+        levels(&vec![2; columns]),
+        AgentState::Working,
+        Some(60),
+        1,
+    );
+    workspace.week = levels(&[2; WEEK_COLUMNS]);
+
+    let once = pane(std::slice::from_ref(&workspace), &config, AS_OF, None);
+    let week = week_pane(&[workspace], &config, AS_OF, None);
+
+    assert!(
+        once.contains("one column = 7m  |  whole row = 3h44"),
+        "{once}"
+    );
+    assert!(
+        !once.contains("one column = 6h00  |  whole row = 7d"),
+        "{once}"
+    );
+    assert!(
+        week.contains("one column = 6h00  |  whole row = 7d"),
+        "{week}"
+    );
+    assert!(
+        !week.contains("one column = 7m  |  whole row = 3h44"),
+        "{week}"
+    );
+}
+
+#[test]
 fn pane_geometry_never_asks_for_more_columns_than_there_are_buckets() {
     for retention in [1usize, 8, 31, 32, 33, 240, 10_000] {
         let config = Config {
@@ -1270,33 +1344,49 @@ fn the_gap_glyph_survives_a_badge_round_trip() {
     );
 }
 
-/// The `--json` document must carry the same gap/quiet distinction the pane
+/// The `--json` document must carry the same gap/quiet distinction each pane
 /// draws with glyphs, but in the JSON type rather than in a sentinel number: a
 /// gap is `null`, an observed-but-idle bucket is `0`. A consumer that flattens
 /// the two — treating `null` as `0` — gets exactly the wrong answer this plugin
-/// exists to prevent, so the distinction has to survive serialisation, not just
-/// live in `WorkspaceActivity::series`.
+/// exists to prevent, so the distinction has to survive serialisation in both
+/// the fine and week histories.
 #[test]
-fn json_series_tells_a_gap_from_an_observed_quiet_bucket() {
+fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     let config = Config::default();
     let series = vec![None, Some(Level::new(0)), Some(Level::new(5))];
-    let workspace = activity("w1", series, AgentState::Idle, None, 1);
+    let mut workspace = activity("w1", series, AgentState::Idle, None, 1);
+    workspace.week = vec![Some(Level::new(0)), None, Some(Level::new(8))];
 
     let document = json_document(&config, AS_OF, 3, 1, &[workspace], None);
     let series = &document["workspaces"][0]["series"];
+    let week = &document["workspaces"][0]["week"];
 
     assert!(
         series[0].is_null(),
-        "a gap must serialise as JSON null, not 0: {series}"
+        "a fine gap must serialise as JSON null, not 0: {series}"
     );
     assert_eq!(
         series[1], 0,
-        "an observed quiet bucket must serialise as 0, not null: {series}"
+        "a fine observed quiet bucket must serialise as 0, not null: {series}"
     );
     assert_eq!(
         series[2], 5,
-        "an observed active bucket lost its level: {series}"
+        "a fine observed active bucket lost its level: {series}"
     );
+    assert_eq!(
+        week[0], 0,
+        "a week observed quiet bucket must serialise as 0, not null: {week}"
+    );
+    assert!(
+        week[1].is_null(),
+        "a week gap must serialise as JSON null, not 0: {week}"
+    );
+    assert_eq!(
+        week[2], 8,
+        "a week observed active bucket lost its level: {week}"
+    );
+    assert_eq!(document["week_bucket_seconds"], WEEK_BUCKET_SECONDS);
+    assert_eq!(document["week_columns"], WEEK_COLUMNS);
 }
 
 #[test]

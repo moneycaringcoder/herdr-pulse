@@ -11,11 +11,13 @@
 //!
 //! # The three properties that matter
 //!
-//! 1. **Bounded by construction.** The ring is `retention_buckets` long and is
-//!    never grown. Tracked workspaces are capped at `max_workspaces`, evicting
-//!    the least recently seen. The file size must have a ceiling that does not
-//!    depend on uptime, and there is a test that proves it over many thousands
-//!    of samples.
+//! 1. **Bounded by construction.** Each workspace carries two rings, and neither
+//!    is ever grown: the fine one is `retention_buckets` long, and the week one
+//!    is a fixed 168 hourly buckets — around 40% of the file at the defaults, and
+//!    counted into the ceiling `config::MAX_TOTAL_BUCKETS` enforces. Tracked
+//!    workspaces are capped at `max_workspaces`, evicting the least recently
+//!    seen. The file size must have a ceiling that does not depend on uptime, and
+//!    there is a test that proves it over many thousands of samples.
 //!
 //! 2. **Gaps are not quiet.** A bucket the sampler did not observe is `None`,
 //!    never `Level(0)`. If the daemon was stopped for forty minutes, those
@@ -167,6 +169,228 @@ impl Bucket {
     }
 }
 
+/// A read-only view of one ring: its buckets and the absolute number of the
+/// newest one written.
+///
+/// The ring mechanics live here, once, because there are two rings now — the
+/// fine one the user configures and the fixed week one beside it — and the
+/// subtle parts (which slots belong to the current lap, what a column of them
+/// averages to) must be identical for both. A second copy of this reasoning
+/// would be a second place for the lap edge to go wrong.
+#[derive(Debug, Clone, Copy)]
+struct RingRef<'a> {
+    buckets: &'a [Bucket],
+    newest: u64,
+}
+
+/// The same view, mutable, for the paths that write.
+struct RingMut<'a> {
+    buckets: &'a mut Vec<Bucket>,
+    newest: &'a mut u64,
+}
+
+impl<'a> RingRef<'a> {
+    /// The ring slot holding absolute bucket `number`, or `None` when that
+    /// bucket is not in the ring's current lap.
+    ///
+    /// This is the guard that keeps a previous lap's data from being read as
+    /// this one's. Every slot always holds *something*, and `number % len` is
+    /// happy to hand back a slot written a full lap ago — which is a plausible
+    /// looking bar drawn in a column the sampler never observed. Both ends
+    /// matter: `number` above `newest` is the future (the ring holds the same
+    /// slot's value from the previous lap), and `number` more than a lap below it
+    /// has already been overwritten by newer data.
+    fn slot(&self, number: u64) -> Option<usize> {
+        let len = self.buckets.len() as u64;
+        if len == 0 || number > self.newest {
+            return None;
+        }
+        // `number + len` has to be checked. `newest` comes straight out of the
+        // history file, and one near `u64::MAX` overflows the add — a panic in a
+        // debug build today, and a bare SIGABRT the day anyone turns on
+        // `overflow-checks` for the release profile, on the `pulse --once` path
+        // that runs in somebody's sidebar. An overflow means the lap edge is past
+        // `u64::MAX` and so past `newest`: the bucket is inside the lap.
+        if number
+            .checked_add(len)
+            .is_some_and(|lap_edge| lap_edge <= self.newest)
+        {
+            return None;
+        }
+        Some((number % len) as usize)
+    }
+
+    /// The bucket for an absolute bucket number, or a gap if it is not in the
+    /// ring's current lap.
+    fn bucket(&self, number: u64) -> Bucket {
+        self.slot(number)
+            .map(|slot| self.buckets[slot])
+            .unwrap_or_default()
+    }
+
+    /// The level for one output column, covering absolute buckets `first..=last`.
+    ///
+    /// `None` only when *nothing* in the range was observed. A column that is
+    /// half gap and half data is data: it is real, and dropping it would punch a
+    /// hole in the sparkline every time the daemon restarted mid-column.
+    fn column(&self, first: u64, last: u64) -> Option<Level> {
+        let len = self.buckets.len() as u64;
+        if len == 0 {
+            return None;
+        }
+        // Clamp the walk to the live lap — `[newest - len + 1, newest]` — so a
+        // column wider than the ring still costs at most one lap of iteration
+        // however far into the future `as_of` is.
+        //
+        // Both ends are anchored on `newest`, never on the column. An earlier
+        // version measured a ring length back from `last`, which is the
+        // *column's* newest bucket and can be well past `newest` whenever the
+        // workspace stopped being reported before `as_of`. The walk then started
+        // after the oldest live slots and never reached them, so a column holding
+        // minutes of real, still-retained data read as a gap.
+        // `--bucket-seconds 10 --columns 1` is enough to reach it.
+        let first = first.max(self.newest.saturating_sub(len - 1));
+        let last = last.min(self.newest);
+
+        let mut total: u32 = 0;
+        let mut observed: u32 = 0;
+        for number in first..=last {
+            let bucket = self.bucket(number);
+            if !bucket.observed() {
+                continue;
+            }
+            total += u32::from(bucket.level());
+            observed += 1;
+        }
+        if observed == 0 {
+            return None;
+        }
+        Some(Level::new(((total + observed / 2) / observed) as u8))
+    }
+
+    /// Every column of a series, oldest first, ending with the bucket containing
+    /// `newest_wanted`.
+    fn series(&self, newest_wanted: u64, columns: usize, per_column: u64) -> Vec<Option<Level>> {
+        let per_column = per_column.max(1);
+        (0..columns)
+            .map(|column| {
+                // Oldest first: column 0 is the furthest back, and the last
+                // column is the one containing `newest_wanted`.
+                let back = ((columns - 1 - column) as u64).saturating_mul(per_column);
+                // A column entirely before the epoch is not a column.
+                let last = newest_wanted.checked_sub(back)?;
+                let first = last.saturating_sub(per_column - 1);
+                self.column(first, last)
+            })
+            .collect()
+    }
+}
+
+impl<'a> RingMut<'a> {
+    fn as_ref(&self) -> RingRef<'_> {
+        RingRef {
+            buckets: self.buckets,
+            newest: *self.newest,
+        }
+    }
+
+    /// Re-lays the ring at a new length, keeping each bucket at the slot its
+    /// absolute number implies.
+    ///
+    /// Reached when a user changes `retention_buckets` between runs, and on the
+    /// first load of a file written before the week ring existed, whose week ring
+    /// arrives empty. Growing or truncating the vector in place would be far
+    /// simpler and completely wrong: the ring is indexed modulo its length, so
+    /// changing the length silently re-points every slot at a different minute.
+    /// That is a whole sparkline of real-looking data describing the wrong times,
+    /// which is exactly the class of failure this module is built to refuse.
+    fn reshape(&mut self, len: usize) {
+        if self.buckets.len() == len {
+            return;
+        }
+        let mut fresh = vec![Bucket::default(); len];
+        let keep = (self.buckets.len() as u64).min(len as u64);
+        for back in 0..keep {
+            let Some(number) = self.newest.checked_sub(back) else {
+                break;
+            };
+            if let Some(slot) = self.as_ref().slot(number) {
+                fresh[(number % len as u64) as usize] = self.buckets[slot];
+            }
+        }
+        *self.buckets = fresh;
+    }
+
+    /// Moves the newest bucket forward, clearing every slot passed over.
+    ///
+    /// The clearing is the point. Those slots hold the previous lap's counts, and
+    /// the minutes we skipped are minutes we did not observe — they have to come
+    /// back as gaps, not as whatever was there four hours ago. At most one lap's
+    /// worth of clearing is ever needed: a longer jump means the whole ring is
+    /// stale, and every slot gets reset exactly once.
+    fn advance(&mut self, number: u64) {
+        let len = self.buckets.len() as u64;
+        if len == 0 {
+            *self.newest = number;
+            return;
+        }
+        let skipped = number - *self.newest;
+        for step in 0..skipped.min(len) {
+            let stale = number - step;
+            self.buckets[(stale % len) as usize] = Bucket::default();
+        }
+        *self.newest = number;
+    }
+
+    /// Pulls the anchor *back* to `number`, discarding every bucket newer than it.
+    ///
+    /// The counterpart to [`Self::advance`], and the only escape from a `newest`
+    /// that a fast clock wrote into the future. Without it the drop rule in
+    /// `WorkspaceHistory::observe` discards every later sample until the wall
+    /// clock climbs back past that bucket — for as long as the forward jump was,
+    /// across daemon restarts and reboots, because the anchor is persisted.
+    ///
+    /// Discarding the newer buckets is not a loss: they were stamped by the same
+    /// wrong clock and describe minutes that never happened.
+    fn rewind(&mut self, number: u64) {
+        let len = self.buckets.len() as u64;
+        if len > 0 {
+            let ahead = self.newest.saturating_sub(number);
+            for step in 0..ahead.min(len) {
+                let unreachable = *self.newest - step;
+                self.buckets[(unreachable % len) as usize] = Bucket::default();
+            }
+        }
+        *self.newest = number;
+    }
+
+    /// Folds one observation into the bucket containing `number`, moving the
+    /// anchor to meet it first.
+    ///
+    /// The counters saturate throughout: a pathological interval and bucket-width
+    /// pair could in principle push past `u16`, and a wrapped counter reads as a
+    /// suddenly quiet workspace, which is a wrong answer nobody can see.
+    fn absorb(&mut self, number: u64, working: bool, blocked: bool, transitions: u16) {
+        if number < *self.newest {
+            self.rewind(number);
+        } else if number > *self.newest {
+            self.advance(number);
+        }
+        let Some(slot) = self.as_ref().slot(number) else {
+            return;
+        };
+        let bucket = &mut self.buckets[slot];
+        bucket.samples = bucket.samples.saturating_add(1);
+        if working {
+            bucket.working = bucket.working.saturating_add(1);
+        }
+        if blocked {
+            bucket.blocked = bucket.blocked.saturating_add(1);
+        }
+        bucket.transitions = bucket.transitions.saturating_add(transitions);
+    }
+}
+
 /// Everything recorded for one workspace.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceHistory {
@@ -226,12 +450,29 @@ pub struct WorkspaceHistory {
     #[serde(default)]
     pub session_began: Option<u64>,
     /// Ring of buckets, indexed by absolute bucket number modulo the ring
-    /// length. Fixed length; never grown.
+    /// length. Fixed length; never grown. `config.bucket_seconds` per bucket.
     pub buckets: Vec<Bucket>,
     /// Absolute bucket number of the newest bucket written, so a reader can tell
     /// which ring slots are current and which are stale leftovers from a
     /// previous lap.
     pub newest_bucket: u64,
+    /// The coarse ring: one hour per bucket, a week of them, recorded from the
+    /// same observations as the fine ring and never derived from it.
+    ///
+    /// It answers a different question — "did this workspace do anything
+    /// yesterday" — and it is a separate ring rather than a wider window on the
+    /// fine one because the fine ring's size is the user's business and its
+    /// ceiling is load-bearing. Folding hours out of four hours of minutes cannot
+    /// reach yesterday at all.
+    ///
+    /// Defaulted on load: a file written before this ring existed comes back with
+    /// it empty, and the first `reshape` lays it out as a week of gaps. Nothing is
+    /// back-filled from the fine ring, because the fine ring never held those
+    /// hours.
+    #[serde(default)]
+    pub week_buckets: Vec<Bucket>,
+    #[serde(default)]
+    pub week_newest_bucket: u64,
     /// Aggregate state at the last observation.
     pub state: String,
     /// Unix seconds at which `state` was first observed to hold. `None` until a
@@ -275,6 +516,8 @@ impl WorkspaceHistory {
             session_began: session.map(|mark| mark.began),
             buckets: vec![Bucket::default(); config.retention_buckets],
             newest_bucket: bucket_number(taken_at, config),
+            week_buckets: vec![Bucket::default(); crate::config::WEEK_RETENTION_BUCKETS],
+            week_newest_bucket: week_bucket_number(taken_at),
             state: observation.state().as_str().to_string(),
             state_since: None,
             last_seen: taken_at,
@@ -282,42 +525,38 @@ impl WorkspaceHistory {
         }
     }
 
-    /// The ring slot holding absolute bucket `number`, or `None` when that
-    /// bucket is not in the ring's current lap.
-    ///
-    /// This is the guard that keeps a previous lap's data from being read as
-    /// this one's. Every slot always holds *something*, and `number % len` is
-    /// happy to hand back a slot written a full lap ago — which is a plausible
-    /// looking bar drawn in a column the sampler never observed. Both ends
-    /// matter: `number` above `newest_bucket` is the future (the ring holds the
-    /// same slot's value from the previous lap), and `number` more than a lap
-    /// below it has already been overwritten by newer data.
-    fn slot(&self, number: u64) -> Option<usize> {
-        let len = self.buckets.len() as u64;
-        if len == 0 || number > self.newest_bucket {
-            return None;
+    /// The fine ring the user configures.
+    fn fine(&self) -> RingRef<'_> {
+        RingRef {
+            buckets: &self.buckets,
+            newest: self.newest_bucket,
         }
-        // `number + len` has to be checked. `newest_bucket` comes straight out of
-        // the history file, and one near `u64::MAX` overflows the add — a panic
-        // in a debug build today, and a bare SIGABRT the day anyone turns on
-        // `overflow-checks` for the release profile, on the `pulse --once` path
-        // that runs in somebody's sidebar. An overflow means the lap edge is past
-        // `u64::MAX` and so past `newest_bucket`: the bucket is inside the lap.
-        if number
-            .checked_add(len)
-            .is_some_and(|lap_edge| lap_edge <= self.newest_bucket)
-        {
-            return None;
-        }
-        Some((number % len) as usize)
     }
 
-    /// The bucket for an absolute bucket number, or a gap if it is not in the
-    /// ring's current lap.
+    fn fine_mut(&mut self) -> RingMut<'_> {
+        RingMut {
+            buckets: &mut self.buckets,
+            newest: &mut self.newest_bucket,
+        }
+    }
+
+    /// The coarse ring: hours, a week of them.
+    fn week(&self) -> RingRef<'_> {
+        RingRef {
+            buckets: &self.week_buckets,
+            newest: self.week_newest_bucket,
+        }
+    }
+
+    fn week_mut(&mut self) -> RingMut<'_> {
+        RingMut {
+            buckets: &mut self.week_buckets,
+            newest: &mut self.week_newest_bucket,
+        }
+    }
+
     fn bucket(&self, number: u64) -> Bucket {
-        self.slot(number)
-            .map(|slot| self.buckets[slot])
-            .unwrap_or_default()
+        self.fine().bucket(number)
     }
 
     /// Re-lays the ring at a coarser bucket size, folding `factor` old buckets
@@ -400,77 +639,43 @@ impl WorkspaceHistory {
         kept
     }
 
-    /// Re-lays the ring at a new length, keeping each bucket at the slot its
-    /// absolute number implies.
+    /// Re-lays both rings at their configured lengths.
     ///
-    /// Reached when a user changes `retention_buckets` between runs. Growing or
-    /// truncating the vector in place would be far simpler and completely wrong:
-    /// the ring is indexed modulo its length, so changing the length silently
-    /// re-points every slot at a different minute. That is a whole sparkline of
-    /// real-looking data describing the wrong times, which is exactly the class
-    /// of failure this module is built to refuse.
+    /// The fine one follows `retention_buckets`; the week one is fixed, and is
+    /// laid out here on the first load of a file written before it existed.
     fn reshape(&mut self, len: usize) {
-        if self.buckets.len() == len {
-            return;
-        }
-        let mut fresh = vec![Bucket::default(); len];
-        let keep = (self.buckets.len() as u64).min(len as u64);
-        for back in 0..keep {
-            let Some(number) = self.newest_bucket.checked_sub(back) else {
-                break;
-            };
-            if let Some(slot) = self.slot(number) {
-                fresh[(number % len as u64) as usize] = self.buckets[slot];
-            }
-        }
-        self.buckets = fresh;
+        self.fine_mut().reshape(len);
+        self.week_mut()
+            .reshape(crate::config::WEEK_RETENTION_BUCKETS);
     }
 
-    /// Moves the newest bucket forward, clearing every slot passed over.
-    ///
-    /// The clearing is the point. Those slots hold the previous lap's counts,
-    /// and the minutes we skipped are minutes we did not observe — they have to
-    /// come back as gaps, not as whatever was there four hours ago. At most one
-    /// lap's worth of clearing is ever needed: a longer jump means the whole
-    /// ring is stale, and every slot gets reset exactly once.
     fn advance(&mut self, number: u64) {
-        let len = self.buckets.len() as u64;
-        if len == 0 {
-            self.newest_bucket = number;
-            return;
-        }
-        let skipped = number - self.newest_bucket;
-        for step in 0..skipped.min(len) {
-            let stale = number - step;
-            self.buckets[(stale % len) as usize] = Bucket::default();
-        }
-        self.newest_bucket = number;
+        self.fine_mut().advance(number);
     }
 
-    /// Pulls the anchor *back* to `number`, discarding every bucket newer than
-    /// it, and re-stamps the timestamps that were written alongside them.
+    /// Pulls both anchors *back* to meet `taken_at`, discarding every bucket
+    /// newer than it, and re-stamps the timestamps that were written alongside
+    /// them.
     ///
-    /// The counterpart to [`Self::advance`], and the only escape from a
-    /// `newest_bucket` that a fast clock wrote into the future. Without it the
-    /// drop rule in [`Self::observe`] discards every later sample until the wall
-    /// clock climbs back past that bucket — for as long as the forward jump was,
-    /// across daemon restarts and reboots, because `newest_bucket` is persisted.
+    /// The counterpart to [`Self::advance`], and the only escape from an anchor
+    /// that a fast clock wrote into the future. Without it the drop rule in
+    /// [`Self::observe`] discards every later sample until the wall clock climbs
+    /// back past that bucket — for as long as the forward jump was, across daemon
+    /// restarts and reboots, because the anchors are persisted.
     ///
     /// Discarding the newer buckets is not a loss: they were stamped by the same
     /// wrong clock and describe minutes that never happened. `last_seen` and
     /// `state_since` carry that clock too, and `WorkspaceActivity` measures
     /// freshness from them, so a future `last_seen` left in place would report
     /// "observed just now" forever beside a sparkline of pure gaps.
+    ///
+    /// Only the fine anchor is pulled back here. The week ring is rewound by the
+    /// [`RingMut::absorb`] that follows, which meets whatever anchor it finds —
+    /// and it must be rewound, because a stepped clock wrote into both and a
+    /// coarse anchor left in the future would keep the week view deaf for as many
+    /// *hours* as the jump was long.
     fn rewind(&mut self, number: u64, taken_at: u64) {
-        let len = self.buckets.len() as u64;
-        if len > 0 {
-            let ahead = self.newest_bucket - number;
-            for step in 0..ahead.min(len) {
-                let unreachable = self.newest_bucket - step;
-                self.buckets[(unreachable % len) as usize] = Bucket::default();
-            }
-        }
-        self.newest_bucket = number;
+        self.fine_mut().rewind(number);
         self.last_seen = taken_at;
         if self.state_since.is_some_and(|since| since > taken_at) {
             // We no longer know when this state began: the only stamp we had for
@@ -551,28 +756,24 @@ impl WorkspaceHistory {
         }
 
         let transitions = self.count_transitions(observation);
-        if let Some(slot) = self.slot(number) {
-            let bucket = &mut self.buckets[slot];
-            // Saturating throughout: a pathological interval/bucket-width pair
-            // could in principle push past u16, and a wrapped counter reads as a
-            // suddenly quiet workspace, which is a wrong answer nobody can see.
-            bucket.samples = bucket.samples.saturating_add(1);
-            if observation
-                .agents
-                .iter()
-                .any(|a| a.state == AgentState::Working)
-            {
-                bucket.working = bucket.working.saturating_add(1);
-            }
-            if observation
-                .agents
-                .iter()
-                .any(|a| a.state == AgentState::Blocked)
-            {
-                bucket.blocked = bucket.blocked.saturating_add(1);
-            }
-            bucket.transitions = bucket.transitions.saturating_add(transitions);
-        }
+        let working = observation
+            .agents
+            .iter()
+            .any(|a| a.state == AgentState::Working);
+        let blocked = observation
+            .agents
+            .iter()
+            .any(|a| a.state == AgentState::Blocked);
+        self.fine_mut()
+            .absorb(number, working, blocked, transitions);
+        // The same observation, into the coarse ring. Recorded rather than
+        // derived: the fine ring only reaches back four hours at the defaults, so
+        // nothing that answers "did this workspace do anything yesterday" could
+        // ever be folded out of it. Both rings therefore see every sample, and an
+        // hour nobody sampled stays a gap in the week exactly as a minute nobody
+        // sampled stays one in the afternoon.
+        self.week_mut()
+            .absorb(week_bucket_number(taken_at), working, blocked, transitions);
 
         let state = observation.state();
         if self.state != state.as_str() {
@@ -599,46 +800,6 @@ impl WorkspaceHistory {
 
         self.last_seen = self.last_seen.max(taken_at);
         rewound
-    }
-
-    /// The level for one output column, covering absolute buckets `first..=last`.
-    ///
-    /// `None` only when *nothing* in the range was observed. A column that is
-    /// half gap and half data is data: it is real, and dropping it would punch a
-    /// hole in the sparkline every time the daemon restarted mid-column.
-    fn column(&self, first: u64, last: u64) -> Option<Level> {
-        let len = self.buckets.len() as u64;
-        if len == 0 {
-            return None;
-        }
-        // Clamp the walk to the live lap — `[newest_bucket - len + 1,
-        // newest_bucket]` — so a column wider than the ring still costs at most
-        // one lap of iteration however far into the future `as_of` is.
-        //
-        // Both ends are anchored on `newest_bucket`, never on the column. An
-        // earlier version measured a ring length back from `last`, which is the
-        // *column's* newest bucket and can be well past `newest_bucket` whenever
-        // the workspace stopped being reported before `as_of`. The walk then
-        // started after the oldest live slots and never reached them, so a column
-        // holding minutes of real, still-retained data read as a gap.
-        // `--bucket-seconds 10 --columns 1` is enough to reach it.
-        let first = first.max(self.newest_bucket.saturating_sub(len - 1));
-        let last = last.min(self.newest_bucket);
-
-        let mut total: u32 = 0;
-        let mut observed: u32 = 0;
-        for number in first..=last {
-            let bucket = self.bucket(number);
-            if !bucket.observed() {
-                continue;
-            }
-            total += u32::from(bucket.level());
-            observed += 1;
-        }
-        if observed == 0 {
-            return None;
-        }
-        Some(Level::new(((total + observed / 2) / observed) as u8))
     }
 }
 
@@ -1007,17 +1168,16 @@ impl History {
         self.workspaces
             .iter()
             .map(|workspace| {
-                let series = (0..columns)
-                    .map(|column| {
-                        // Oldest first: column 0 is the furthest back, and the
-                        // last column is the one containing `as_of`.
-                        let back = ((columns - 1 - column) as u64).saturating_mul(per_column);
-                        // A column entirely before the epoch is not a column.
-                        let last = newest.checked_sub(back)?;
-                        let first = last.saturating_sub(per_column - 1);
-                        workspace.column(first, last)
-                    })
-                    .collect();
+                let series = workspace.fine().series(newest, columns, per_column);
+                // The week is always projected, at its own fixed geometry: it is
+                // one series per workspace either way, and a consumer that asks
+                // for the afternoon should not have to ask twice to find out
+                // whether yesterday happened.
+                let week = workspace.week().series(
+                    week_bucket_number(as_of),
+                    crate::config::WEEK_COLUMNS,
+                    crate::config::WEEK_BUCKETS_PER_COLUMN as u64,
+                );
                 WorkspaceActivity {
                     workspace_id: workspace.workspace_id.clone(),
                     label: workspace.label.clone(),
@@ -1049,6 +1209,7 @@ impl History {
                     // rows for one checkout are one interrupted series.
                     session: workspace.session.clone(),
                     session_began: workspace.session_began,
+                    week,
                 }
             })
             .collect()
@@ -1074,6 +1235,26 @@ impl History {
         }
         self.bucket_seconds = config.bucket_seconds;
         kept
+    }
+
+    /// Empties every fine ring, keeps every week ring, and adopts the live
+    /// bucket size.
+    ///
+    /// Reached when the recorded `bucket_seconds` cannot be re-laid at the live
+    /// one. That is a fact about the fine ring and about nothing else: the week
+    /// ring is an hour per bucket whatever the user configures, so its hours are
+    /// still exactly the hours it recorded. Throwing away a week of history
+    /// because the *minutes* beside it were written at another scale would be a
+    /// loss with no reason behind it.
+    ///
+    /// The identity, state and timestamps come through with the week ring, since
+    /// they are what say whose hours those are.
+    fn keep_only_week(&mut self, config: &Config) {
+        for workspace in &mut self.workspaces {
+            workspace.buckets = vec![Bucket::default(); config.retention_buckets];
+            workspace.newest_bucket = bucket_number(workspace.last_seen, config);
+        }
+        self.bucket_seconds = config.bucket_seconds;
     }
 }
 
@@ -1149,6 +1330,16 @@ fn coarsening_factor(recorded: u64, live: u64) -> Option<u64> {
 /// starting a new one.
 fn bucket_number(at: u64, config: &Config) -> u64 {
     at / config.bucket_seconds.max(1)
+}
+
+/// The absolute hour containing a Unix timestamp, which is the coarse ring's
+/// bucket number.
+///
+/// Not derived from `config`: the week ring's width is fixed, so a config change
+/// can never re-point its slots at different hours the way it can for the fine
+/// ring. That is the whole reason it is a constant.
+fn week_bucket_number(at: u64) -> u64 {
+    at / crate::config::WEEK_BUCKET_SECONDS.max(1)
 }
 
 /// Loads the history from the state dir.
@@ -1236,18 +1427,16 @@ pub fn load_from(dir: &Path, config: &Config) -> History {
                     );
                 } else {
                     eprintln!(
-                        "pulse: starting with an empty history, {} has {recorded}s buckets and \
-                         this run uses {}s; no run of {factor} buckets was watched end to end, \
-                         so every fold of them is a gap",
+                        "pulse: {} has {recorded}s buckets and this run uses {}s; no run of \
+                         {factor} buckets was watched end to end, so the fine history is gone \
+                         and only the week ring is kept",
                         path.display(),
                         config.bucket_seconds
                     );
-                    // The message and the store have to agree. Every ring came
-                    // back a gap, so what is left is workspace names attached to
-                    // no observations at all; keeping them would draw rows that
-                    // claim a last-seen time beside a sparkline with nothing in
-                    // it, under a line that says the history is gone.
-                    return History::empty(config);
+                    // The message and the store have to agree: every fold came
+                    // back a gap, so the fine ring holds nothing and is reset
+                    // rather than left as rows of empty slots at the old scale.
+                    history.keep_only_week(config);
                 }
             }
             None => {
@@ -1270,13 +1459,17 @@ pub fn load_from(dir: &Path, config: &Config) -> History {
                     "the new size is not a whole multiple of the old one"
                 };
                 eprintln!(
-                    "pulse: starting with an empty history, {} has {}s buckets and this run \
-                     uses {}s; {why}",
+                    "pulse: {} has {}s buckets and this run uses {}s; {why}, so the fine \
+                     history is discarded and only the week ring is kept",
                     path.display(),
                     history.bucket_seconds,
                     config.bucket_seconds
                 );
-                return History::empty(config);
+                // Only the fine ring is at the wrong scale. The week ring is an
+                // hour per bucket whatever the user configures, so its hours are
+                // still exactly the hours it recorded, and discarding them here
+                // would be a loss with no reason behind it.
+                history.keep_only_week(config);
             }
         }
     }

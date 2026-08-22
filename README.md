@@ -162,12 +162,13 @@ pulse --once
 | Verb | What it does |
 |---|---|
 | `--once` | Print a one-shot activity report and exit. The default when no verb is given. |
+| `--week` | Print a one-shot week view and exit. One column is six hours; the row covers seven days. |
 | `--json` | Print the recorded history as JSON and exit. Gaps are `null`, observed-and-quiet is `0`. |
 | `--watch` | Live activity view, refreshing on an interval. Exits with a message if no sampler is running. |
 
 ### Reading the pane
 
-`--once` and `--watch` print one row per workspace:
+`--once`, `--week` and `--watch` print one row per workspace:
 
 | Column | Meaning |
 |---|---|
@@ -323,11 +324,24 @@ span anyone asks this question about. The ring is allocated at this length and
 never grows, so the history file's size has a ceiling that does not depend on
 uptime.
 
+**168 hourly buckets = 7 days.** The configurable fine ring answers what
+happened over the last few hours; the fixed week ring answers whether a
+workspace did anything yesterday, or at any other point this week. Both record
+the same samples. The week ring is not derived by folding the fine ring because,
+at the defaults, those minute buckets have aged out after four hours. Its
+one-hour buckets and 168-bucket width are not configurable, so "the week" always
+means exactly seven days.
+
+**8 workspaces × (240 fine + 168 week) buckets ≈ 180 KB.** That is the measured
+history-file size at the defaults. The week ring accounts for
+`168 / (240 + 168) ≈ 41%`, roughly 40%, of the file.
+
 **8 badge columns over 64 minutes = 8 minutes per column.** Sidebar cells are
 narrow; eight columns plus a state glyph is about as much as fits before herdr
 starts eliding. 64 minutes divides evenly by 8 and still reads as "the last
-hour". The `--once` and `--watch` panes are not so constrained and draw the full
-retention across 32 wider columns instead.
+hour". The `--once` and `--watch` panes are not so constrained and draw the
+full fine-ring retention across 32 wider columns; `--week` draws its fixed ring
+across 28 columns instead.
 
 **5-second sampling.** One snapshot of a live 10-workspace, 18-agent session
 measured 12.7 ms and 34 KB on the wire, so a 5-second interval is a 0.25% duty
@@ -352,13 +366,14 @@ cycle — cheap enough that the finer resolution is worth having.
   ages out.
 - The badge cannot say which session it is drawing; there is no room in a sidebar
   cell for it. The pane and `--json` can, and do.
-- Increasing `bucket_seconds` by a whole multiple folds the old buckets, sums
-  their counters and keeps the history. A decrease still discards because a
-  smaller bucket cannot be recovered from a larger one; an increase that is not
-  a whole multiple still discards because its boundaries would split
-  observations that were never recorded separately. Both discard with a message
-  saying why. A folded group containing any unobserved time is unobserved, never
-  quiet.
+- Increasing `bucket_seconds` by a whole multiple folds the fine ring, sums each
+  group of counters and keeps that history. A decrease still discards the fine
+  ring because a smaller bucket cannot be recovered from a larger one; an
+  increase that is not a whole multiple also discards it because its boundaries
+  would split observations that were never recorded separately. Both discard
+  with a message saying why. The fixed hourly week ring is independent of
+  `bucket_seconds` and remains intact. A folded fine-ring group containing any
+  unobserved time is unobserved, never quiet.
 
 ## License
 

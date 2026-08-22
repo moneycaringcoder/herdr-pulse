@@ -340,11 +340,12 @@ fn no_verb_panics_without_a_server() {
 }
 
 /// Every verb that needs no socket.
-const VERBS: [[&str; 1]; 7] = [
+const VERBS: [[&str; 1]; 8] = [
     ["--help"],
     ["--version"],
     ["--once"],
     ["--json"],
+    ["--week"],
     ["--forget"],
     ["--restore"],
     ["--bogus-verb"],
