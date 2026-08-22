@@ -97,8 +97,12 @@ pub const TRANSITION_MARKER: char = '^';
 /// reading the keys it knows is unaffected — but it does earn a changelog entry
 /// like any other visible change.
 ///
-/// `tests/render.rs` pins the full set of key paths, so a shape that moves
-/// without this constant moving fails the suite rather than somebody's script.
+/// `tests/render.rs` pins every key path with the JSON type under it, so a key
+/// removed, renamed or moved, and a value that changed type or nullability, fail
+/// the suite rather than somebody's script. A unit that changes from seconds to
+/// milliseconds, or a key that keeps its name and starts meaning something else,
+/// is not mechanically detectable — that half rests on review, and the test does
+/// not pretend otherwise by reading this constant.
 pub const JSON_SCHEMA_VERSION: u32 = 1;
 
 const MAX_TRANSITION_MARKERS: usize = 3;

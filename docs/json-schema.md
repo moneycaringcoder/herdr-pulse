@@ -34,9 +34,9 @@ The version promises the document's shape: which keys exist, where they are
 nested, each value's type and unit, and what each value means. It does not freeze
 the values; those change every time the sampler runs.
 
-It also does not promise the contents or positions of `workspaces`. That array
-follows the order in which workspaces were first seen, so consumers must not
-attach meaning to an array index or sort it by assumption.
+It also does not promise which workspaces appear, or in what positions. That
+array follows the order in which workspaces were first seen, so consumers must
+not attach meaning to an array index or sort it by assumption.
 
 ## Schema version 1 fields
 
@@ -110,8 +110,24 @@ existing key means.
 
 Adding a new key beside the existing keys does not move the version. A consumer
 that reads only the keys it knows remains unaffected, but the addition still
-earns a changelog entry. `tests/render.rs` pins the complete set of key paths, so
-a shape move without a version bump fails CI.
+earns a changelog entry.
+
+That rule places one obligation on the consumer: **ignore keys you do not
+recognise.** A JSON Schema validator configured with `additionalProperties:
+false`, or a deserialiser using serde's `deny_unknown_fields`, is asserting a
+promise this contract does not make, and will break on an addition that breaks
+nobody else.
+
+What is mechanically enforced, and what is not. `tests/render.rs` pins every key
+path together with the JSON type and nullability found under it, across two
+fixtures — one where every optional field is populated and one where every
+nullable field is `null`. A key removed, renamed or moved, an integer that became
+a string, an array that stopped being an array, or a field that can no longer be
+`null` all fail the suite. A unit changing from seconds to milliseconds, or a key
+that keeps its name and type and starts meaning something else, cannot be
+detected by any test; those rest on review, and on this document being read.
+Nothing couples the pinned list to the version either — bumping it is a decision,
+not an assertion the suite can make for you.
 
 ## Reading the document safely
 

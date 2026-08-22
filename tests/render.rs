@@ -8,6 +8,7 @@
 //! The recurring theme is that a gap and a quiet bucket must never be confused,
 //! and that columns line up when measured the way a terminal measures them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use pulse::config::{Config, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
@@ -2549,12 +2550,38 @@ fn json_carries_the_complete_sampler_stop() {
 // The `--json` schema contract
 // ---------------------------------------------------------------------------
 
-/// Every key path in a document, `object.key` joined, arrays flattened to `[]`.
+/// Every key path in a set of documents, with the JSON type found under it:
+/// `columns: integer`, `workspaces[].series: array<integer|null>`.
 ///
-/// Shape, not values: the numbers change every time the sampler runs, and a test
-/// that pinned them would fail for reasons nobody cares about.
-fn key_paths(value: &Value) -> Vec<String> {
-    fn walk(value: &Value, prefix: &str, out: &mut Vec<String>) {
+/// Types, not values. The numbers change every time the sampler runs, and a test
+/// that pinned them would fail for reasons nobody cares about — but a type is
+/// part of the promise, and a key-path list alone cannot tell an integer that
+/// became a string, or a series that stopped being an array, from no change at
+/// all. `series` ceasing to be an array is the most destructive break this
+/// document can suffer.
+///
+/// The union across documents, so a field that is `null` in one and populated in
+/// another is pinned as both. That is what makes nullability part of the pin
+/// rather than an accident of which fixture was used.
+fn shape_of(documents: &[Value]) -> Vec<String> {
+    fn type_of(value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(_) => "boolean".to_string(),
+            Value::Number(number) if number.is_f64() => "number".to_string(),
+            Value::Number(_) => "integer".to_string(),
+            Value::String(_) => "string".to_string(),
+            Value::Object(_) => "object".to_string(),
+            Value::Array(items) => {
+                let mut inner: Vec<String> = items.iter().map(type_of).collect();
+                inner.sort();
+                inner.dedup();
+                format!("array<{}>", inner.join("|"))
+            }
+        }
+    }
+
+    fn walk(value: &Value, prefix: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
         match value {
             Value::Object(map) => {
                 for (key, child) in map {
@@ -2563,7 +2590,7 @@ fn key_paths(value: &Value) -> Vec<String> {
                     } else {
                         format!("{prefix}.{key}")
                     };
-                    out.push(path.clone());
+                    out.entry(path.clone()).or_default().insert(type_of(child));
                     walk(child, &path, out);
                 }
             }
@@ -2575,15 +2602,34 @@ fn key_paths(value: &Value) -> Vec<String> {
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    walk(value, "", &mut out);
-    out.sort();
-    out.dedup();
-    out
+
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for document in documents {
+        walk(document, "", &mut found);
+    }
+    // Sorted as whole entries, the way the pinned list below is written, so the
+    // two orders cannot disagree over where `sampler` sits relative to
+    // `sampler.running`.
+    let mut shape: Vec<String> = found
+        .into_iter()
+        .map(|(path, types)| {
+            format!(
+                "{path}: {}",
+                types.into_iter().collect::<Vec<_>>().join("|")
+            )
+        })
+        .collect();
+    shape.sort();
+    shape
 }
 
 /// A document with every optional part populated, so nothing is missing from the
 /// shape by accident of the fixture.
+///
+/// Every bucket array holds a gap *and* an observed zero, which is how the
+/// pinned shape comes to say `array<integer|null>` rather than `array<integer>`.
+/// The `null` versus `0` rule is the contract's first guarantee, so it belongs in
+/// the mechanical pin and not only in the test that reads the values.
 fn full_document() -> Value {
     let live = session("live-fingerprint", 13 * 3_600);
     let stop = SamplerStop {
@@ -2593,14 +2639,20 @@ fn full_document() -> Value {
     };
     let mut workspace = with_agents(
         with_blocked_time(
-            activity("web", levels(&[4, 0]), AgentState::Working, Some(60), 1),
+            activity(
+                "web",
+                vec![None, Some(Level(4)), Some(Level(0))],
+                AgentState::Working,
+                Some(60),
+                1,
+            ),
             30,
             120,
         ),
         vec![agent(
             "w1:p1",
             Some("claude"),
-            vec![None, Some(Level(4))],
+            vec![None, Some(Level(4)), Some(Level(0))],
             AgentState::Working,
             7,
             30,
@@ -2608,17 +2660,46 @@ fn full_document() -> Value {
         )],
     );
     workspace = recorded_by(workspace, &live);
-    workspace.week = vec![Some(Level(2)); WEEK_COLUMNS];
-    workspace.week_transitions = vec![Some(1); WEEK_COLUMNS];
+    workspace.week = vec![None, Some(Level(2)), Some(Level(0))];
+    workspace.week_transitions = vec![None, Some(1), Some(0)];
 
     json_document(
         &Config::default(),
         AS_OF,
-        2,
+        3,
         1,
         &[workspace],
         Some(&live),
         stopped(&stop),
+    )
+}
+
+/// The other half of the shape: a workspace nobody has observed, no live
+/// session, and a sampler that never ran, so every nullable field is `null`.
+///
+/// Pinned beside [`full_document`] because nullability is part of the promise.
+/// One fixture alone would pin `session.is_current: boolean` and let a change
+/// that made it always `null` — the exact "we could not establish which session
+/// is running" versus "this row is from an old one" confusion the field exists
+/// to prevent — pass unnoticed.
+fn unobserved_document() -> Value {
+    let mut workspace = activity("never-seen", vec![None], AgentState::Unknown, None, 0);
+    workspace.last_seen = None;
+    workspace.week = vec![None];
+    workspace.week_transitions = vec![None];
+    workspace.agents = vec![AgentActivity {
+        program: None,
+        ..agent("w1:p1", None, vec![None], AgentState::Unknown, 0, 0, 0)
+    }];
+
+    json_document(
+        &Config::default(),
+        AS_OF,
+        1,
+        1,
+        &[workspace],
+        None,
+        never_ran(),
     )
 }
 
@@ -2635,74 +2716,81 @@ fn the_json_document_states_its_schema_version() {
 }
 
 #[test]
-fn the_json_shape_cannot_move_without_the_schema_version_moving() {
-    // The whole point of versioning the document. If this test fails, the shape
-    // changed: decide whether it is a change a consumer could notice by reading
-    // the keys — a removal, a rename, a move between objects, a type or unit
-    // change, or a key that now means something else — and if so bump
-    // `JSON_SCHEMA_VERSION` and say so in CHANGELOG.md. A key added beside the
-    // existing ones is not a break, but it still belongs in both this list and
-    // the changelog.
+fn the_json_key_paths_and_types_are_pinned() {
+    // What versioning the document buys, mechanically. If this fails, a key was
+    // removed, renamed or moved, or a value changed type or nullability — all
+    // things a consumer notices. Decide whether it is a break, bump
+    // `JSON_SCHEMA_VERSION` if it is, and say so in CHANGELOG.md either way. A
+    // key added beside the existing ones is not a break, and still belongs in
+    // this list and the changelog.
     //
-    // Values are deliberately not pinned. This is a promise about shape.
+    // What this cannot catch, and no test can: a key that keeps its name and
+    // type and starts meaning something else, or seconds becoming milliseconds.
+    // Those rest on review, and `docs/json-schema.md` says so rather than
+    // implying this list has them covered.
+    //
+    // The entries are the union over the two fixtures and, within each, over
+    // array elements — so `integer|null` is a field seen both ways, and a key
+    // emitted for only *some* workspaces would still appear here. Keep every key
+    // in `json_document` unconditional and this stays an exact set.
     const SHAPE: [&str; 54] = [
-        "as_of",
-        "bucket_seconds",
-        "buckets_per_column",
-        "columns",
-        "level_max",
-        "sampler",
-        "sampler.running",
-        "sampler.stopped",
-        "sampler.stopped.at",
-        "sampler.stopped.detail",
-        "sampler.stopped.reason",
-        "schema_version",
-        "seconds_per_column",
-        "session",
-        "session.began",
-        "session.fingerprint",
-        "staleness_tolerance_seconds",
-        "week_bucket_seconds",
-        "week_buckets_per_column",
-        "week_columns",
-        "week_seconds_per_column",
-        "workspaces",
-        "workspaces[].agent_count",
-        "workspaces[].agents",
-        "workspaces[].agents[].blocked_seconds",
-        "workspaces[].agents[].last_seen",
-        "workspaces[].agents[].observed_ago_seconds",
-        "workspaces[].agents[].pane_id",
-        "workspaces[].agents[].program",
-        "workspaces[].agents[].series",
-        "workspaces[].agents[].state",
-        "workspaces[].agents[].state_is_current",
-        "workspaces[].agents[].transitions",
-        "workspaces[].agents[].watched_seconds",
-        "workspaces[].blocked_seconds",
-        "workspaces[].label",
-        "workspaces[].last_seen",
-        "workspaces[].observed_ago_seconds",
-        "workspaces[].series",
-        "workspaces[].session",
-        "workspaces[].session.began",
-        "workspaces[].session.fingerprint",
-        "workspaces[].session.is_current",
-        "workspaces[].sparkline",
-        "workspaces[].state",
-        "workspaces[].state_for_seconds",
-        "workspaces[].state_is_current",
-        "workspaces[].transitions",
-        "workspaces[].watched_seconds",
-        "workspaces[].week",
-        "workspaces[].week_blocked_seconds",
-        "workspaces[].week_transitions",
-        "workspaces[].week_watched_seconds",
-        "workspaces[].workspace_id",
+        "as_of: integer",
+        "bucket_seconds: integer",
+        "buckets_per_column: integer",
+        "columns: integer",
+        "level_max: integer",
+        "sampler: object",
+        "sampler.running: boolean",
+        "sampler.stopped: null|object",
+        "sampler.stopped.at: integer",
+        "sampler.stopped.detail: string",
+        "sampler.stopped.reason: string",
+        "schema_version: integer",
+        "seconds_per_column: integer",
+        "session: object",
+        "session.began: integer|null",
+        "session.fingerprint: null|string",
+        "staleness_tolerance_seconds: integer",
+        "week_bucket_seconds: integer",
+        "week_buckets_per_column: integer",
+        "week_columns: integer",
+        "week_seconds_per_column: integer",
+        "workspaces: array<object>",
+        "workspaces[].agent_count: integer",
+        "workspaces[].agents: array<object>",
+        "workspaces[].agents[].blocked_seconds: integer",
+        "workspaces[].agents[].last_seen: integer",
+        "workspaces[].agents[].observed_ago_seconds: integer",
+        "workspaces[].agents[].pane_id: string",
+        "workspaces[].agents[].program: null|string",
+        "workspaces[].agents[].series: array<integer|null>|array<null>",
+        "workspaces[].agents[].state: string",
+        "workspaces[].agents[].state_is_current: boolean",
+        "workspaces[].agents[].transitions: array<integer|null>|array<null>",
+        "workspaces[].agents[].watched_seconds: integer",
+        "workspaces[].blocked_seconds: integer",
+        "workspaces[].label: string",
+        "workspaces[].last_seen: integer|null",
+        "workspaces[].observed_ago_seconds: integer|null",
+        "workspaces[].series: array<integer|null>|array<null>",
+        "workspaces[].session: object",
+        "workspaces[].session.began: integer|null",
+        "workspaces[].session.fingerprint: null|string",
+        "workspaces[].session.is_current: boolean|null",
+        "workspaces[].sparkline: string",
+        "workspaces[].state: string",
+        "workspaces[].state_for_seconds: integer|null",
+        "workspaces[].state_is_current: boolean",
+        "workspaces[].transitions: array<integer|null>|array<null>",
+        "workspaces[].watched_seconds: integer",
+        "workspaces[].week: array<integer|null>|array<null>",
+        "workspaces[].week_blocked_seconds: integer",
+        "workspaces[].week_transitions: array<integer|null>|array<null>",
+        "workspaces[].week_watched_seconds: integer",
+        "workspaces[].workspace_id: string",
     ];
 
-    let found = key_paths(&full_document());
+    let found = shape_of(&[full_document(), unobserved_document()]);
     let mut expected: Vec<String> = SHAPE.iter().map(|key| (*key).to_string()).collect();
     expected.sort();
 

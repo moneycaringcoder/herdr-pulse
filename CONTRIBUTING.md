@@ -24,7 +24,7 @@ the test is right and the change is wrong:
 | Nothing is written outside the plugin's state directory, except the unit `--supervise` installs where the user asked for it | `tests/read_only.rs` |
 | No git invocation, and no subprocess beyond the daemon re-exec, `herdr server reload-config`, and the supervisor `--supervise` hands the sampler to | `tests/read_only.rs` |
 | No dependency that can open a network socket | `tests/read_only.rs` (audited allowlist over `Cargo.lock`) |
-| The `--json` shape cannot move without `JSON_SCHEMA_VERSION` moving | `tests/render.rs` (all 54 key paths pinned) |
+| Every `--json` key path, with its type and nullability, is pinned | `tests/render.rs` (54 paths over two fixtures) |
 | `null` and `0` stay distinct in every `--json` array | `tests/render.rs` |
 
 **A gap is not a quiet period.** This is the correctness property that the whole
@@ -90,7 +90,10 @@ If you change the `--json` document, read
 [docs/json-schema.md](docs/json-schema.md) first. The shape is a promise to
 anything scripting against it, and the two rules are short: a change a consumer
 could notice by reading the keys bumps `JSON_SCHEMA_VERSION`, and every visible
-change earns a changelog entry. `tests/render.rs` will fail before CI does.
+change earns a changelog entry. The pinned list in `tests/render.rs` will fail
+the moment a key or a type moves — but it cannot tell whether the version should
+move with it, and it cannot see a unit or a meaning change at all. That decision
+is the reviewer's, which is why it is written down rather than automated.
 
 ## Commit messages
 
