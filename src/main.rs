@@ -11,6 +11,7 @@ Usage: pulse [VERB]
 
 Reporting:
   --once                    Print a one-shot activity report and exit
+  --week                    Print a week of hourly history and exit
   --json                    Print the recorded history as JSON and exit
   --watch                   Live activity view, refreshing on an interval
 
@@ -78,6 +79,7 @@ fn run(args: &[String]) -> Result<()> {
     let verb = verb_of(args);
     match verb {
         "--once" => render::run_once(&config::load_with_args(args)?),
+        "--week" => render::run_week(&config::load_with_args(args)?),
         "--json" => render::run_json(&config::load_with_args(args)?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
         "--enable" => daemon::enable(args),
@@ -111,6 +113,7 @@ mod tests {
     #[test]
     fn the_verb_is_found_whatever_the_order() {
         assert_eq!(verb_of(&args(&["--once"])), "--once");
+        assert_eq!(verb_of(&args(&["--week"])), "--week");
         assert_eq!(verb_of(&args(&["--json", "--interval", "5"])), "--json");
         assert_eq!(verb_of(&args(&["--interval", "5", "--json"])), "--json");
         assert_eq!(verb_of(&args(&["--interval=5", "--json"])), "--json");

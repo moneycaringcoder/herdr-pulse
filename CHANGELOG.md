@@ -21,6 +21,18 @@ All notable changes to this project are documented here. The format follows
   sends, and the snapshot fields it reads are all still there. It is scheduled
   and manual only, it is not a required check, and a red canary is a signal to
   read herdr's recent changes rather than a reason to hold a pull request.
+- A second, coarser activity ring records the same samples as the fine ring in
+  168 fixed one-hour buckets. It is recorded independently rather than derived:
+  the default fine ring has aged out after four hours and cannot answer whether
+  a workspace did anything yesterday. An hour nobody sampled remains a gap; an
+  hour sampled without activity remains observed and quiet.
+
+  The new `--week` verb renders those seven days as 28 six-hour columns while
+  leaving the other report columns unchanged. `--json` adds a `"week"` array to
+  each workspace and top-level `"week_bucket_seconds"` and `"week_columns"`
+  fields. At the defaults, 8 workspaces × (240 fine + 168 week) buckets measure
+  about 180 KB; the week ring is `168 / (240 + 168) ≈ 41%`, roughly 40%, of the
+  history file.
 
 ### Changed
 

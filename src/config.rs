@@ -64,17 +64,37 @@ pub const MAX_MAX_WORKSPACES: usize = 512;
 /// the config file, so nothing on the command line ever exercised it.
 pub const MAX_BADGE_WINDOW_MINUTES: u64 = 1_440;
 
-/// Ceiling on `retention_buckets × max_workspaces`, which is what actually
-/// determines the history file's size.
+/// The coarse ring: one hour per bucket, 168 of them, which is exactly a week.
 ///
-/// Clamping the two fields separately is not enough to keep the promise that
-/// storage is "bounded by construction": their documented maxima multiply out to
-/// tens of millions of buckets, and a measured
+/// Fixed rather than configurable, and deliberately so. The fine ring is tuned
+/// by the user against the question "what happened this afternoon"; this one
+/// answers "did this workspace do anything yesterday", which has one sensible
+/// answer and no reason to vary. Two knobs would also mean two ways for a config
+/// change to invalidate recorded history, and one is enough.
+pub const WEEK_BUCKET_SECONDS: u64 = 3_600;
+pub const WEEK_RETENTION_BUCKETS: usize = 168;
+
+/// 28 columns of 6 hours each, which covers the 168 buckets exactly. Wider than
+/// the badge because the week is only ever drawn in a pane, where there is room.
+pub const WEEK_COLUMNS: usize = 28;
+pub const WEEK_BUCKETS_PER_COLUMN: usize = 6;
+
+/// Ceiling on `(retention_buckets + WEEK_RETENTION_BUCKETS) × max_workspaces`,
+/// which is what actually determines the history file's size.
+///
+/// Both rings count. Every workspace carries the fine ring the user sizes and
+/// the fixed 168-bucket week ring beside it, so a bound that names only the fine
+/// one would say the week ring is outside it — and the next per-workspace array
+/// somebody adds would be too.
+///
+/// Clamping the fields separately is not enough to keep the promise that storage
+/// is "bounded by construction": their documented maxima multiply out to tens of
+/// millions of buckets, and a measured
 /// `{"max_workspaces": 4096, "retention_buckets": 10000}` produced a 103 MB file
 /// that the daemon then rewrote and fsync'd every five seconds. Each bucket
 /// serialises to roughly 55 bytes, so this ceiling corresponds to a few
-/// megabytes — generous next to the 15,360 buckets (~840 KB) the defaults use,
-/// and small enough that the rewrite stays cheap.
+/// megabytes — generous next to the `(240 + 168) × 64 = 26,112` buckets (~1.4 MB)
+/// the defaults use, and small enough that the rewrite stays cheap.
 pub const MAX_TOTAL_BUCKETS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,18 +182,28 @@ impl Config {
         self.badge_window_minutes = self.badge_window_minutes.clamp(1, MAX_BADGE_WINDOW_MINUTES);
         self.max_workspaces = self.max_workspaces.clamp(1, MAX_MAX_WORKSPACES);
 
-        // The file's size is the product of these two, not either one alone, so
-        // clamping them separately leaves "bounded by construction" untrue.
+        // The file's size is the product of the per-workspace bucket count and
+        // the workspace cap, not either one alone, so clamping them separately
+        // leaves "bounded by construction" untrue. Every workspace carries the
+        // fine ring *and* the fixed week ring, so the week's 168 buckets are part
+        // of the count being bounded — leaving them out would let the file exceed
+        // the ceiling by 168 buckets per workspace, which is the whole ceiling
+        // over at a few hundred workspaces.
+        //
         // `retention_buckets` is the user's explicit statement about how far back
         // they want to see, so the workspace cap gives way instead — losing the
         // least recently seen workspace is a smaller loss than silently
         // shortening everyone's history.
-        if self.retention_buckets.saturating_mul(self.max_workspaces) > MAX_TOTAL_BUCKETS {
-            let affordable = (MAX_TOTAL_BUCKETS / self.retention_buckets.max(1)).max(1);
+        let per_workspace = self
+            .retention_buckets
+            .saturating_add(WEEK_RETENTION_BUCKETS);
+        if per_workspace.saturating_mul(self.max_workspaces) > MAX_TOTAL_BUCKETS {
+            let affordable = (MAX_TOTAL_BUCKETS / per_workspace.max(1)).max(1);
             // Loud, because a user who asked to track 400 workspaces and is
             // silently given 6 would have no way to discover it.
             eprintln!(
-                "pulse: retention_buckets {} x max_workspaces {} exceeds the {} bucket ceiling; \
+                "pulse: retention_buckets {} plus the {WEEK_RETENTION_BUCKETS}-bucket week ring, \
+                 x max_workspaces {}, exceeds the {} bucket ceiling; \
                  tracking {} workspaces instead",
                 self.retention_buckets, self.max_workspaces, MAX_TOTAL_BUCKETS, affordable
             );

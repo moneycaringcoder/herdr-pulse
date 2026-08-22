@@ -840,7 +840,264 @@ fn far_more_workspaces_than_the_cap_stay_capped() {
     }
 
     assert_eq!(history.workspaces.len(), 8);
-    assert!(history.encoded_len() < 128 * 1024);
+    // Both rings, stated rather than assumed: 8 workspaces x (240 fine + 168
+    // week) buckets at roughly 55 bytes each is about 180 KB, so the week ring is
+    // 40% of the file at these settings and the ceiling has to leave room for it.
+    // The point of the assertion is that the size follows the cap and the two
+    // fixed ring lengths, and nothing else — not uptime, not sample count.
+    let encoded = history.encoded_len();
+    assert!(
+        encoded < 256 * 1024,
+        "{encoded} bytes for 8 workspaces of two rings"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The coarse ring: hours, a week of them
+// ---------------------------------------------------------------------------
+
+/// The week series for the first workspace, at the geometry the store projects.
+fn week(history: &History, as_of: u64, config: &Config) -> Vec<Option<Level>> {
+    history.activity(as_of, 8, 1, config)[0].week.clone()
+}
+
+/// The start of an hour, so a test can say "this hour" and mean one bucket.
+fn hour_start() -> u64 {
+    T0 - (T0 % 3_600)
+}
+
+#[test]
+fn the_week_ring_records_the_same_samples_at_hourly_resolution() {
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // Two hours of work, sampled every ten minutes.
+    for step in 0..12u64 {
+        history.record(
+            &one(
+                base + step * 600,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    let entry = &history.workspaces[0];
+    assert_eq!(
+        entry.week_buckets.len(),
+        pulse::config::WEEK_RETENTION_BUCKETS,
+        "the coarse ring is a fixed week long"
+    );
+    let observed: Vec<&Bucket> = entry
+        .week_buckets
+        .iter()
+        .filter(|bucket| bucket.samples > 0)
+        .collect();
+    assert_eq!(observed.len(), 2, "two hours were sampled");
+    assert_eq!(
+        observed.iter().map(|b| u64::from(b.samples)).sum::<u64>(),
+        12,
+        "every sample lands in both rings, not one or the other"
+    );
+    assert_eq!(entry.week_newest_bucket, (base + 11 * 600) / 3_600);
+}
+
+#[test]
+fn an_hour_nobody_sampled_is_a_gap_in_the_week() {
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // This hour and the one three hours later. The two hours between were not
+    // watched, and the week ring has to say so rather than smoothing over them.
+    history.record(
+        &one(base, "w15", "api", &[("w15:p1", "working", 10)]),
+        &config,
+    );
+    history.record(
+        &one(base + 3 * 3_600, "w15", "api", &[("w15:p1", "working", 11)]),
+        &config,
+    );
+
+    // One column per hour for this assertion: the projection's own geometry is
+    // six hours wide, which would hide the shape being tested.
+    let entry = &history.workspaces[0];
+    let hour = |number: u64| {
+        entry.week_buckets[(number % pulse::config::WEEK_RETENTION_BUCKETS as u64) as usize]
+    };
+    let first = base / 3_600;
+    assert!(hour(first).samples > 0);
+    assert_eq!(hour(first + 1).samples, 0, "an unwatched hour is a gap");
+    assert_eq!(hour(first + 2).samples, 0);
+    assert!(hour(first + 3).samples > 0);
+}
+
+#[test]
+fn a_quiet_hour_is_not_a_gap_in_the_week() {
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    for step in 0..6u64 {
+        history.record(
+            &one(base + step * 600, "w15", "api", &[("w15:p1", "idle", 500)]),
+            &config,
+        );
+    }
+
+    let series = week(&history, base + 5 * 600, &config);
+    let newest = series.last().expect("a week series has columns");
+    assert_eq!(
+        *newest,
+        Some(Level(0)),
+        "an hour that was watched and was quiet is quiet, not unobserved: {series:?}"
+    );
+}
+
+#[test]
+fn the_week_reaches_back_further_than_the_fine_ring() {
+    // The point of the second ring. The fine ring at the defaults covers four
+    // hours; a workspace that worked yesterday is outside it entirely, and the
+    // week ring is the only place that answer can come from.
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    for step in 0..6u64 {
+        history.record(
+            &one(
+                base + step * 600,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    // Twenty hours later.
+    let as_of = base + 20 * 3_600;
+    let fine = series(&history, as_of, 240, &config);
+    assert!(
+        fine.iter().all(Option::is_none),
+        "yesterday is off the end of the fine ring: {fine:?}"
+    );
+    let coarse = week(&history, as_of, &config);
+    assert!(
+        coarse.iter().any(Option::is_some),
+        "and the week ring still has it: {coarse:?}"
+    );
+}
+
+#[test]
+fn the_week_ring_wraps_rather_than_growing() {
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // Ten days, one sample an hour: nearly a lap and a half of the week ring.
+    for hour in 0..240u64 {
+        history.record(
+            &one(
+                base + hour * 3_600,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + hour)],
+            ),
+            &config,
+        );
+    }
+
+    let entry = &history.workspaces[0];
+    assert_eq!(
+        entry.week_buckets.len(),
+        pulse::config::WEEK_RETENTION_BUCKETS,
+        "the ring is allocated once and never grown"
+    );
+    // Ten days of sampling still only holds a week, and the hours that fell off
+    // the back are gone rather than lingering as a previous lap's data.
+    let as_of = base + 239 * 3_600;
+    let coarse = week(&history, as_of, &config);
+    assert!(coarse.iter().all(Option::is_some), "{coarse:?}");
+    let stale = week(&history, base + 3_600, &config);
+    assert!(
+        stale.iter().all(Option::is_none),
+        "a week-old projection of a wrapped ring is gaps, not last lap's bars: {stale:?}"
+    );
+}
+
+#[test]
+fn a_history_file_written_before_the_week_ring_gains_an_empty_one() {
+    let dir = TempDir::new("pre-week-file");
+    let config = config(60, 16, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    for step in 0..3u64 {
+        history.record(
+            &one(
+                base + step * 60,
+                "w15",
+                "api",
+                &[("w15:p1", "working", 10 + step)],
+            ),
+            &config,
+        );
+    }
+
+    // Exactly what the previous release wrote: no week ring at all.
+    let mut value = serde_json::to_value(&history).unwrap();
+    let entry = value["workspaces"][0].as_object_mut().unwrap();
+    assert!(
+        entry.remove("week_buckets").is_some(),
+        "the field is written"
+    );
+    entry.remove("week_newest_bucket");
+    std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
+
+    let mut loaded = history::load_from(dir.path(), &config);
+    assert_eq!(
+        loaded.workspaces[0].week_buckets.len(),
+        pulse::config::WEEK_RETENTION_BUCKETS,
+        "the week ring is laid out on load"
+    );
+    let coarse = week(&loaded, base + 2 * 60, &config);
+    assert!(
+        coarse.iter().all(Option::is_none),
+        "nothing is back-filled from the fine ring: those hours were never \
+         recorded as hours: {coarse:?}"
+    );
+
+    // And it starts recording from the next sample.
+    loaded.record(
+        &one(base + 3 * 60, "w15", "api", &[("w15:p1", "working", 20)]),
+        &config,
+    );
+    let coarse = week(&loaded, base + 3 * 60, &config);
+    assert!(coarse.iter().any(Option::is_some), "{coarse:?}");
+}
+
+#[test]
+fn a_clock_correction_rewinds_both_rings() {
+    let config = config(60, 240, 8);
+    let base = hour_start();
+    let mut history = History::empty(&config);
+    // A stepped clock writes an anchor five hours into the future.
+    history.record(
+        &one(base + 5 * 3_600, "w15", "api", &[("w15:p1", "working", 10)]),
+        &config,
+    );
+    // Then it is corrected. Leaving the coarse anchor in the future would keep
+    // the week view deaf for as many hours as the jump was long.
+    history.record(
+        &one(base, "w15", "api", &[("w15:p1", "working", 11)]),
+        &config,
+    );
+
+    let entry = &history.workspaces[0];
+    assert_eq!(entry.week_newest_bucket, base / 3_600);
+    let coarse = week(&history, base, &config);
+    assert!(
+        coarse.last().expect("columns").is_some(),
+        "the corrected hour is being recorded again: {coarse:?}"
+    );
 }
 
 #[test]
@@ -2682,28 +2939,87 @@ fn a_file_from_an_older_format_is_discarded() {
     );
 }
 
+/// A load that could not re-lay the fine ring: every fine bucket is a gap, the
+/// file now speaks the live bucket width, and the week ring is untouched.
+///
+/// The week ring is an hour per bucket whatever `bucket_seconds` says, so a
+/// change to that setting is a fact about the fine ring alone. Discarding a week
+/// of hours because the minutes beside them were written at another scale would
+/// be a loss with no reason behind it.
+fn assert_fine_discarded(loaded: &History, live: &Config) {
+    assert_eq!(loaded.bucket_seconds, live.bucket_seconds);
+    for workspace in &loaded.workspaces {
+        assert!(
+            workspace.buckets.iter().all(|bucket| !bucket.observed()),
+            "{} kept fine buckets recorded at another scale",
+            workspace.workspace_id
+        );
+        assert_eq!(workspace.buckets.len(), live.retention_buckets);
+    }
+}
+
+/// How many hours the week rings are holding across the whole store.
+fn week_hours(history: &History) -> usize {
+    history
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.week_buckets.iter())
+        .filter(|bucket| bucket.samples > 0)
+        .count()
+}
+
+/// That the kept hours are also *visible*: a raw bucket count says the data
+/// survived, and only the projection says a reader can still see it.
+///
+/// The difference matters because the discard path re-derives the fine anchor.
+/// An edit that re-derived the coarse one too would leave every kept hour
+/// outside its lap, projecting a week of gaps while the raw counts stayed
+/// exactly as they are.
+fn assert_week_is_visible(history: &History, as_of: u64, config: &Config) {
+    let projected = week(history, as_of, config);
+    assert!(
+        projected.iter().any(Option::is_some),
+        "the week ring survived but nothing projects from it: {projected:?}"
+    );
+}
+
 #[test]
-fn a_file_written_with_a_smaller_bucket_width_is_discarded() {
+fn a_file_written_with_a_smaller_bucket_width_discards_the_fine_ring() {
     let dir = TempDir::new("bucket-width");
     let written = config(60, 16, 8);
-    history::save_to(dir.path(), &recorded(&written)).expect("save");
+    let recorded = recorded(&written);
+    let hours = week_hours(&recorded);
+    assert!(hours > 0, "the fixture recorded some hours");
+    history::save_to(dir.path(), &recorded).expect("save");
 
     // One minute cannot become two thirty-second buckets: the detail to split it
     // by was never recorded, and inventing it would draw a plausible lie.
     let live = config(30, 16, 8);
-    assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
+    let loaded = history::load_from(dir.path(), &live);
+    assert_fine_discarded(&loaded, &live);
+    assert_eq!(
+        week_hours(&loaded),
+        hours,
+        "the week ring is hours either way and has no reason to be discarded"
+    );
+    assert_week_is_visible(&loaded, T0 + 3 * 60, &live);
 }
 
 #[test]
-fn a_bucket_width_that_is_not_a_whole_multiple_is_discarded() {
+fn a_bucket_width_that_is_not_a_whole_multiple_discards_the_fine_ring() {
     let dir = TempDir::new("bucket-width-ragged");
     let written = config(60, 16, 8);
-    history::save_to(dir.path(), &recorded(&written)).expect("save");
+    let recorded = recorded(&written);
+    let hours = week_hours(&recorded);
+    history::save_to(dir.path(), &recorded).expect("save");
 
     // 90s boundaries fall inside 60s buckets, so every fold would have to split
     // observations that cannot be split.
     let live = config(90, 16, 8);
-    assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
+    let loaded = history::load_from(dir.path(), &live);
+    assert_fine_discarded(&loaded, &live);
+    assert_eq!(week_hours(&loaded), hours);
+    assert_week_is_visible(&loaded, T0 + 3 * 60, &live);
 }
 
 #[test]
@@ -2925,9 +3241,9 @@ fn a_fold_of_an_impossible_anchor_reads_as_gaps_rather_than_panicking() {
     let loaded = history::load_from(dir.path(), &live);
 
     // Every group around an anchor nobody can believe reads as a gap, so the
-    // fold keeps nothing and the load says so rather than returning a store full
-    // of workspace names with no observations behind them.
-    assert_eq!(loaded, History::empty(&live));
+    // fold keeps nothing of the fine ring — and says so rather than leaving rows
+    // of empty slots at the old scale behind.
+    assert_fine_discarded(&loaded, &live);
 }
 
 #[test]
@@ -3035,13 +3351,13 @@ fn a_fold_that_keeps_nothing_says_the_history_is_gone() {
     let live = config(3_600, 16, 8);
     let loaded = history::load_from(dir.path(), &live);
 
-    // A fold that keeps nothing is a discard, and the store has to agree with
-    // the message: workspace names attached to no observations at all would draw
-    // rows claiming a last-seen time beside a sparkline with nothing in it.
-    assert_eq!(
-        loaded,
-        History::empty(&live),
-        "an hour that was watched for four minutes is not an observed hour"
+    // A fold that keeps nothing of the fine ring is a discard of the fine ring,
+    // and the store has to agree with the message. The week ring is hours and is
+    // untouched by any of this.
+    assert_fine_discarded(&loaded, &live);
+    assert!(
+        week_hours(&loaded) > 0,
+        "the four minutes were still an observed hour"
     );
 }
 
@@ -3076,7 +3392,8 @@ fn a_recorded_bucket_width_no_run_could_write_is_discarded_not_folded() {
     std::fs::write(dir.file("history.json"), value.to_string()).unwrap();
 
     let live = config(10, 16, 8);
-    assert_eq!(history::load_from(dir.path(), &live), History::empty(&live));
+    let loaded = history::load_from(dir.path(), &live);
+    assert_fine_discarded(&loaded, &live);
 }
 
 #[test]

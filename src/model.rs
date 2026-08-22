@@ -277,6 +277,11 @@ pub struct WorkspaceActivity {
     pub session: Option<String>,
     /// Unix seconds at which that session started listening, when known.
     pub session_began: Option<u64>,
+    /// The coarse series: 28 columns of six hours each, covering the last week,
+    /// oldest first. Same rules as [`Self::series`] — `None` is a gap, `0` is
+    /// observed and quiet — and recorded from the same samples rather than folded
+    /// out of the fine ring, which cannot reach back that far.
+    pub week: Vec<Option<Level>>,
 }
 
 impl WorkspaceActivity {

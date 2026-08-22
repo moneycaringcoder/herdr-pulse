@@ -24,7 +24,7 @@ use std::io::Write;
 
 use serde_json::{json, Value};
 
-use crate::config::Config;
+use crate::config::{Config, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
 use crate::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use crate::Result;
 use crate::{daemon, herdr, history};
@@ -205,6 +205,33 @@ pub fn duration(seconds: Option<u64>) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PaneView {
+    name: Option<&'static str>,
+    columns: usize,
+    seconds_per_column: u64,
+}
+
+impl PaneView {
+    fn fine(config: &Config) -> Self {
+        let (columns, buckets_per_column) = pane_geometry(config);
+        Self {
+            name: None,
+            columns,
+            seconds_per_column: (buckets_per_column as u64).saturating_mul(config.bucket_seconds),
+        }
+    }
+
+    fn week() -> Self {
+        Self {
+            name: Some("week view"),
+            columns: WEEK_COLUMNS,
+            seconds_per_column: (WEEK_BUCKETS_PER_COLUMN as u64)
+                .saturating_mul(WEEK_BUCKET_SECONDS),
+        }
+    }
+}
+
 /// The full activity pane: every tracked workspace, its sparkline, the state we
 /// last saw it in, and when we saw it.
 ///
@@ -233,13 +260,26 @@ pub fn pane(
     as_of: u64,
     session: Option<&SessionMark>,
 ) -> String {
+    render_pane(activity, config, as_of, session, PaneView::fine(config))
+}
+
+fn render_pane(
+    activity: &[WorkspaceActivity],
+    config: &Config,
+    as_of: u64,
+    session: Option<&SessionMark>,
+    view: PaneView,
+) -> String {
     if activity.is_empty() {
         // Not an empty table. An empty table looks like a quiet session, and a
         // quiet session is the one answer we must never give by accident.
+        let header = match view.name {
+            Some(name) => format!("pulse — {name} — {}", clock(as_of)),
+            None => format!("pulse — {}", clock(as_of)),
+        };
         return format!(
-            "pulse — {}\n\nNo workspace history recorded yet.\n\
-             Start the sampler with `pulse --enable`; activity appears after the first bucket.\n",
-            clock(as_of)
+            "{header}\n\nNo workspace history recorded yet.\n\
+             Start the sampler with `pulse --enable`; activity appears after the first bucket.\n"
         );
     }
 
@@ -284,22 +324,45 @@ pub fn pane(
         ]);
     }
 
-    let mut out = format!(
-        "pulse — {} workspace{} — {}\n\n",
-        activity.len(),
-        if activity.len() == 1 { "" } else { "s" },
-        clock(as_of)
-    );
+    let mut out = match view.name {
+        Some(name) => format!(
+            "pulse — {name} — {} workspace{} — {}\n\n",
+            activity.len(),
+            if activity.len() == 1 { "" } else { "s" },
+            clock(as_of)
+        ),
+        None => format!(
+            "pulse — {} workspace{} — {}\n\n",
+            activity.len(),
+            if activity.len() == 1 { "" } else { "s" },
+            clock(as_of)
+        ),
+    };
     out.push_str(&table(&rows));
     out.push('\n');
     out.push_str(&legend(
-        config,
         activity,
         any_stale,
         explain_sessions,
         session,
+        view,
     ));
     out
+}
+
+/// The week pane uses the same table and row metadata as [`pane`], changing
+/// only the history series and the scale stated in the header and legend.
+pub fn week_pane(
+    activity: &[WorkspaceActivity],
+    config: &Config,
+    as_of: u64,
+    session: Option<&SessionMark>,
+) -> String {
+    let mut activity = activity.to_vec();
+    for workspace in &mut activity {
+        std::mem::swap(&mut workspace.series, &mut workspace.week);
+    }
+    render_pane(&activity, config, as_of, session, PaneView::week())
 }
 /// The live herdr identity, when both locating and fingerprinting its socket
 /// succeed. Reporting commands still render saved history when there is no
@@ -328,10 +391,27 @@ pub fn run_once(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// `--week`: print the week pane once and exit.
+pub fn run_week(config: &Config) -> Result<()> {
+    let as_of = crate::now_unix();
+    let session = live_session();
+    let (columns, buckets_per_column) = pane_geometry(config);
+    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+    print!("{}", week_pane(&activity, config, as_of, session.as_ref()));
+
+    if activity.is_empty() && daemon::live_pid().is_none() {
+        eprintln!("pulse: no sampler is running — nothing is being recorded.");
+    }
+    Ok(())
+}
+
 /// `--json`: the recorded history as machine-readable JSON.
 ///
-/// A gap must be representable and distinguishable from a zero — `null` in the
-/// series array, not `0`.
+/// A gap must be representable and distinguishable from a zero — `null` in
+/// either history array, not `0`. Consumers need both arrays because the fine
+/// series answers "what happened this afternoon", while the coarse week series
+/// answers "did anything happen yesterday"; neither can be derived from the
+/// other.
 ///
 /// `state` carries the same freshness problem the pane solves with a tense, and
 /// a consumer cannot see a tense. So every workspace also carries `last_seen`,
@@ -412,6 +492,14 @@ pub fn json_document(
                         None => Value::Null,
                     })
                     .collect::<Vec<Value>>(),
+                "week": workspace
+                    .week
+                    .iter()
+                    .map(|slot| match slot {
+                        Some(level) => json!(level.0.min(Level::MAX)),
+                        None => Value::Null,
+                    })
+                    .collect::<Vec<Value>>(),
                 // The rendered form too, so a bug report can show what the user
                 // saw without asking them to screenshot a sidebar.
                 "sparkline": sparkline(&workspace.series),
@@ -429,6 +517,16 @@ pub fn json_document(
         "columns": columns,
         "buckets_per_column": buckets_per_column,
         "seconds_per_column": (buckets_per_column as u64).saturating_mul(config.bucket_seconds),
+        // The week array needs its own three, for the same reason the fine one
+        // does: a column is not a bucket. Without the column width a consumer
+        // that reasonably mirrors the fine naming reads `week_bucket_seconds x
+        // week_columns` as the row span and mislabels its axis by a factor of
+        // six on every draw.
+        "week_bucket_seconds": WEEK_BUCKET_SECONDS,
+        "week_columns": WEEK_COLUMNS,
+        "week_buckets_per_column": WEEK_BUCKETS_PER_COLUMN,
+        "week_seconds_per_column": (WEEK_BUCKETS_PER_COLUMN as u64)
+            .saturating_mul(WEEK_BUCKET_SECONDS),
         "staleness_tolerance_seconds": tolerance,
         "level_max": Level::MAX,
         "workspaces": workspaces,
@@ -556,11 +654,11 @@ fn session_cell(workspace: &WorkspaceActivity, session: Option<&SessionMark>) ->
 /// changed without the legend following it. The previous version hard-coded the
 /// word "blank", and went stale the moment [`GAP`] stopped being a space.
 fn legend(
-    config: &Config,
     activity: &[WorkspaceActivity],
     any_stale: bool,
     explain_sessions: bool,
     session: Option<&SessionMark>,
+    view: PaneView,
 ) -> String {
     let ramp: String = RAMP.iter().collect();
     let mut out = format!(
@@ -605,18 +703,18 @@ fn legend(
     }
 
     // Only claim a timescale when the series we were handed actually has the
-    // shape this config implies. A caller that built the activity with different
+    // shape this view implies. A caller that built the activity with different
     // geometry would otherwise get a confidently mislabelled axis.
-    let (columns, buckets_per_column) = pane_geometry(config);
     if activity
         .iter()
-        .all(|workspace| workspace.series.len() == columns)
+        .all(|workspace| workspace.series.len() == view.columns)
     {
-        let per_column = (buckets_per_column as u64).saturating_mul(config.bucket_seconds);
         out.push_str(&format!(
             "        one column = {}  |  whole row = {}\n",
-            duration(Some(per_column)),
-            duration(Some(per_column.saturating_mul(columns as u64)))
+            duration(Some(view.seconds_per_column)),
+            duration(Some(
+                view.seconds_per_column.saturating_mul(view.columns as u64)
+            ))
         ));
     }
     out
