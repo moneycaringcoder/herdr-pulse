@@ -26,6 +26,7 @@ use pulse::daemon::{self, BadgeOp, WorkspaceBadge};
 use pulse::history::History;
 use pulse::model::WorkspaceObservation;
 use pulse::model::{AgentObservation, AgentState, Sample, SessionMark, Tone, WorkspaceActivity};
+use pulse::supervise;
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
@@ -666,6 +667,69 @@ fn restore_spawns_a_detached_daemon_when_it_was_enabled_and_nothing_is_live() {
     assert!(
         daemon::is_enabled(),
         "restore must not disturb the enabled marker"
+    );
+}
+
+/// Points the platform's unit directory into a temp tree and writes a unit
+/// there, so `supervise::is_installed()` is true without touching a real home.
+///
+/// `HOME` alone: the Linux path asks the running user manager where it looks and
+/// falls back to `$HOME/.config/systemd/user`, and the macOS path is
+/// `$HOME/Library/LaunchAgents`. Under a temp `HOME` there is no manager to
+/// answer, so the fallback is what both platforms use here.
+///
+/// The previous value is put back on drop rather than removed. `HOME` is not
+/// this guard's to delete: every later test in the binary would inherit a
+/// process with no home, and the first one to rely on a fallback would resolve
+/// somewhere shared across runs.
+struct InstalledUnit {
+    path: PathBuf,
+    previous_home: Option<String>,
+}
+
+impl InstalledUnit {
+    fn new(root: &Path) -> Self {
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", root.join("home"));
+        let path = supervise::unit_path().expect("a supervised platform with a home");
+        std::fs::create_dir_all(path.parent().expect("unit dir")).expect("unit dir");
+        std::fs::write(&path, "written by a test, never loaded").expect("unit");
+        Self {
+            path,
+            previous_home,
+        }
+    }
+}
+
+impl Drop for InstalledUnit {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        match &self.previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+#[test]
+fn restore_leaves_a_supervised_sampler_to_its_supervisor() {
+    // herdr's startup hook and the supervisor would otherwise both start a
+    // sampler: one detached child and one unit, two processes writing one
+    // history file, each rewriting what the other just wrote.
+    let _guard = env_lock();
+    let dirs = TempDirs::new("restore-supervised");
+    let _unit = InstalledUnit::new(&dirs.root);
+    daemon::mark_enabled(true);
+
+    daemon::restore().expect("restore");
+
+    assert!(
+        !exists(&config::pid_file()),
+        "the hook spawned nothing, because the supervisor owns the process"
+    );
+    assert!(
+        daemon::is_enabled(),
+        "and the user's choice is untouched: the supervisor is what starts it"
     );
 }
 

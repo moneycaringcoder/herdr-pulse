@@ -2,7 +2,7 @@
 //!
 //! Verb dispatch only; every verb is implemented in the library crate.
 
-use pulse::{config, daemon, history, render, setup, Result};
+use pulse::{config, daemon, history, render, setup, supervise, Result};
 
 const USAGE: &str = "\
 pulse — agent activity history and sparklines for herdr
@@ -20,6 +20,8 @@ Sampler:
   --disable                 Stop it and clear every badge this plugin set
   --toggle                  Stop it if running, otherwise start it
   --restore                 Restart it only if it was enabled (herdr startup hook)
+  --supervise               Start the sampler at login, under systemd or launchd
+  --unsupervise             Remove that supervision (history is kept)
   --daemon                  Run the sampler in the foreground (internal)
 
 History:
@@ -107,6 +109,8 @@ fn run(args: &[String]) -> Result<()> {
         "--forget" => history::forget(),
         "--setup" => setup::run_setup(),
         "--setup-rollback" => setup::run_rollback(),
+        "--supervise" => supervise::install(args),
+        "--unsupervise" => supervise::remove(),
         "--version" => {
             println!("pulse {}", env!("CARGO_PKG_VERSION"));
             Ok(())

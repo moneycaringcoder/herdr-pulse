@@ -216,17 +216,23 @@ fn the_plugin_shells_out_only_to_itself_and_to_herdr() {
     // A source-level guard rather than a runtime one: a subprocess that only
     // spawns on a path this suite does not exercise would slip past any test
     // that merely watches a run. The rule is small enough to state exactly —
-    // the daemon re-execs this binary, and setup asks herdr to reload its
-    // config. Nothing else, and in particular never `git`.
+    // the daemon re-execs this binary, setup asks herdr to reload its config,
+    // and supervision hands the sampler to the platform's own supervisor.
+    // Nothing else, and in particular never `git`.
     // Asserting the exact *set* of spawn sites, rather than searching each line
     // for a permitted substring: a loose `line.contains("bin")` would wave
     // through `Command::new(user_supplied_binary)` without a murmur.
-    const SANCTIONED: [&str; 2] = [
+    const SANCTIONED: [&str; 3] = [
         // setup.rs — `herdr server reload-config`, so sidebar rows take effect
         // without the user restarting herdr.
         "src/setup.rs: Command::new(bin)",
         // daemon.rs — this binary re-execing itself as a detached `--daemon`.
         "src/daemon.rs: Command::new(exe)",
+        // supervise.rs — `systemctl --user` or `launchctl`, and only from the
+        // two verbs the user types to install and remove supervision. The
+        // program is one of those two names built here, never a value from a
+        // config file or a snapshot.
+        "src/supervise.rs: Command::new(program)",
     ];
 
     let src = repo_root().join("src");

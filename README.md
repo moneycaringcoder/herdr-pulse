@@ -294,9 +294,69 @@ time, and `is_current` per workspace, plus the live session at the top level.
 |---|---|
 | `--enable` | Start the background sampler, detached from herdr. |
 | `--disable` | Stop it and clear every badge this plugin set. |
+| `--supervise` | Start the sampler at login, under systemd or launchd. |
+| `--unsupervise` | Remove that supervision (history is kept). |
 | `--toggle` | Stop it if running, otherwise start it. |
 | `--restore` | Restart it only if it was enabled. herdr's startup hook; silent otherwise. |
 | `--daemon` | Run the sampler in the foreground. Internal; `--enable` uses it. |
+
+### Supervision
+
+Supervision is opt-in: pulse writes nothing until you run `pulse --supervise`.
+
+On Linux it writes a systemd user unit named `dev.herdr.pulse.sampler.service`,
+into whichever per-user directory the running user manager reports in
+`systemctl --user show --property=UnitPath`, falling back to
+`~/.config/systemd/user` when there is no manager to ask. It asks rather than
+deriving the path because a user manager is started by logind before any shell
+exists and never sees an `XDG_CONFIG_HOME` set in a shell rc — a unit written
+where that variable points would sit on disk in a directory systemd does not
+read. It then activates the unit with:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now dev.herdr.pulse.sampler.service
+```
+
+On macOS it writes
+`~/Library/LaunchAgents/dev.herdr.pulse.sampler.plist`, then activates it with:
+
+```sh
+launchctl enable "gui/$(id -u)/dev.herdr.pulse.sampler"
+launchctl bootout "gui/$(id -u)/dev.herdr.pulse.sampler"   # clears a stale copy
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.herdr.pulse.sampler.plist"
+```
+
+Other platforms do not support supervision; pulse says that it is available on
+Linux and macOS only and that `pulse --enable` still runs the sampler until the
+machine stops.
+
+The installed definition runs `pulse --daemon`. At install time it writes the
+resolved `HERDR_PLUGIN_STATE_DIR` and `HERDR_SOCKET_PATH` values in full and
+bakes in the recording flags passed to `--supervise`: `--interval`,
+`--bucket-seconds`, `--retention-buckets`, `--columns` and `--agents`. A
+supervisor starts the sampler with neither environment variable set. Baking both
+paths in keeps the sampler writing the history that the panes read even if one
+of those variables later changes. Before installing the definition, pulse stops
+any unsupervised sampler already running so that two processes cannot overwrite
+the same history file.
+
+Once supervision is installed, `--enable` starts the unit. `--disable` first
+runs `systemctl --user disable --now`, or `launchctl bootout` followed by
+`launchctl disable`, and then stops the sampler and clears its badges. Both
+halves matter on macOS: `bootout` unloads the agent for this session, and only
+`disable` keeps launchd from loading the plist again at the next login. The
+definition stays on disk either way, so a later `--enable` starts it again
+without a reinstall. `--restore` becomes a no-op because the supervisor owns the
+process. Run `pulse --unsupervise` to stop the unit and delete its definition;
+recorded history is left untouched.
+
+Supervision does not change what pulse records or how a gap is judged. Every
+bucket the sampler did not observe stays a gap, restart or no restart: stop the
+unit for half an hour and the row draws half an hour of gap glyphs. Downtime
+shorter than one bucket leaves that bucket observed, because it was — the
+sampler saw part of it, and a bucket with any observation in it is real data.
+Continuity of the unit is not continuity of observation.
 
 ### History
 
