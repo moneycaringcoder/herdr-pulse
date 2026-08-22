@@ -194,10 +194,21 @@ to the past tense:
 The sparkline says the same thing in glyphs: a stretch of `╌` is time nobody
 watched. The words and the sparkline are never allowed to disagree.
 
+When no sampler is live, `--once`, `--week` and `--watch` print a line on
+standard error naming why the last run stopped and, when known, how long ago.
+The four explanations are disabled, terminated, ended unexpectedly (with detail
+where one was recorded), and stopped for an unknown reason. Unknown is said
+plainly, never dressed up as a clean exit. While a sampler is live there is no
+stop to explain; a gap then means herdr was unreachable.
+
 `--json` carries the same distinction, since a consumer cannot read a tense:
 each workspace has `last_seen`, `observed_ago_seconds` and `state_is_current`,
 and the document has the `staleness_tolerance_seconds` those were judged
 against.
+
+The `--json` document also carries a top-level `sampler` object with `running`
+and `stopped`. Inside `stopped`, the fields are `reason`, `at` and `detail`;
+`reason` is one of `disabled`, `terminated`, `failed` or `unknown`.
 
 ### Sessions are not spliced together
 

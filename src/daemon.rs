@@ -46,6 +46,7 @@
 //! sampling intervals, 15 s at the default — and nothing shorter.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -77,6 +78,171 @@ pub const FORWARDED: [&str; 4] = [
     "--retention-buckets",
     "--columns",
 ];
+
+/// Why the last sampler run ended, as far as it was able to say.
+///
+/// A gap in the history says nobody was watching. This says why nobody was
+/// watching, which is the difference between "I turned it off after lunch" and
+/// "it died at 11:04 and I have been reading an empty sparkline since".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// `--disable`, or a `--toggle` that landed on a live daemon. The user asked.
+    Disabled,
+    /// A signal from somewhere else: a reboot, an OOM killer's polite first
+    /// attempt, somebody's `kill`. Distinguished from [`Self::Disabled`] by the
+    /// enabled marker, which `--disable` clears *before* it signals.
+    Terminated,
+    /// The run ended on a panic or an error it could not continue past.
+    Failed,
+    /// The run stopped without leaving a word. A `SIGKILL`, a power cut, a
+    /// container reaped out from under it.
+    ///
+    /// Never reported as anything else. "Cleanly disabled" is the flattering
+    /// guess, and a user deciding how much of an empty sparkline to believe is
+    /// exactly the person that guess would mislead.
+    Unknown,
+}
+
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Terminated => "terminated",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "disabled" => Self::Disabled,
+            "terminated" => Self::Terminated,
+            "failed" => Self::Failed,
+            // Including a reason written by a newer pulse: an unrecognised word
+            // is one we cannot interpret, and interpreting it anyway is how a
+            // guess gets in.
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.write_str(match self {
+            Self::Disabled => "disabled",
+            Self::Terminated => "terminated",
+            Self::Failed => "ended unexpectedly",
+            Self::Unknown => "stopped for an unknown reason",
+        })
+    }
+}
+
+/// What happened to the last sampler run, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplerStop {
+    pub reason: StopReason,
+    /// Unix seconds the run ended, when it was able to record one. `None` for a
+    /// run that left no marker at all — there is nobody to have written a time.
+    pub at: Option<u64>,
+    /// One line of detail for [`StopReason::Failed`], such as a panic message.
+    pub detail: Option<String>,
+}
+
+/// Records why this run is ending, best effort.
+///
+/// Best effort because the alternative is worse: an unwritable state dir must
+/// not turn a clean shutdown into a hang or a crash. A marker that could not be
+/// written reads back as [`StopReason::Unknown`], which is exactly what it is.
+fn record_stop(reason: StopReason, detail: Option<&str>) {
+    let at = crate::now_unix();
+    let line = match detail {
+        Some(detail) => format!("{}\n{at}\n{}\n", reason.as_str(), one_line(detail)),
+        None => format!("{}\n{at}\n", reason.as_str()),
+    };
+    let _ = fs::write(config::stop_marker(), line);
+}
+
+/// Detail is written into a line-delimited marker, so it has to stay on one
+/// line. A panic message carrying a newline would otherwise make the file
+/// unparseable and lose the reason along with it.
+fn one_line(detail: &str) -> String {
+    detail
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect()
+}
+
+/// Clears the marker, so a run that is starting does not inherit the last one's
+/// epitaph.
+fn clear_stop() {
+    let _ = fs::remove_file(config::stop_marker());
+}
+
+/// Why the sampler is not running, or `None` while one is.
+///
+/// The three cases, in the order they are believed:
+///
+/// * a live daemon — nothing to explain, and a gap in the history means herdr
+///   was unreachable rather than that the sampler stopped;
+/// * a marker the last run wrote as it went — the reason it recorded;
+/// * no marker, but evidence that a run existed: a pid file nobody cleaned up,
+///   or an enabled flag with nothing running under it. That run did not get to
+///   say goodbye, and [`StopReason::Unknown`] is the honest reading.
+pub fn stop_report() -> Option<SamplerStop> {
+    if live_pid().is_some() {
+        return None;
+    }
+    if let Some(stop) = read_stop_marker() {
+        return Some(stop);
+    }
+    // `live_pid` sweeps a stale pid file as it reads, so by here the evidence of
+    // an unannounced death is the enabled flag: the user asked for a sampler and
+    // there is not one.
+    if is_enabled() {
+        return Some(SamplerStop {
+            reason: StopReason::Unknown,
+            at: None,
+            detail: None,
+        });
+    }
+    None
+}
+
+fn read_stop_marker() -> Option<SamplerStop> {
+    let raw = fs::read_to_string(config::stop_marker()).ok()?;
+    let mut lines = raw.lines();
+    let reason = StopReason::parse(lines.next()?.trim());
+    Some(SamplerStop {
+        reason,
+        // A marker with an unreadable timestamp still names a reason, and the
+        // reason is the part that matters; "when" degrades to unknown on its own.
+        at: lines.next().and_then(|line| line.trim().parse().ok()),
+        detail: lines
+            .next()
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// Records a panic as the reason this run ended, then lets the default hook run.
+///
+/// A panicking sampler is the case a user is least equipped to diagnose: the
+/// process is gone, its stderr went to `/dev/null` when it detached, and all
+/// that is left is a sparkline that stops. The marker is the one place that can
+/// still say what happened, so it is written from inside the hook rather than
+/// after unwinding, which a panic in a detached daemon may never reach.
+fn install_panic_reporter() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record_stop(StopReason::Failed, Some(&info.to_string()));
+        previous(info);
+    }));
+}
 
 pub fn enable(args: &[String]) -> Result<()> {
     // Parse before touching any state: a typo'd value must fail here, where the
@@ -137,15 +303,38 @@ pub fn restore() -> Result<()> {
     spawn_detached(&[])
 }
 
+/// [`run`], with the outcome recorded.
+///
+/// The loop itself never returns `Ok`: it parks when a signal arrives and the
+/// signal thread exits the process. So an `Err` here is the run ending on
+/// something it could not continue past, and that is as much a reason for a gap
+/// as a `kill` is.
+pub fn run_daemon(config: &Config) -> Result<()> {
+    let outcome = run(config);
+    if let Err(err) = &outcome {
+        record_stop(StopReason::Failed, Some(&err.to_string()));
+    }
+    outcome
+}
+
 /// The sampling loop itself, running in the foreground.
 ///
 /// One cycle: take a snapshot, fold it into the history, persist, then push one
 /// badge per workspace recorded by that snapshot's session. History is saved
 /// every cycle — a SIGKILLed daemon must lose at most one interval of data, not
 /// the whole session.
+///
+/// Every exit this function can see is recorded on the way out, so a gap in the
+/// history can say why nobody was watching. The exits it cannot see — a
+/// `SIGKILL`, a power cut — leave no marker, and read back as
+/// [`StopReason::Unknown`] rather than as a tidy shutdown.
 pub fn run(config: &Config) -> Result<()> {
     write_pid(std::process::id());
-
+    // The last run's epitaph is not this run's. Cleared after the pid marker so
+    // a reader in the window between them sees a live daemon rather than a
+    // sampler that stopped for no stated reason.
+    clear_stop();
+    install_panic_reporter();
     // Which token name is currently lit per workspace. A tone flip has to clear
     // the old name before setting the new one, or herdr renders two badges at
     // once — the merge patch only touches names we mention.
@@ -566,6 +755,22 @@ fn spawn_signal_thread(
     std::thread::spawn(move || {
         if signals.forever().next().is_some() {
             stopping.store(true, Ordering::SeqCst);
+            // Who asked. `--disable` clears the enabled marker *before* it
+            // signals — the lifecycle contract at the top of this module — so a
+            // signal arriving with the marker gone is the user's own request,
+            // and one arriving with it still set came from somewhere else: a
+            // reboot, an OOM killer, somebody's `kill`. The two look identical
+            // on the wire and mean different things to a reader deciding whether
+            // to trust an empty sparkline.
+            let reason = if is_enabled() {
+                StopReason::Terminated
+            } else {
+                StopReason::Disabled
+            };
+            // Before the badge clears, not after: `shutdown` spends a round trip
+            // per workspace and can be outlived by `--disable`'s own timeout, and
+            // a stop nobody recorded reads as unknown.
+            record_stop(reason, None);
             shutdown(&active);
             std::process::exit(0);
         }

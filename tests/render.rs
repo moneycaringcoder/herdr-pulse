@@ -11,10 +11,11 @@
 use std::time::Duration;
 
 use pulse::config::{Config, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
+use pulse::daemon::{SamplerStop, StopReason};
 use pulse::model::{AgentState, Level, SessionMark, WorkspaceActivity};
 use pulse::render::{
-    badge, display_width, duration, json_document, pane, pane_geometry, sparkline,
-    staleness_tolerance, state_glyph, week_pane, GAP, QUIET, RAMP,
+    badge, display_width, duration, json_document, pane, pane_geometry, sampler_stop_message,
+    sparkline, staleness_tolerance, state_glyph, week_pane, GAP, QUIET, RAMP,
 };
 
 /// The `as_of` every pane test renders at. Fixed so a row's freshness is a
@@ -268,6 +269,83 @@ fn no_duration_ever_exceeds_four_columns() {
         );
     }
     assert!(display_width(&duration(None)) <= 4);
+}
+
+// ---------------------------------------------------------------------------
+// sampler stop explanation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_disabled_sampler_names_the_choice_and_when_it_was_made() {
+    let stop = SamplerStop {
+        reason: StopReason::Disabled,
+        at: Some(AS_OF - 14 * 60),
+        detail: None,
+    };
+
+    assert_eq!(
+        sampler_stop_message(Some(&stop), AS_OF).as_deref(),
+        Some("no sampler is running — disabled 14m ago; nothing since then is recorded.")
+    );
+}
+
+#[test]
+fn a_terminated_sampler_names_the_termination_with_or_without_a_time() {
+    let known = SamplerStop {
+        reason: StopReason::Terminated,
+        at: Some(AS_OF - 3 * 60),
+        detail: None,
+    };
+    let unknown = SamplerStop {
+        at: None,
+        ..known.clone()
+    };
+
+    assert_eq!(
+        sampler_stop_message(Some(&known), AS_OF).as_deref(),
+        Some("no sampler is running — terminated 3m ago; nothing since then is recorded.")
+    );
+    assert_eq!(
+        sampler_stop_message(Some(&unknown), AS_OF).as_deref(),
+        Some("no sampler is running — terminated; nothing since then is recorded.")
+    );
+}
+
+#[test]
+fn a_failed_sampler_carries_the_failure_detail() {
+    let stop = SamplerStop {
+        reason: StopReason::Failed,
+        at: Some(AS_OF - 3 * 60),
+        detail: Some("history write failed".to_string()),
+    };
+
+    assert_eq!(
+        sampler_stop_message(Some(&stop), AS_OF).as_deref(),
+        Some(
+            "no sampler is running — the last run ended unexpectedly 3m ago (history write failed); nothing since then is recorded."
+        )
+    );
+}
+
+#[test]
+fn an_unannounced_stop_is_never_presented_as_clean() {
+    let stop = SamplerStop {
+        reason: StopReason::Unknown,
+        at: None,
+        detail: None,
+    };
+
+    assert_eq!(
+        sampler_stop_message(Some(&stop), AS_OF).as_deref(),
+        Some(
+            "no sampler is running — the last run stopped for an unknown reason; nothing since then is recorded."
+        )
+    );
+}
+
+#[test]
+fn a_live_sampler_has_nothing_to_explain() {
+    assert_eq!(sampler_stop_message(None, AS_OF), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,7 +1435,7 @@ fn json_carries_both_series_with_the_gap_and_quiet_distinction_intact() {
     let mut workspace = activity("w1", series, AgentState::Idle, None, 1);
     workspace.week = vec![Some(Level::new(0)), None, Some(Level::new(8))];
 
-    let document = json_document(&config, AS_OF, 3, 1, &[workspace], None);
+    let document = json_document(&config, AS_OF, 3, 1, &[workspace], None, None);
     let series = &document["workspaces"][0]["series"];
     let week = &document["workspaces"][0]["week"];
 
@@ -1412,7 +1490,7 @@ fn json_carries_the_live_and_per_workspace_session_marks() {
     current.workspace_id = "same-checkout".to_string();
     old.workspace_id = "same-checkout".to_string();
 
-    let document = json_document(&config, AS_OF, 1, 1, &[current, old], Some(&live));
+    let document = json_document(&config, AS_OF, 1, 1, &[current, old], Some(&live), None);
     assert_eq!(
         document["session"]["fingerprint"].as_str(),
         Some("live-fingerprint")
@@ -1441,7 +1519,42 @@ fn json_carries_the_live_and_per_workspace_session_marks() {
     assert_eq!(earlier_session["began"].as_u64(), Some(3 * 3_600 + 7 * 60));
     assert_eq!(earlier_session["is_current"].as_bool(), Some(false));
 
-    let unknown = json_document(&config, AS_OF, 0, 1, &[], None);
+    let unknown = json_document(&config, AS_OF, 0, 1, &[], None, None);
     assert!(unknown["session"]["fingerprint"].is_null());
     assert!(unknown["session"]["began"].is_null());
+}
+
+#[test]
+fn json_says_when_the_sampler_is_running() {
+    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, None);
+
+    assert_eq!(
+        document["sampler"],
+        serde_json::json!({
+            "running": true,
+            "stopped": null,
+        })
+    );
+}
+
+#[test]
+fn json_carries_the_complete_sampler_stop() {
+    let stop = SamplerStop {
+        reason: StopReason::Failed,
+        at: Some(AS_OF - 3 * 60),
+        detail: Some("history write failed".to_string()),
+    };
+    let document = json_document(&Config::default(), AS_OF, 0, 1, &[], None, Some(&stop));
+
+    assert_eq!(
+        document["sampler"],
+        serde_json::json!({
+            "running": false,
+            "stopped": {
+                "reason": "failed",
+                "at": AS_OF - 3 * 60,
+                "detail": "history write failed",
+            },
+        })
+    );
 }

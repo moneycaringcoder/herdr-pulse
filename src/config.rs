@@ -398,6 +398,16 @@ pub fn enabled_flag() -> PathBuf {
     state_dir().join("enabled")
 }
 
+/// Marker: why the last sampler run ended, written as it goes.
+///
+/// Separate from the pid and enabled markers because it answers a different
+/// question from either. The pid says whether one is live now, the enabled flag
+/// says whether the user wants one, and this says what happened to the last one
+/// — which is the only way a gap in the history can carry a reason.
+pub fn stop_marker() -> PathBuf {
+    state_dir().join("sampler.stop")
+}
+
 /// The recorded activity history.
 pub fn history_file() -> PathBuf {
     state_dir().join("history.json")

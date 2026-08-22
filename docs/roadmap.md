@@ -30,12 +30,6 @@ something changed next to the shape of the work around it.
 
 ## Operating it
 
-### Say why the sampler stopped
-
-A gap correctly shows that nothing was observed. It does not say whether the
-sampler was disabled deliberately, killed, or crashed. The distinction matters to
-anyone trying to trust the history.
-
 ### Optional supervision
 
 The sampler is a detached background process that keeps running after herdr exits

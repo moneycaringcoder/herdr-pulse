@@ -204,6 +204,36 @@ pub fn duration(seconds: Option<u64>) -> String {
         ">99d".to_string()
     }
 }
+/// Explains why there is no live sampler, or returns `None` while one is live.
+///
+/// The stop time is measured against `as_of` rather than the wall clock so the
+/// pane, JSON document, and explanation all describe the same instant. A future
+/// timestamp saturates to `0s` instead of underflowing.
+pub fn sampler_stop_message(stop: Option<&daemon::SamplerStop>, as_of: u64) -> Option<String> {
+    let stop = stop?;
+    let age = stop
+        .at
+        .map(|at| format!(" {} ago", duration(Some(as_of.saturating_sub(at)))))
+        .unwrap_or_default();
+    let reason = match stop.reason {
+        daemon::StopReason::Disabled => format!("disabled{age}"),
+        daemon::StopReason::Terminated => format!("terminated{age}"),
+        daemon::StopReason::Failed => {
+            let detail = stop
+                .detail
+                .as_deref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            format!("the last run ended unexpectedly{age}{detail}")
+        }
+        daemon::StopReason::Unknown => {
+            format!("the last run stopped for an unknown reason{age}")
+        }
+    };
+    Some(format!(
+        "no sampler is running — {reason}; nothing since then is recorded."
+    ))
+}
 
 #[derive(Clone, Copy)]
 struct PaneView {
@@ -382,11 +412,11 @@ pub fn run_once(config: &Config) -> Result<()> {
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
     print!("{}", pane(&activity, config, as_of, session.as_ref()));
 
-    // An empty report and a stopped sampler look identical on screen, so say
-    // which one this is. On stderr, so `pulse --once > report.txt` still
-    // captures only the report.
-    if activity.is_empty() && daemon::live_pid().is_none() {
-        eprintln!("pulse: no sampler is running — nothing is being recorded.");
+    // A stopped sampler can leave either an empty report or a convincing stretch
+    // of saved history. Say what stopped in both cases. On stderr, so
+    // `pulse --once > report.txt` still captures only the report.
+    if let Some(message) = sampler_stop_message(current_sampler_stop().as_ref(), as_of) {
+        eprintln!("pulse: {message}");
     }
     Ok(())
 }
@@ -399,8 +429,8 @@ pub fn run_week(config: &Config) -> Result<()> {
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
     print!("{}", week_pane(&activity, config, as_of, session.as_ref()));
 
-    if activity.is_empty() && daemon::live_pid().is_none() {
-        eprintln!("pulse: no sampler is running — nothing is being recorded.");
+    if let Some(message) = sampler_stop_message(current_sampler_stop().as_ref(), as_of) {
+        eprintln!("pulse: {message}");
     }
     Ok(())
 }
@@ -419,9 +449,14 @@ pub fn run_week(config: &Config) -> Result<()> {
 /// `staleness_tolerance_seconds` those were judged against. Without them a tool
 /// reading `"state":"working"` has no way to discover that nobody has looked in
 /// five hours, and would be right to treat it as current.
+///
+/// A series of `null` buckets only says nobody was watching. The top-level
+/// `sampler` field is the only field that says whether that was on purpose or
+/// because the last run ended.
 pub fn run_json(config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
     let session = live_session();
+    let stop = current_sampler_stop();
     let (columns, buckets_per_column) = pane_geometry(config);
     let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
     let document = json_document(
@@ -431,6 +466,7 @@ pub fn run_json(config: &Config) -> Result<()> {
         buckets_per_column,
         &activity,
         session.as_ref(),
+        stop.as_ref(),
     );
     println!("{}", serde_json::to_string_pretty(&document)?);
     Ok(())
@@ -453,8 +489,24 @@ pub fn json_document(
     buckets_per_column: usize,
     activity: &[WorkspaceActivity],
     session: Option<&SessionMark>,
+    stop: Option<&daemon::SamplerStop>,
 ) -> Value {
     let tolerance = staleness_tolerance(config);
+
+    let sampler = match stop {
+        Some(stop) => json!({
+            "running": false,
+            "stopped": {
+                "reason": stop.reason.as_str(),
+                "at": stop.at,
+                "detail": stop.detail.as_deref(),
+            },
+        }),
+        None => json!({
+            "running": true,
+            "stopped": Value::Null,
+        }),
+    };
 
     let workspaces: Vec<Value> = activity
         .iter()
@@ -513,6 +565,7 @@ pub fn json_document(
             "fingerprint": session.map(|mark| mark.fingerprint.as_str()),
             "began": session.map(|mark| mark.began),
         },
+        "sampler": sampler,
         "bucket_seconds": config.bucket_seconds,
         "columns": columns,
         "buckets_per_column": buckets_per_column,
@@ -537,8 +590,9 @@ pub fn json_document(
 /// writes. Must degrade with a clear message when no sampler is running, rather
 /// than showing an empty pane that looks like a quiet session.
 pub fn run_watch(config: &Config) -> Result<()> {
-    if daemon::live_pid().is_none() {
-        return Err(no_sampler_error().into());
+    let as_of = crate::now_unix();
+    if let Some(stop) = current_sampler_stop() {
+        return Err(no_sampler_error(&stop, as_of).into());
     }
 
     let (columns, buckets_per_column) = pane_geometry(config);
@@ -547,12 +601,10 @@ pub fn run_watch(config: &Config) -> Result<()> {
         // Re-checked every cycle, not just at startup. A sampler that dies under
         // a running watch would otherwise leave the last frame on screen for
         // hours, ageing into a confident lie.
-        if daemon::live_pid().is_none() {
+        if let Some(stop) = current_sampler_stop() {
             write!(out, "{CLEAR}")?;
             out.flush()?;
-            return Err(
-                format!("the sampler stopped while watching. {}", no_sampler_error()).into(),
-            );
+            return Err(no_sampler_error(&stop, crate::now_unix()).into());
         }
 
         let as_of = crate::now_unix();
@@ -575,10 +627,27 @@ pub fn run_watch(config: &Config) -> Result<()> {
     }
 }
 
-fn no_sampler_error() -> String {
-    "no sampler is running, so there is nothing live to watch — start it with `pulse --enable`, \
-     or use `pulse --once` to read what was recorded earlier"
-        .to_string()
+fn no_sampler_error(stop: &daemon::SamplerStop, as_of: u64) -> String {
+    let message =
+        sampler_stop_message(Some(stop), as_of).expect("a sampler stop always has an explanation");
+    format!(
+        "{message} Start it with `pulse --enable`, or use `pulse --once` to read what was recorded earlier"
+    )
+}
+
+/// Returns the recorded stop reason, with an honest fallback for a sampler that
+/// disappeared before it could leave a marker. The second live check closes the
+/// race where a sampler starts after [`daemon::stop_report`] finds no marker.
+fn current_sampler_stop() -> Option<daemon::SamplerStop> {
+    match daemon::stop_report() {
+        Some(stop) => Some(stop),
+        None if daemon::live_pid().is_some() => None,
+        None => Some(daemon::SamplerStop {
+            reason: daemon::StopReason::Unknown,
+            at: None,
+            detail: None,
+        }),
+    }
 }
 
 /// How many pane columns to ask the store for, and how many buckets each one
