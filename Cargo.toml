@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Activity history and sparklines for herdr agents."
 license = "MIT"
