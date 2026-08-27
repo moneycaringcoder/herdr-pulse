@@ -1,9 +1,10 @@
-# herdr socket protocol notes (verified against herdr 0.8.0, protocol 19)
+# herdr socket protocol notes (qualified at protocols 19 and 20)
 
-Working notes for this plugin's socket client. Everything here was verified
-against a live herdr 0.8.0 server and its bundled schema (`herdr api schema`),
-not inferred from documentation. Where a claim was checked by reading a value
-back out of the server rather than by trusting an `ok`, it says so.
+The runtime shape is captured from live Herdr 0.8.0/protocol 19 and
+0.8.2/protocol 20 sessions. The complete generated Herdr 0.8.2 schema
+(schema version 1) is committed beside those captures and checked by the same
+narrow contract validator as the upstream canary. Behavioral readback claims
+remain labelled 0.8.0 where they were observed only on that server.
 
 ## Transport
 
@@ -55,7 +56,7 @@ The payload is `{"type":"session_snapshot","snapshot":{...}}` and the arrays liv
 **one level below `result`, under `snapshot`**:
 
 ```
-snapshot.version    "0.8.0"        snapshot.protocol  19
+snapshot.version    "0.8.0" / "0.8.2"    snapshot.protocol  19 / 20
 snapshot.workspaces[]  workspace_id, number, label, focused, pane_count,
                        tab_count, active_tab_id, agent_status, tokens?, worktree?
 snapshot.agents[]      pane_id, workspace_id, tab_id, terminal_id, agent,
@@ -324,16 +325,16 @@ close.
 
 ## What the protocol does not expose: the width a badge has
 
-Checked, not assumed, against `herdr api schema --json` from a live 0.8.0 server
-(protocol 19) and a live `session.snapshot`. **Nothing in the protocol says how
-many columns a sidebar badge has to work with**, so the badge's eight columns are
-a fixed choice rather than a measurement.
+Checked against `herdr api schema --json` and live snapshots from Herdr
+0.8.0/protocol 19 and 0.8.2/protocol 20. **Nothing in either protocol says how
+many columns a sidebar badge has to work with**, so the badge's eight columns
+are a fixed choice rather than a measurement.
 
 The evidence, in the order it rules the possibilities out:
 
-- All 105 request methods were enumerated from the schema's `request.oneOf[]`.
-  None queries sidebar or UI geometry: the closest are `pane.layout` and
-  `pane.list`, which describe terminal panes.
+- All 105 protocol-19 and 91 protocol-20 request methods were enumerated. None
+  queries sidebar or UI geometry: the closest are `pane.layout` and `pane.list`,
+  which describe terminal panes.
 - `WorkspaceInfo` — the object the badge belongs to — carries `workspace_id`,
   `number`, `label`, `focused`, `pane_count`, `tab_count`, `active_tab_id`,
   `agent_status`, `tokens` and `worktree`. There is no width, and no cell budget.

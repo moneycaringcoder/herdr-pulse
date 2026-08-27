@@ -1,5 +1,33 @@
 # Test fixtures
 
+## `herdr-0.8.2-api.schema.json`
+
+The complete generated output of `herdr api schema --json` from Herdr 0.8.2:
+schema version 1, protocol 20. It is copied unchanged. The document contains no
+session/user data and is the stable-release input for the same narrow contract
+checker the daily `master` canary runs.
+
+## `snapshot-live-0.8.2.json`
+
+A real `session.snapshot` response captured from a running Herdr 0.8.2 server
+(protocol 20) with 5 workspaces, 4 agents, 10 panes, 5 tabs and 5 layouts.
+
+Every key, array entry, nesting level, nullability and value type remains as the
+server sent it. Only identifying strings were replaced consistently:
+
+- workspace, pane, tab, terminal and layout-node ids;
+- workspace labels, repository/cwd paths and the agent-session path;
+- terminal/tab titles; and
+- token values, while preserving every token key.
+
+Program/status/kind/source values, booleans, numbers, array order, optional-field
+presence, layout geometry and split structure were not changed. Observed
+`agent_status` values: `idle`, `unknown`, `working`.
+
+This is the primary protocol-20 runtime-shape fixture. `snapshot-live.json`
+remains the protocol-19 compatibility-floor capture rather than being rewritten
+or relabelled.
+
 ## `snapshot-live.json`
 
 A real `session.snapshot` response, captured from a running herdr 0.8.0 server

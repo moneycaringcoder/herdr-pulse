@@ -38,6 +38,7 @@ from herdr_api_contract import (  # noqa: E402
 )
 
 CHECKER = Path(__file__).with_name("herdr_api_contract.py")
+STABLE_SCHEMA = Path(__file__).resolve().parents[1] / "tests/data/herdr-0.8.2-api.schema.json"
 
 # Response objects and enumerations the fixture must define because the
 # contract's own objects point at them, even though nothing in this plugin
@@ -123,6 +124,9 @@ def response_definitions(schema: dict[str, Any]) -> dict[str, Any]:
 class FixtureTests(unittest.TestCase):
     def test_the_generated_fixture_passes(self) -> None:
         self.assertEqual(validate(contract_schema()), (MIN_PROTOCOL, len(REQUESTS)))
+
+    def test_the_stable_protocol_20_schema_passes(self) -> None:
+        self.assertEqual(validate(read_schema(STABLE_SCHEMA)), (20, len(REQUESTS)))
 
     def test_unrelated_upstream_additions_are_tolerated(self) -> None:
         schema = contract_schema(protocol=MIN_PROTOCOL + 7)

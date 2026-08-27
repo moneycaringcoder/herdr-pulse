@@ -12,12 +12,11 @@
 id = "moneycaringcoder.pulse"
 name = "Pulse"
 version = "0.1.1"
-# The floor is the latest stable herdr, which is also the only version this
-# plugin has ever been run against: 0.8.0 / protocol 19. Earlier servers carry
-# the APIs used here — the `tokens` metadata API on workspace.report_metadata
-# arrived in 0.7.5 — but nothing here has been exercised against one, and a
-# compatibility claim that was inferred rather than measured is not one worth
-# publishing. Lower it when someone has run the suite against an older server.
+# Herdr 0.8.0 / protocol 19 is the earliest exercised compatibility floor.
+# Herdr 0.8.2 / protocol 20 is also qualified by a captured live snapshot and
+# the generated stable schema. Earlier servers carry some required APIs — token
+# metadata arrived in 0.7.5 — but have not been exercised, so the floor remains
+# measured rather than inferred.
 min_herdr_version = "0.8.0"
 description = "Per-workspace agent activity history, rendered as a sidebar sparkline."
 platforms = ["linux", "macos"]

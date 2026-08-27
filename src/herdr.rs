@@ -7,15 +7,15 @@
 //! answers exactly one request per connection and then closes, so every call
 //! must be able to reconnect and retry once — see `docs/herdr-protocol.md`.
 //!
-//! # The shape of a snapshot, verified live against herdr 0.8.0 / protocol 19
+//! # Snapshot shape, captured at both supported protocol generations
 //!
 //! ```text
 //! {"id":"...","result":{"type":"session_snapshot","snapshot":{
-//!    "version":"0.8.0","protocol":19,
+//!    "version":"0.8.x","protocol":19 | 20,
 //!    "workspaces":[{workspace_id,label,number,agent_status,focused,
 //!                   pane_count,tab_count,active_tab_id,tokens?,worktree?}],
 //!    "agents":[{pane_id,workspace_id,tab_id,terminal_id,agent,agent_session,
-//!               agent_status,state_change_seq,revision,cwd,focused,tokens,...}],
+//!               agent_status,state_change_seq?,revision,cwd,focused,tokens,...}],
 //!    "panes":[...], "tabs":[...], "layouts":[...]}}}
 //! ```
 //!
@@ -24,22 +24,11 @@
 //! session — that is how the reference plugin shipped a silent bug past a green
 //! suite, so an absent `snapshot` object must be a loud error here.
 //!
-//! Two things differ from what the protocol notes in `docs/` describe, both
-//! confirmed against a live session: `agents[]` entries carry the **full pane
-//! shape** (not a reduced `{pane_id, workspace_id, agent_session, name}`), and
-//! there is **no `name` field** on them at all. Use `agent` — the program — as
-//! the label.
-//!
-//! # Where the label actually comes from
-//!
-//! The captured fixture disagrees with the paragraph above on one point: 15 of
-//! its 18 `agents[]` entries *do* carry a `name` (the user's own label for the
-//! agent, such as `reviewer`), and one carries a `display_agent`.
-//! We still populate [`AgentObservation::program`] from `agent`, because that
-//! field is named and documented in `model.rs` as *the program* — filling it
-//! with a user label would make the type lie. `name` is deliberately not
-//! carried: nothing in this plugin renders it, and a field nobody reads is a
-//! field nobody keeps correct.
+//! Captures from Herdr 0.8.0/protocol 19 and 0.8.2/protocol 20 both show that
+//! `agents[]` entries carry the full pane shape, not a reduced agent record.
+//! Optional user labels vary by capture and entry; `agent` is the stable program
+//! field used for [`AgentObservation::program`]. User `name`/`display_agent`
+//! values are deliberately not retained because this plugin renders neither.
 //!
 //! # Durable identity
 //!

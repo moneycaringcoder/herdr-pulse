@@ -62,11 +62,51 @@ work from a shell:
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+cargo build --release --locked
 ```
 
-CI runs exactly these on Linux and macOS. The local toolchain is expected to
-match CI, so a lint you cannot reproduce locally is a real difference worth
-investigating rather than something to paper over with an `#[allow]`.
+CI runs these four gates on Linux and macOS. The local toolchain is expected to
+match CI, so a lint or release-build failure you cannot reproduce locally is a
+real difference worth investigating rather than something to paper over with an
+`#[allow]`.
+
+## Pull request flow
+
+Keep one issue and one focused implementation PR together. Topic branches
+usually use `pulse/<short-topic>`, but that is a convention rather than a gate.
+Open the implementation PR non-draft, link it with `Closes #N`, fill in the
+safety checklist, and include the commands above plus live Herdr evidence for
+anything user-visible. Merge only after the actual repository checks and review
+criteria shown by GitHub are satisfied; this document does not claim unverified
+branch-protection or approval rules.
+
+## Releases
+
+Prepare a separate non-draft `release/vX.Y.Z` PR after the intended changes are
+on `main`. Move these four surfaces together:
+
+- `Cargo.toml` package version;
+- Pulse's entry in `Cargo.lock`;
+- `herdr-plugin.toml` version; and
+- a dated, non-empty `CHANGELOG.md` section.
+
+Rehearse the identity gate before merge:
+
+```sh
+python3 tools/check_release.py --tag vX.Y.Z
+```
+
+After that PR is reviewed, green and merged, push the exact stable tag:
+
+```sh
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+The tag starts the Release workflow. Wait for its identity job and both Linux
+and macOS gate matrices, then confirm the GitHub release exists and its notes
+match that version's changelog section. The daily Herdr-master canary remains
+advisory and is not a release or PR gate.
 
 ## On tests
 
