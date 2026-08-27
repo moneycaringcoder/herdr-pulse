@@ -13,6 +13,18 @@ All notable changes to this project are documented here. The format follows
   workspace labels, checkout paths and activity from its in-memory copy on the
   next sampling cycle. A stopped sampler stays stopped, and success is printed
   only after deletion and any required restart both complete.
+- Runtime state is now owned per resolved Herdr socket pathname. The default
+  socket adopts the exact legacy state root and supervisor label in place and
+  records that pathname atomically so later `HOME`/XDG changes cannot redirect
+  it; ambiguous existing state is refused rather than guessed. Named sockets use
+  collision-free full-hex directories under `sessions/` and distinct
+  systemd/launchd labels. History, lifecycle markers, status, badge cleanup,
+  disable and forget can no longer cross between named sessions.
+- Sampler startup now uses retained Unix owner flocks and serialized lifecycle
+  control flocks. Concurrent same-session starts produce one owner, one
+  atomically published PID and one history writer; stale PIDs are diagnostic
+  only, crashes release ownership automatically, and parent/supervisor startup
+  waits boundedly for ownership and PID readiness.
 
 ## [0.1.1] - 2026-08-23
 

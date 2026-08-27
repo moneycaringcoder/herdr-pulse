@@ -292,6 +292,38 @@ re-bound under a live server; it cannot merge two sessions into one, which is th
 error that would matter. `--json` carries the fingerprint, the session's start
 time, and `is_current` per workspace, plus the live session at the top level.
 
+The socket pathname has a second, deliberately separate job: it selects the
+sampler namespace. pulse resolves `HERDR_SOCKET_PATH` to an absolute pathname
+once per command. The ordinary fallback socket keeps the exact legacy state
+root, including its existing `history.json`, markers and
+`dev.herdr.pulse.sampler` supervisor label; nothing is migrated. Any other
+socket uses:
+
+```text
+$HERDR_PLUGIN_STATE_DIR/sessions/socket-<full lowercase hex of absolute socket pathname bytes>/
+```
+
+The full byte encoding is reversible and collision-free: it is never an inode,
+session fingerprint, truncated name or hash. Rebinding one pathname can change
+the historical session fingerprint above, but never changes its ownership,
+history directory or supervisor identity. Lifecycle actions, status, badge
+cleanup and `--forget` affect only the invoking socket's namespace.
+
+The state root records the default socket's raw absolute pathname in
+`default.socket`, initialized under a global lock and atomically replaced. That
+keeps legacy-root ownership stable even if a later shell changes `HOME` or
+`XDG_CONFIG_HOME`. If unscoped history or lifecycle markers already exist and
+pulse cannot match them to the remembered default, it refuses to guess and
+leaves them untouched.
+
+Within each namespace a control flock serializes lifecycle transitions, and an
+owner flock retained for the daemon's entire lifetime is authoritative.
+`sampler.pid` is only a diagnostic and signal target. Concurrent starts for one
+socket therefore publish one winning PID and one history writer; stale or
+reused PIDs cannot block recovery after the owner's process exits or crashes.
+Startup returns only after the winning child owns the lock and has atomically
+published its PID.
+
 ### Sampler
 
 | Verb | What it does |
@@ -308,9 +340,9 @@ time, and `is_current` per workspace, plus the live session at the top level.
 
 Supervision is opt-in: pulse writes nothing until you run `pulse --supervise`.
 
-On Linux it writes a systemd user unit named `dev.herdr.pulse.sampler.service`,
-into whichever per-user directory the running user manager reports in
-`systemctl --user show --property=UnitPath`, falling back to
+On Linux the default socket writes the compatibility systemd user unit named
+`dev.herdr.pulse.sampler.service` into whichever per-user directory the running
+user manager reports in `systemctl --user show --property=UnitPath`, falling back to
 `~/.config/systemd/user` when there is no manager to ask. It asks rather than
 deriving the path because a user manager is started by logind before any shell
 exists and never sees an `XDG_CONFIG_HOME` set in a shell rc — a unit written
@@ -321,6 +353,9 @@ read. It then activates the unit with:
 systemctl --user daemon-reload
 systemctl --user enable --now dev.herdr.pulse.sampler.service
 ```
+
+Named sockets append their full `socket-<hex>` component to the label and use
+distinct unit files, so different Herdr sessions can be supervised concurrently.
 
 On macOS it writes
 `~/Library/LaunchAgents/dev.herdr.pulse.sampler.plist`, then activates it with:
@@ -336,14 +371,13 @@ Linux and macOS only and that `pulse --enable` still runs the sampler until the
 machine stops.
 
 The installed definition runs `pulse --daemon`. At install time it writes the
-resolved `HERDR_PLUGIN_STATE_DIR` and `HERDR_SOCKET_PATH` values in full and
-bakes in the recording flags passed to `--supervise`: `--interval`,
-`--bucket-seconds`, `--retention-buckets`, `--columns` and `--agents`. A
-supervisor starts the sampler with neither environment variable set. Baking both
-paths in keeps the sampler writing the history that the panes read even if one
-of those variables later changes. Before installing the definition, pulse stops
-any unsupervised sampler already running so that two processes cannot overwrite
-the same history file.
+global `HERDR_PLUGIN_STATE_DIR` root and resolved absolute `HERDR_SOCKET_PATH`
+in full and bakes in the recording flags passed to `--supervise`: `--interval`,
+`--bucket-seconds`, `--retention-buckets`, `--columns` and `--agents`. The
+daemon applies the socket namespace exactly once beneath that root. Before
+activation pulse marks that namespace enabled; activation failure restores the
+previous marker. Installation and startup succeed only once the supervised
+daemon owns the namespace and has published its PID.
 
 Once supervision is installed, `--enable` starts the unit. `--disable` first
 runs `systemctl --user disable --now`, or `launchctl bootout` followed by

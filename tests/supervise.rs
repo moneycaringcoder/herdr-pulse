@@ -14,6 +14,8 @@
 //! both platforms, or `--disable` is a lie by morning. And supervision must
 //! leave recording untouched, gaps included.
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use pulse::supervise::{self, Environment, Step, Supervisor, LABEL, RESTART_SECONDS};
@@ -23,8 +25,10 @@ const BOTH: [Supervisor; 2] = [Supervisor::Systemd, Supervisor::Launchd];
 fn env(args: &[&str]) -> Environment {
     Environment {
         exe: PathBuf::from("/home/dev/.local/bin/pulse"),
-        state_dir: PathBuf::from("/home/dev/.local/state/herdr/plugins/pulse"),
-        socket_path: Some(PathBuf::from("/home/dev/.config/herdr/herdr.sock")),
+        state_root: PathBuf::from("/home/dev/.local/state/herdr/plugins/pulse"),
+        socket_path: PathBuf::from("/home/dev/.config/herdr/herdr.sock"),
+        socket_is_default: true,
+        label: LABEL.to_string(),
         args: args.iter().map(|arg| (*arg).to_string()).collect(),
         unit_dir: PathBuf::from("/home/dev/.config/systemd/user"),
         uid: 1000,
@@ -58,6 +62,12 @@ fn every_unit_carries_the_paths_resolved_at_install_time() {
         assert!(
             plan.contents.contains("/home/dev/.config/herdr/herdr.sock"),
             "{supervisor:?} names the socket it was installed against: {}",
+            plan.contents
+        );
+        assert!(
+            plan.contents.contains("PULSE_SOCKET_IS_DEFAULT")
+                && (plan.contents.contains("=1") || plan.contents.contains("<string>1</string>")),
+            "{supervisor:?} preserves default-state compatibility: {}",
             plan.contents
         );
         assert!(
@@ -204,6 +214,38 @@ fn the_unit_file_lands_where_the_platform_looks_for_it() {
 }
 
 #[test]
+fn named_sessions_get_distinct_labels_plans_and_root_environment() {
+    let mut a = env(&[]);
+    a.socket_path = PathBuf::from("/tmp/herdr-a.sock");
+    a.socket_is_default = false;
+    a.label = format!("{LABEL}.socket-2f746d702f68657264722d612e736f636b");
+    let mut b = env(&[]);
+    b.socket_path = PathBuf::from("/tmp/herdr-b.sock");
+    b.socket_is_default = false;
+    b.label = format!("{LABEL}.socket-2f746d702f68657264722d622e736f636b");
+
+    for supervisor in BOTH {
+        let a_plan = supervise::plan_for(supervisor, &a).expect("A plan");
+        let b_plan = supervise::plan_for(supervisor, &b).expect("B plan");
+        assert_ne!(a_plan.path, b_plan.path);
+        let a_identity = format!("{}\n{}", a_plan.contents, flat(&a_plan.activate));
+        let b_identity = format!("{}\n{}", b_plan.contents, flat(&b_plan.activate));
+        assert!(a_identity.contains(&a.label), "{a_identity}");
+        assert!(b_identity.contains(&b.label), "{b_identity}");
+        assert!(a_plan.contents.contains("=0") || a_plan.contents.contains("<string>0</string>"));
+        assert!(b_plan.contents.contains("=0") || b_plan.contents.contains("<string>0</string>"));
+        assert!(a_plan.contents.contains("/tmp/herdr-a.sock"));
+        assert!(b_plan.contents.contains("/tmp/herdr-b.sock"));
+        assert!(
+            a_plan
+                .contents
+                .contains("/home/dev/.local/state/herdr/plugins/pulse"),
+            "unit exports the state root, not a sessions child"
+        );
+    }
+}
+
+#[test]
 fn a_path_systemd_would_reinterpret_is_refused_rather_than_escaped() {
     // Not hypothetical: `%i` is a specifier and `$HOME` a variable reference, and
     // either one silently expands into a path that is not the one on disk. A unit
@@ -245,6 +287,18 @@ fn a_path_launchd_would_reinterpret_is_escaped_rather_than_refused() {
         "a bare ampersand is a plist launchd refuses to parse: {}",
         plan.contents
     );
+}
+
+#[test]
+fn non_utf8_paths_are_refused_instead_of_redirected_lossily() {
+    let mut broken = env(&[]);
+    broken.socket_path = PathBuf::from(OsString::from_vec(vec![b'/', 0xff, b's']));
+
+    for supervisor in BOTH {
+        let err = supervise::plan_for(supervisor, &broken)
+            .expect_err("a lossy path would target a different socket");
+        assert!(err.to_string().contains("non-UTF-8"), "{err}");
+    }
 }
 
 #[test]

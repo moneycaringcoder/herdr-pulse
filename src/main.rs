@@ -94,23 +94,56 @@ fn verb_of(args: &[String]) -> &str {
 fn run(args: &[String]) -> Result<()> {
     let verb = verb_of(args);
     match verb {
-        "--once" => render::run_once(&config::load_with_args(args)?),
-        "--week" => render::run_week(&config::load_with_args(args)?),
-        "--json" => render::run_json(&config::load_with_args(args)?),
-        "--watch" => render::run_watch(&config::load_with_args(args)?),
-        "--enable" => daemon::enable(args),
-        "--disable" => daemon::disable(),
-        "--toggle" => daemon::toggle(args),
-        "--restore" => daemon::restore(),
-        // The daemon records why it stopped on its way out, including this exit:
-        // an error that ends the run is a reason a gap can carry, and losing it
-        // would leave the run indistinguishable from one that was killed.
-        "--daemon" => daemon::run_daemon(&config::load_with_args(args)?),
-        "--forget" => daemon::forget_history(),
+        "--once" => {
+            let paths = config::SessionPaths::resolve()?;
+            render::run_once(&paths, &config::load_with_args(args)?)
+        }
+        "--week" => {
+            let paths = config::SessionPaths::resolve()?;
+            render::run_week(&paths, &config::load_with_args(args)?)
+        }
+        "--json" => {
+            let paths = config::SessionPaths::resolve()?;
+            render::run_json(&paths, &config::load_with_args(args)?)
+        }
+        "--watch" => {
+            let paths = config::SessionPaths::resolve()?;
+            render::run_watch(&paths, &config::load_with_args(args)?)
+        }
+        "--enable" => {
+            let paths = config::SessionPaths::resolve()?;
+            daemon::enable(&paths, args)
+        }
+        "--disable" => {
+            let paths = config::SessionPaths::resolve()?;
+            daemon::disable(&paths)
+        }
+        "--toggle" => {
+            let paths = config::SessionPaths::resolve()?;
+            daemon::toggle(&paths, args)
+        }
+        "--restore" => {
+            let paths = config::SessionPaths::resolve()?;
+            daemon::restore(&paths)
+        }
+        "--daemon" => {
+            let paths = config::SessionPaths::resolve_daemon()?;
+            daemon::run_daemon(&paths, &config::load_with_args(args)?)
+        }
+        "--forget" => {
+            let paths = config::SessionPaths::resolve()?;
+            daemon::forget_history(&paths)
+        }
         "--setup" => setup::run_setup(),
         "--setup-rollback" => setup::run_rollback(),
-        "--supervise" => supervise::install(args),
-        "--unsupervise" => supervise::remove(),
+        "--supervise" => {
+            let paths = config::SessionPaths::resolve()?;
+            supervise::install(&paths, args)
+        }
+        "--unsupervise" => {
+            let paths = config::SessionPaths::resolve()?;
+            supervise::remove(&paths)
+        }
         "--version" => {
             println!("pulse {}", env!("CARGO_PKG_VERSION"));
             Ok(())
