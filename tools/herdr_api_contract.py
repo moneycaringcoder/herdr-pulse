@@ -135,7 +135,7 @@ def read_schema(path: Path) -> object:
             content.decode("utf-8", errors="strict"),
             parse_constant=reject_json_constant,
         )
-    except (UnicodeError, ValueError, RecursionError) as error:
+    except (ValueError, RecursionError) as error:
         raise ContractError("schema is not valid UTF-8 JSON") from error
 
 
