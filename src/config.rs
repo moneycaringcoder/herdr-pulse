@@ -2,12 +2,17 @@
 //! us. Owned by the integrator; the other modules read it, none of them change
 //! it.
 
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Result;
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.pulse";
+pub(crate) const SOCKET_IS_DEFAULT_ENV: &str = "PULSE_SOCKET_IS_DEFAULT";
 
 /// How often the daemon takes a `session.snapshot`.
 ///
@@ -424,17 +429,12 @@ pub fn plugin_id() -> String {
     non_empty_env("HERDR_PLUGIN_ID").unwrap_or_else(|| PLUGIN_ID.to_string())
 }
 
-/// Where the daemon's markers and the history file live:
-/// `~/.local/state/herdr/plugins/<id>/`.
+/// Unscoped state root injected by herdr, preserving the pre-session layout.
 ///
-/// herdr injects `HERDR_PLUGIN_STATE_DIR` into the commands it spawns and is
-/// authoritative when it does, but the fallback has to resolve to the *same*
-/// directory. The README encourages running the binary by hand during
-/// development, and a fallback that pointed somewhere else — a temp dir — would
-/// give `--enable` from a plugin action and `--disable` from a shell two
-/// different state dirs: the hand-run disable finds no pid file, silently does
-/// nothing, and leaves a daemon running that the user has no way to stop.
-pub fn state_dir() -> PathBuf {
+/// The resolved default socket uses this directory directly. Named sockets put
+/// all runtime state below `sessions/socket-<full path hex>`; configuration
+/// remains global.
+pub fn state_root() -> PathBuf {
     non_empty_env("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -445,8 +445,209 @@ pub fn state_dir() -> PathBuf {
         })
 }
 
+/// Every runtime path belonging to one resolved Herdr socket namespace.
+///
+/// This value is resolved once at command entry and threaded through lifecycle,
+/// history, rendering, and supervision. It deliberately owns the socket path as
+/// well as its derived state directory so an ambient environment change cannot
+/// split one operation across two sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPaths {
+    pub socket_path: PathBuf,
+    pub state_root: PathBuf,
+    pub state_dir: PathBuf,
+    pub scope_key: Option<String>,
+}
+
+impl SessionPaths {
+    pub fn resolve() -> Result<Self> {
+        Self::resolve_target(crate::herdr::socket_target()?, true)
+    }
+
+    /// Resolves the internal daemon handoff. A child may consume an existing
+    /// default classification but may never create or redirect it.
+    pub fn resolve_daemon() -> Result<Self> {
+        Self::resolve_target(crate::herdr::daemon_socket_target()?, false)
+    }
+
+    fn resolve_target(
+        mut target: crate::herdr::SocketTarget,
+        may_initialize_default: bool,
+    ) -> Result<Self> {
+        target.is_default = stable_default_classification(&target, may_initialize_default)?;
+        Ok(Self::for_socket(&target))
+    }
+
+    pub fn for_socket(target: &crate::herdr::SocketTarget) -> Self {
+        let state_root = state_root();
+        let scope_key = (!target.is_default).then(|| socket_key(&target.path));
+        let state_dir = scope_key.as_ref().map_or_else(
+            || state_root.clone(),
+            |key| state_root.join("sessions").join(key),
+        );
+        Self {
+            socket_path: target.path.clone(),
+            state_root,
+            state_dir,
+            scope_key,
+        }
+    }
+
+    pub fn pid_file(&self) -> PathBuf {
+        self.state_dir.join("sampler.pid")
+    }
+
+    pub fn enabled_flag(&self) -> PathBuf {
+        self.state_dir.join("enabled")
+    }
+
+    pub fn stop_marker(&self) -> PathBuf {
+        self.state_dir.join("sampler.stop")
+    }
+
+    pub fn owner_lock(&self) -> PathBuf {
+        self.state_dir.join("sampler.owner.lock")
+    }
+
+    pub fn control_lock(&self) -> PathBuf {
+        self.state_dir.join("sampler.control.lock")
+    }
+
+    pub fn history_file(&self) -> PathBuf {
+        self.state_dir.join("history.json")
+    }
+
+    pub fn supervisor_label(&self) -> String {
+        match &self.scope_key {
+            Some(key) => format!("{}.{}", crate::supervise::LABEL, key),
+            None => crate::supervise::LABEL.to_string(),
+        }
+    }
+}
+
+/// Reversible, collision-free namespace key for an absolute Unix socket path.
+pub fn socket_key(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_bytes();
+    let mut key = String::with_capacity(7 + bytes.len() * 2);
+    key.push_str("socket-");
+    for byte in bytes {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    key
+}
+
+const DEFAULT_SOCKET_MARKER: &str = "default.socket";
+const DEFAULT_SOCKET_LOCK: &str = "default.socket.lock";
+const DEFAULT_SOCKET_TEMP: &str = "default.socket.tmp";
+
+/// Makes legacy-root adoption independent of the caller's later HOME/XDG
+/// environment. Once the default pathname is known, its raw bytes are the
+/// authority. A first invocation that cannot reconcile existing unscoped state
+/// refuses rather than assigning that history to a guessed socket.
+fn stable_default_classification(
+    target: &crate::herdr::SocketTarget,
+    may_initialize_default: bool,
+) -> Result<bool> {
+    let root = state_root();
+    let marker = root.join(DEFAULT_SOCKET_MARKER);
+    if let Some(is_default) = read_default_marker(&marker, &target.path)? {
+        return Ok(is_default);
+    }
+
+    fs::create_dir_all(&root)?;
+    let _guard = lock_default_marker(&root)?;
+    if let Some(is_default) = read_default_marker(&marker, &target.path)? {
+        return Ok(is_default);
+    }
+
+    if target.is_default {
+        if !may_initialize_default {
+            return Err(format!(
+                "{} is missing; an internal daemon cannot claim the legacy default namespace",
+                marker.display()
+            )
+            .into());
+        }
+        let temp = root.join(DEFAULT_SOCKET_TEMP);
+        let _ = fs::remove_file(&temp);
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .truncate(false)
+                .open(&temp)?;
+            file.write_all(target.path.as_os_str().as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temp, &marker)?;
+            fs::File::open(&root)?.sync_all()
+        })();
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&temp);
+            return Err(format!(
+                "cannot record default socket in {}: {err}",
+                marker.display()
+            )
+            .into());
+        }
+        return Ok(true);
+    }
+
+    if [
+        "history.json",
+        "history.json.tmp",
+        "sampler.pid",
+        "enabled",
+        "sampler.stop",
+    ]
+    .iter()
+    .any(|name| root.join(name).exists())
+    {
+        return Err(format!(
+            "cannot assign existing unscoped state in {} to socket {}; run once with the \
+             original default HOME/XDG environment first",
+            root.display(),
+            target.path.display()
+        )
+        .into());
+    }
+    Ok(false)
+}
+
+fn read_default_marker(marker: &Path, socket: &Path) -> Result<Option<bool>> {
+    match fs::read(marker) {
+        Ok(recorded) if !recorded.is_empty() => Ok(Some(recorded == socket.as_os_str().as_bytes())),
+        Ok(_) => Err(format!(
+            "{} is empty; refusing to guess the default socket",
+            marker.display()
+        )
+        .into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("cannot read {}: {err}", marker.display()).into()),
+    }
+}
+
+fn lock_default_marker(root: &Path) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(DEFAULT_SOCKET_LOCK))?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err.into());
+        }
+    }
+}
+
 /// Where the config file lives: `~/.config/herdr/plugins/config/<id>/`. Same
-/// split-brain rule as [`state_dir`] — a config read by hand must be the config
+/// split-brain rule as [`state_root`] — a config read by hand must be the config
 /// herdr reads.
 pub fn config_dir() -> PathBuf {
     non_empty_env("HERDR_PLUGIN_CONFIG_DIR")
@@ -481,32 +682,6 @@ fn xdg_dir(variable: &str, relative: &str) -> PathBuf {
         Some(home) => home.join(relative),
         None => std::env::temp_dir().join("herdr-no-home"),
     }
-}
-
-/// Marker: a daemon is live right now.
-pub fn pid_file() -> PathBuf {
-    state_dir().join("sampler.pid")
-}
-
-/// Marker: the user asked for a daemon at some point. Survives restarts, and is
-/// what `--restore` consults.
-pub fn enabled_flag() -> PathBuf {
-    state_dir().join("enabled")
-}
-
-/// Marker: why the last sampler run ended, written as it goes.
-///
-/// Separate from the pid and enabled markers because it answers a different
-/// question from either. The pid says whether one is live now, the enabled flag
-/// says whether the user wants one, and this says what happened to the last one
-/// — which is the only way a gap in the history can carry a reason.
-pub fn stop_marker() -> PathBuf {
-    state_dir().join("sampler.stop")
-}
-
-/// The recorded activity history.
-pub fn history_file() -> PathBuf {
-    state_dir().join("history.json")
 }
 
 /// herdr injects empty strings for absent context, so empty means unset.

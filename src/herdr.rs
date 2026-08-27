@@ -116,18 +116,27 @@ pub struct Herdr {
     next_id: u64,
 }
 
+/// One invocation's stable socket pathname and compatibility classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketTarget {
+    pub path: PathBuf,
+    pub is_default: bool,
+}
+
 impl Herdr {
-    /// Dials once so a missing server is reported here, with the path, rather
-    /// than as a confusing failure inside the first call.
-    pub fn connect() -> Result<Self> {
-        let socket_path = socket_path()?;
-        // The connection is dropped immediately: one request per connection
-        // means there is nothing worth holding open.
-        dial(&socket_path)?;
+    /// Dials the already-resolved socket selected for this invocation.
+    pub fn connect_at(socket_path: &Path) -> Result<Self> {
+        dial(socket_path)?;
         Ok(Self {
-            socket_path,
+            socket_path: socket_path.to_path_buf(),
             next_id: 0,
         })
+    }
+
+    /// Convenience for callers that do not participate in a longer stateful
+    /// operation. Runtime lifecycle code uses [`Self::connect_at`] instead.
+    pub fn connect() -> Result<Self> {
+        Self::connect_at(&socket_target()?.path)
     }
 
     /// One `session.snapshot`, reduced to a [`Sample`] stamped with `taken_at`
@@ -476,21 +485,76 @@ pub fn reduce_snapshot(
         workspaces,
     })
 }
+/// Resolves the socket once. Relative injected paths are made absolute against
+/// the invoking process's current directory before any detach or supervision
+/// boundary. The path is not canonicalized: the socket may be absent during a
+/// restart, and its pathname rather than its inode owns runtime state.
+pub fn socket_target() -> Result<SocketTarget> {
+    socket_target_with_hint(None)
+}
 
-/// Resolves the socket path: `HERDR_SOCKET_PATH`, else
-/// `$XDG_CONFIG_HOME/herdr/herdr.sock`. An empty environment variable counts as
-/// unset, because herdr injects empty strings for absent context.
-pub fn socket_path() -> Result<PathBuf> {
-    // herdr injects this into everything it spawns; the fallback exists only for
-    // hand invocation from a shell.
-    if let Some(path) = config::non_empty_env("HERDR_SOCKET_PATH") {
-        return Ok(PathBuf::from(path));
+/// Internal detached/supervised daemon resolution. Only the daemon entrypoint
+/// honors the parent's namespace hint; public actions always classify their own
+/// socket and cannot be redirected across namespaces by a private handoff var.
+pub(crate) fn daemon_socket_target() -> Result<SocketTarget> {
+    let hint = match config::non_empty_env(config::SOCKET_IS_DEFAULT_ENV).as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        Some(value) => {
+            return Err(format!(
+                "{} must be `0` or `1`, got `{value}`",
+                config::SOCKET_IS_DEFAULT_ENV
+            )
+            .into())
+        }
+        None => None,
+    };
+    socket_target_with_hint(hint)
+}
+
+fn socket_target_with_hint(default_hint: Option<bool>) -> Result<SocketTarget> {
+    if let Some(injected) = config::non_empty_env("HERDR_SOCKET_PATH") {
+        let path = absolute_path(PathBuf::from(injected))?;
+        let is_default = default_hint.unwrap_or_else(|| {
+            default_socket_path()
+                .and_then(absolute_path)
+                .is_ok_and(|fallback| path == fallback)
+        });
+        return Ok(SocketTarget { path, is_default });
     }
+
+    let path = absolute_path(default_socket_path()?)?;
+    Ok(SocketTarget {
+        path,
+        is_default: true,
+    })
+}
+
+/// The resolved pathname alone, retained for short-lived client callers.
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(socket_target()?.path)
+}
+
+fn default_socket_path() -> Result<PathBuf> {
     let config_home = config::non_empty_env("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| config::non_empty_env("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            config::non_empty_env("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        })
         .ok_or("HERDR_SOCKET_PATH is unset and neither XDG_CONFIG_HOME nor HOME is set")?;
     Ok(config_home.join("herdr").join("herdr.sock"))
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 /// Non-empty string field, since herdr reports absent context as an empty string

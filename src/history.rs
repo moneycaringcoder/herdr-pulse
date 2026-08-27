@@ -65,10 +65,10 @@
 //!   in ten minutes of hard work. It is also the only way to see an agent that
 //!   went working -> idle -> working *between* two samples.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::config::Config;
+use crate::config::{Config, SessionPaths};
 use crate::model::{
     AgentActivity, AgentState, Level, Sample, SessionMark, WorkspaceActivity, WorkspaceObservation,
 };
@@ -1759,14 +1759,9 @@ fn week_bucket_number(at: u64) -> u64 {
     at / crate::config::WEEK_BUCKET_SECONDS.max(1)
 }
 
-/// Loads the history from the state dir.
-///
-/// A missing file is an empty history and is not an error. A corrupt file, a
-/// file from a future `FORMAT_VERSION`, or one whose `bucket_seconds` disagrees
-/// with `config` is reported on stderr and replaced with an empty history: we
-/// would rather start over loudly than render a series we cannot interpret.
-pub fn load(config: &Config) -> History {
-    load_from(&state_dir(), config)
+/// Loads this socket namespace's history.
+pub fn load(paths: &SessionPaths, config: &Config) -> History {
+    load_from(&paths.state_dir, config)
 }
 
 /// [`load`], from a named directory.
@@ -1906,8 +1901,8 @@ pub fn load_from(dir: &Path, config: &Config) -> History {
 /// Hence the `Ok` on failure. The caller is the sampling loop, and the obvious
 /// thing for it to write is `save(&history, &config)?` — so a full disk must not
 /// be an error here, or a full disk stops the badge from ever updating again.
-pub fn save(history: &History, _config: &Config) -> Result<()> {
-    match save_to(&state_dir(), history) {
+pub fn save(paths: &SessionPaths, history: &History, _config: &Config) -> Result<()> {
+    match save_to(&paths.state_dir, history) {
         Ok(()) => {
             SAVE_FAILURE_REPORTED.store(false, Ordering::Relaxed);
         }
@@ -1915,7 +1910,7 @@ pub fn save(history: &History, _config: &Config) -> Result<()> {
             if !SAVE_FAILURE_REPORTED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "pulse: not recording history, cannot write {}: {err}",
-                    state_dir().join(HISTORY_FILE).display()
+                    paths.history_file().display()
                 );
             }
         }
@@ -1958,9 +1953,9 @@ fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Deletes the recorded history. Backs the `--forget` action.
-pub fn forget() -> Result<()> {
-    forget_in(&state_dir())
+/// Deletes this socket namespace's recorded history.
+pub fn forget(paths: &SessionPaths) -> Result<()> {
+    forget_in(&paths.state_dir)
 }
 
 /// [`forget`], in a named directory.
@@ -1979,8 +1974,4 @@ pub fn forget_in(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn state_dir() -> PathBuf {
-    crate::config::state_dir()
 }

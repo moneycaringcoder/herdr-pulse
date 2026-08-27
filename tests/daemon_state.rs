@@ -14,7 +14,10 @@
 //! have a width the store could never emit.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -60,6 +63,40 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    fn new(names: &[&'static str]) -> Self {
+        Self {
+            saved: names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        }
+    }
+
+    fn set(&self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        std::env::set_var(name, value);
+    }
+
+    fn remove(&self, name: &'static str) {
+        std::env::remove_var(name);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn unique_temp(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     std::env::temp_dir().join(format!(
@@ -94,6 +131,12 @@ impl TempDirs {
     fn config(&self) -> PathBuf {
         self.root.join("config")
     }
+
+    fn paths(&self) -> config::SessionPaths {
+        let paths = config::SessionPaths::resolve().expect("session paths");
+        assert!(paths.state_root.starts_with(&self.root));
+        paths
+    }
 }
 
 impl Drop for TempDirs {
@@ -125,7 +168,11 @@ struct SamplerServer {
 
 impl SamplerServer {
     fn start(root: &Path) -> Self {
-        let path = root.join("herdr.sock");
+        Self::start_named(root, "herdr.sock")
+    }
+
+    fn start_named(root: &Path, name: &str) -> Self {
+        let path = root.join(name);
         let listener = UnixListener::bind(&path).expect("bind sampler socket");
         listener.set_nonblocking(true).expect("nonblocking socket");
         let workspace = Arc::new(Mutex::new("old".to_string()));
@@ -239,10 +286,11 @@ impl Drop for SamplerServer {
 /// still the owner.
 struct SamplerProcess {
     initial_reaper: Option<std::thread::JoinHandle<()>>,
+    paths: config::SessionPaths,
 }
 
 impl SamplerProcess {
-    fn new(mut child: Child) -> Self {
+    fn new(mut child: Child, paths: config::SessionPaths) -> Self {
         Self {
             // Reap concurrently. A zombie still answers `kill(pid, 0)`, so the
             // separate `pulse --forget` process would otherwise wait out its
@@ -250,13 +298,21 @@ impl SamplerProcess {
             initial_reaper: Some(std::thread::spawn(move || {
                 let _ = child.wait();
             })),
+            paths,
+        }
+    }
+
+    fn detached(paths: config::SessionPaths) -> Self {
+        Self {
+            initial_reaper: None,
+            paths,
         }
     }
 }
 
 impl Drop for SamplerProcess {
     fn drop(&mut self) {
-        if let Some(pid) = daemon::read_pid() {
+        if let Some(pid) = daemon::read_pid(&self.paths) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
             if !await_death(pid, Duration::from_secs(2)) {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -266,12 +322,63 @@ impl Drop for SamplerProcess {
         if let Some(reaper) = self.initial_reaper.take() {
             let _ = reaper.join();
         }
-        daemon::clear_pid_file();
+        remove_pid_file(&self.paths);
     }
 }
 
-fn write_pid_file(contents: &str) {
-    std::fs::write(config::pid_file(), contents).expect("write pid file");
+fn write_pid_file(paths: &config::SessionPaths, contents: &str) {
+    std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+    std::fs::write(paths.pid_file(), contents).expect("write pid file");
+}
+
+fn remove_pid_file(paths: &config::SessionPaths) {
+    let _ = std::fs::remove_file(paths.pid_file());
+}
+
+fn hold_owner(paths: &config::SessionPaths) -> std::fs::File {
+    std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.owner_lock())
+        .expect("owner lock");
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "acquire owner lock"
+    );
+    file
+}
+
+fn session_paths(socket_path: &Path) -> config::SessionPaths {
+    config::SessionPaths::for_socket(&pulse::herdr::SocketTarget {
+        path: socket_path.to_path_buf(),
+        is_default: false,
+    })
+}
+
+fn owner_is_busy(paths: &config::SessionPaths) -> bool {
+    std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.owner_lock())
+        .expect("owner lock");
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        false
+    } else {
+        let code = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN),
+            "unexpected owner lock failure: {code:?}"
+        );
+        true
+    }
 }
 
 fn exists(path: &Path) -> bool {
@@ -336,7 +443,7 @@ struct Sleeper {
 }
 
 impl Sleeper {
-    fn spawn() -> Option<Self> {
+    fn spawn(paths: &config::SessionPaths) -> Option<Self> {
         let source = ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()
             .map(PathBuf::from)
@@ -347,6 +454,12 @@ impl Sleeper {
         let path = dir.join(our_comm());
         std::fs::copy(&source, &path).ok()?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        let owner = hold_owner(paths);
+        assert_ne!(
+            unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_SETFD, 0) },
+            -1,
+            "make owner lock inheritable"
+        );
 
         let output = Command::new("/bin/sh")
             .arg("-c")
@@ -408,10 +521,10 @@ fn await_death(pid: i32, timeout: Duration) -> bool {
 /// a direct child of whoever spawned it, and in production that parent exits
 /// immediately so init reaps the orphan. A test runner does not exit, so without
 /// this the dead child stays a zombie — and a zombie still answers
-/// `kill(pid, 0)`, which would make `clear_pid_file` treat it as a live
+/// `kill(pid, 0)`, which would make later lifecycle calls treat it as a live
 /// successor and refuse to remove the marker.
-fn reap_spawned() {
-    if let Some(pid) = daemon::read_pid() {
+fn reap_spawned(paths: &config::SessionPaths) {
+    if let Some(pid) = daemon::read_pid(paths) {
         if pid != std::process::id() as i32 {
             unsafe { libc::kill(pid, libc::SIGKILL) };
             await_death(pid, Duration::from_secs(2));
@@ -419,7 +532,7 @@ fn reap_spawned() {
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
     }
-    daemon::clear_pid_file();
+    remove_pid_file(paths);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,68 +540,186 @@ fn reap_spawned() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn default_state_is_adopted_in_place_and_named_state_is_collision_free() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("session-paths");
+    let legacy = config::SessionPaths::for_socket(&pulse::herdr::SocketTarget {
+        path: PathBuf::from("/default/herdr.sock"),
+        is_default: true,
+    });
+    assert_eq!(legacy.state_dir, dirs.state());
+    assert_eq!(legacy.history_file(), dirs.state().join("history.json"));
+    assert_eq!(legacy.supervisor_label(), supervise::LABEL);
+
+    let named = config::SessionPaths::for_socket(&pulse::herdr::SocketTarget {
+        path: PathBuf::from("/tmp/named.sock"),
+        is_default: false,
+    });
+    let key = "socket-2f746d702f6e616d65642e736f636b";
+    assert_eq!(named.scope_key.as_deref(), Some(key));
+    assert_eq!(named.state_dir, dirs.state().join("sessions").join(key));
+    assert_eq!(
+        named.supervisor_label(),
+        format!("{}.{}", supervise::LABEL, key)
+    );
+}
+
+#[test]
+fn remembered_default_socket_survives_later_xdg_changes() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("default-marker");
+    let env = EnvGuard::new(&["XDG_CONFIG_HOME", "PULSE_SOCKET_IS_DEFAULT"]);
+    env.remove("PULSE_SOCKET_IS_DEFAULT");
+    let original_config = dirs.root.join("original-config");
+    let default_socket = original_config.join("herdr/herdr.sock");
+    env.set("XDG_CONFIG_HOME", &original_config);
+    std::env::set_var("HERDR_SOCKET_PATH", &default_socket);
+
+    let (first, concurrent) = std::thread::scope(|scope| {
+        let other = scope.spawn(|| config::SessionPaths::resolve().map_err(|err| err.to_string()));
+        (
+            config::SessionPaths::resolve().expect("first default resolution"),
+            other
+                .join()
+                .expect("parallel resolver")
+                .expect("concurrent default resolution"),
+        )
+    });
+    assert_eq!(first.state_dir, dirs.state());
+    assert_eq!(concurrent.state_dir, dirs.state());
+    assert_eq!(
+        std::fs::read(dirs.state().join("default.socket")).unwrap(),
+        default_socket.as_os_str().as_bytes()
+    );
+
+    let different_config = dirs.root.join("different-config");
+    env.set("XDG_CONFIG_HOME", &different_config);
+    let second = config::SessionPaths::resolve().expect("remembered default resolution");
+    assert_eq!(second.state_dir, dirs.state());
+    assert!(second.scope_key.is_none());
+
+    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o500))
+        .expect("read-only state root");
+    let read_only =
+        config::SessionPaths::resolve().expect("an existing marker needs no writable lock");
+    assert_eq!(read_only.state_dir, dirs.state());
+    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o755))
+        .expect("restore state root");
+
+    let different_socket = different_config.join("herdr/herdr.sock");
+    std::env::set_var("HERDR_SOCKET_PATH", &different_socket);
+    let third = config::SessionPaths::resolve().expect("different socket resolution");
+    assert_ne!(third.state_dir, dirs.state());
+    assert!(third.scope_key.is_some());
+    assert_ne!(third.supervisor_label(), supervise::LABEL);
+}
+
+#[test]
+fn ambiguous_legacy_state_is_reported_instead_of_claimed() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("default-ambiguous");
+    let env = EnvGuard::new(&["XDG_CONFIG_HOME", "PULSE_SOCKET_IS_DEFAULT"]);
+    env.remove("PULSE_SOCKET_IS_DEFAULT");
+    env.set("XDG_CONFIG_HOME", dirs.root.join("different-config"));
+    std::env::set_var("HERDR_SOCKET_PATH", "/legacy/config/herdr/herdr.sock");
+    std::fs::write(dirs.state().join("history.json"), b"legacy").expect("legacy history");
+
+    let err = config::SessionPaths::resolve().expect_err("legacy state is ambiguous");
+    assert!(err
+        .to_string()
+        .contains("cannot assign existing unscoped state"));
+    assert!(dirs.state().join("history.json").exists());
+}
+
+#[test]
+fn internal_daemon_hint_cannot_claim_a_missing_default_marker() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("default-internal");
+    let env = EnvGuard::new(&["PULSE_SOCKET_IS_DEFAULT"]);
+    env.set("PULSE_SOCKET_IS_DEFAULT", "1");
+    std::env::set_var(
+        "HERDR_SOCKET_PATH",
+        dirs.root.join("claimed-default/herdr.sock"),
+    );
+
+    let err = config::SessionPaths::resolve_daemon()
+        .expect_err("only a public parent may initialize legacy ownership");
+    assert!(err.to_string().contains("internal daemon cannot claim"));
+    assert!(!dirs.state().join("default.socket").exists());
+}
+
+#[test]
 fn enabled_flag_round_trips() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("enabled");
+    let dirs = TempDirs::new("enabled");
+    let paths = dirs.paths();
 
     assert!(
-        !daemon::is_enabled(),
+        !daemon::is_enabled(&paths),
         "a fresh state dir means never enabled"
     );
 
-    daemon::mark_enabled(true);
-    assert!(daemon::is_enabled());
-    assert!(exists(&config::enabled_flag()));
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    assert!(daemon::is_enabled(&paths));
+    assert!(exists(&paths.enabled_flag()));
 
-    daemon::mark_enabled(false);
-    assert!(!daemon::is_enabled());
-    assert!(!exists(&config::enabled_flag()));
+    daemon::mark_enabled(&paths, false).expect("disable marker");
+    assert!(!daemon::is_enabled(&paths));
+    assert!(!exists(&paths.enabled_flag()));
 
     // Disabling twice is a no-op, not an error: the marker is already gone.
-    daemon::mark_enabled(false);
-    assert!(!daemon::is_enabled());
+    daemon::mark_enabled(&paths, false).expect("disable marker twice");
+    assert!(!daemon::is_enabled(&paths));
 
     // And enabling twice leaves exactly one marker.
-    daemon::mark_enabled(true);
-    daemon::mark_enabled(true);
-    assert!(daemon::is_enabled());
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    daemon::mark_enabled(&paths, true).expect("enable marker twice");
+    assert!(daemon::is_enabled(&paths));
 }
 
 // ---------------------------------------------------------------------------
 // Why the sampler stopped
 // ---------------------------------------------------------------------------
 
-fn write_stop_marker(contents: &str) {
-    std::fs::write(config::stop_marker(), contents).expect("write stop marker");
+fn write_stop_marker(paths: &config::SessionPaths, contents: &str) {
+    std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+    std::fs::write(paths.stop_marker(), contents).expect("write stop marker");
 }
 
 #[test]
 fn a_live_sampler_has_nothing_to_explain() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-live");
+    let dirs = TempDirs::new("stop-live");
+    let paths = dirs.paths();
+    let _owner = hold_owner(&paths);
     // Our own pid stands in for a live daemon.
-    daemon::write_pid(std::process::id());
+    write_pid_file(&paths, &std::process::id().to_string());
     // Even with a marker left over from an earlier run: a gap while a sampler is
     // running means herdr was unreachable, not that the sampler stopped.
-    write_stop_marker("disabled\n1700000000\n");
+    write_stop_marker(&paths, "disabled\n1700000000\n");
 
-    assert!(daemon::stop_report().is_none());
+    assert!(daemon::stop_report(&paths)
+        .expect("read stop report")
+        .is_none());
 
-    daemon::clear_pid_file();
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn a_recorded_stop_is_reported_with_its_reason_and_time() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-recorded");
+    let dirs = TempDirs::new("stop-recorded");
+    let paths = dirs.paths();
 
     for (written, expected) in [
         ("disabled", daemon::StopReason::Disabled),
         ("terminated", daemon::StopReason::Terminated),
         ("failed", daemon::StopReason::Failed),
     ] {
-        write_stop_marker(&format!("{written}\n1700000000\n"));
-        let stop = daemon::stop_report().expect("a stopped sampler");
+        write_stop_marker(&paths, &format!("{written}\n1700000000\n"));
+        let stop = daemon::stop_report(&paths)
+            .expect("read stop report")
+            .expect("a stopped sampler");
         assert_eq!(stop.reason, expected, "marker {written:?}");
         assert_eq!(stop.at, Some(1_700_000_000));
         assert_eq!(stop.detail, None);
@@ -498,10 +729,16 @@ fn a_recorded_stop_is_reported_with_its_reason_and_time() {
 #[test]
 fn a_failure_carries_its_one_line_of_detail() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-detail");
-    write_stop_marker("failed\n1700000000\ncannot reach herdr at /nowhere.sock\n");
+    let dirs = TempDirs::new("stop-detail");
+    let paths = dirs.paths();
+    write_stop_marker(
+        &paths,
+        "failed\n1700000000\ncannot reach herdr at /nowhere.sock\n",
+    );
 
-    let stop = daemon::stop_report().expect("a stopped sampler");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a stopped sampler");
     assert_eq!(stop.reason, daemon::StopReason::Failed);
     assert_eq!(
         stop.detail.as_deref(),
@@ -512,12 +749,15 @@ fn a_failure_carries_its_one_line_of_detail() {
 #[test]
 fn a_run_that_left_no_marker_reads_as_unknown_and_never_as_disabled() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-killed");
+    let dirs = TempDirs::new("stop-killed");
+    let paths = dirs.paths();
     // What a SIGKILL leaves: the user still wants a sampler, there is not one,
     // and nothing was written on the way out.
-    daemon::mark_enabled(true);
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
-    let stop = daemon::stop_report().expect("a sampler that is wanted and absent");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a sampler that is wanted and absent");
     assert_eq!(
         stop.reason,
         daemon::StopReason::Unknown,
@@ -529,14 +769,17 @@ fn a_run_that_left_no_marker_reads_as_unknown_and_never_as_disabled() {
 #[test]
 fn a_marker_nobody_can_read_is_unknown_rather_than_ignored() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-garbage");
-    daemon::mark_enabled(true);
+    let dirs = TempDirs::new("stop-garbage");
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
     // A reason from a newer pulse, or a hand-edited file. Either way it is a word
     // this build cannot interpret, and interpreting it anyway is how a guess gets
     // in.
-    write_stop_marker("evaporated\n1700000000\n");
-    let stop = daemon::stop_report().expect("a stopped sampler");
+    write_stop_marker(&paths, "evaporated\n1700000000\n");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a stopped sampler");
     assert_eq!(stop.reason, daemon::StopReason::Unknown);
     assert_eq!(
         stop.at,
@@ -547,8 +790,10 @@ fn a_marker_nobody_can_read_is_unknown_rather_than_ignored() {
 
     // A marker with no timestamp still names its reason; only the "when"
     // degrades.
-    write_stop_marker("terminated\n");
-    let stop = daemon::stop_report().expect("a stopped sampler");
+    write_stop_marker(&paths, "terminated\n");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a stopped sampler");
     assert_eq!(stop.reason, daemon::StopReason::Terminated);
     assert_eq!(stop.at, None);
 }
@@ -556,26 +801,35 @@ fn a_marker_nobody_can_read_is_unknown_rather_than_ignored() {
 #[test]
 fn a_sampler_that_was_never_enabled_here_has_nothing_to_report() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-fresh");
+    let dirs = TempDirs::new("stop-fresh");
+    let paths = dirs.paths();
 
     // A fresh state dir is not a stopped sampler. Reporting one would put a
     // reason under every empty pane on a machine that has never run `--enable`.
-    assert!(daemon::stop_report().is_none());
+    assert!(daemon::stop_report(&paths)
+        .expect("read stop report")
+        .is_none());
 }
 
 #[test]
 fn a_real_panic_string_keeps_its_message_in_the_marker() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-panic");
-    daemon::mark_enabled(true);
+    let dirs = TempDirs::new("stop-panic");
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
     // What `std` hands a panic hook, verbatim in shape: the location first, the
     // message on the *next* line. A fold that cut at the first newline would
     // keep the file and line and throw the sentence away — in the one place a
     // detached daemon can still say what happened.
-    daemon::record_failure("panicked at src/daemon.rs:412:9:\nthe ring length was zero");
+    daemon::record_failure(
+        &paths,
+        "panicked at src/daemon.rs:412:9:\nthe ring length was zero",
+    );
 
-    let stop = daemon::stop_report().expect("a stopped sampler");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a stopped sampler");
     assert_eq!(stop.reason, daemon::StopReason::Failed);
     let detail = stop.detail.expect("a failure carries its detail");
     assert!(
@@ -591,12 +845,15 @@ fn a_real_panic_string_keeps_its_message_in_the_marker() {
 #[test]
 fn an_enormous_detail_is_trimmed_rather_than_written_whole() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stop-huge");
-    daemon::mark_enabled(true);
+    let dirs = TempDirs::new("stop-huge");
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
-    daemon::record_failure(&"x".repeat(10_000));
+    daemon::record_failure(&paths, &"x".repeat(10_000));
 
-    let stop = daemon::stop_report().expect("a stopped sampler");
+    let stop = daemon::stop_report(&paths)
+        .expect("read stop report")
+        .expect("a stopped sampler");
     let detail = stop.detail.expect("detail");
     assert!(detail.len() <= 200, "{} chars", detail.len());
 }
@@ -609,44 +866,54 @@ fn the_markers_are_created_even_when_the_state_dir_does_not_exist_yet() {
     // `--enable` may get there first.
     let nested = dirs.state().join("deep").join("deeper");
     std::env::set_var("HERDR_PLUGIN_STATE_DIR", &nested);
+    let paths = dirs.paths();
 
-    daemon::mark_enabled(true);
-    daemon::write_pid(std::process::id());
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    write_pid_file(&paths, &std::process::id().to_string());
 
-    assert!(exists(&nested.join("enabled")));
-    assert_eq!(daemon::read_pid(), Some(std::process::id() as i32));
-    daemon::clear_pid_file();
+    assert!(exists(&paths.enabled_flag()));
+    assert_eq!(daemon::read_pid(&paths), Some(std::process::id() as i32));
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn no_pid_file_means_no_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("nopid");
+    let dirs = TempDirs::new("nopid");
+    let paths = dirs.paths();
 
-    assert_eq!(daemon::live_pid(), None);
-    assert_eq!(daemon::read_pid(), None);
+    assert_eq!(daemon::live_pid(&paths).expect("live pid"), None);
+    assert_eq!(daemon::read_pid(&paths), None);
     // Clearing a marker that is not there is not an error.
-    daemon::clear_pid_file();
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn a_stale_pid_file_is_not_a_live_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("stale");
+    let dirs = TempDirs::new("stale");
+    let paths = dirs.paths();
 
-    write_pid_file(&reaped_pid().to_string());
+    write_pid_file(&paths, &reaped_pid().to_string());
 
-    assert_eq!(daemon::live_pid(), None, "the recorded process is gone");
-    assert!(
-        !exists(&config::pid_file()),
-        "a stale marker is swept, so the next --enable can spawn"
+    assert_eq!(
+        daemon::live_pid(&paths).expect("live pid"),
+        None,
+        "the recorded process has no owner"
     );
+    assert!(
+        exists(&paths.pid_file()),
+        "status reads are non-mutating and cannot race ownership claims"
+    );
+    daemon::forget_history(&paths).expect("a lifecycle action sweeps stale pid state");
+    assert!(!exists(&paths.pid_file()));
 }
 
 #[test]
 fn a_malformed_pid_file_is_not_a_live_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("garbage");
+    let dirs = TempDirs::new("garbage");
+    let paths = dirs.paths();
 
     for contents in [
         "",
@@ -660,131 +927,154 @@ fn a_malformed_pid_file_is_not_a_live_daemon() {
         "1 2 3",
         "\u{0}",
     ] {
-        write_pid_file(contents);
-        assert_eq!(daemon::read_pid(), None, "pid file contents {contents:?}");
-        assert_eq!(daemon::live_pid(), None, "pid file contents {contents:?}");
-        assert!(
-            !exists(&config::pid_file()),
-            "an unreadable marker is swept too: {contents:?}"
+        write_pid_file(&paths, contents);
+        assert_eq!(
+            daemon::read_pid(&paths),
+            None,
+            "pid file contents {contents:?}"
         );
+        assert_eq!(
+            daemon::live_pid(&paths).expect("live pid"),
+            None,
+            "pid file contents {contents:?}"
+        );
+        assert!(
+            exists(&paths.pid_file()),
+            "status reads leave diagnostic files untouched: {contents:?}"
+        );
+        daemon::forget_history(&paths).expect("lifecycle cleanup");
+        assert!(!exists(&paths.pid_file()));
     }
 
     // Surrounding whitespace is fine — the file is written with `to_string`, but
     // a user may have echoed into it.
-    write_pid_file(&format!("  {}  \n", std::process::id()));
-    assert_eq!(daemon::read_pid(), Some(std::process::id() as i32));
-    daemon::clear_pid_file();
+    write_pid_file(&paths, &format!("  {}  \n", std::process::id()));
+    assert_eq!(daemon::read_pid(&paths), Some(std::process::id() as i32));
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn our_own_live_pid_counts_as_a_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("live");
+    let dirs = TempDirs::new("live");
+    let paths = dirs.paths();
 
     let pid = std::process::id();
-    daemon::write_pid(pid);
+    let owner = hold_owner(&paths);
+    write_pid_file(&paths, &pid.to_string());
 
-    assert_eq!(daemon::live_pid(), Some(pid as i32));
-    assert_eq!(daemon::read_pid(), Some(pid as i32));
+    assert_eq!(
+        daemon::live_pid(&paths).expect("live pid"),
+        Some(pid as i32)
+    );
+    assert_eq!(daemon::read_pid(&paths), Some(pid as i32));
 
-    daemon::clear_pid_file();
-    assert_eq!(daemon::live_pid(), None);
+    drop(owner);
+    remove_pid_file(&paths);
+    assert_eq!(daemon::live_pid(&paths).expect("live pid"), None);
 }
 
 #[test]
 fn writing_the_pid_replaces_whatever_was_recorded_before() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("overwrite");
+    let dirs = TempDirs::new("overwrite");
+    let paths = dirs.paths();
 
-    daemon::write_pid(999_999);
-    daemon::write_pid(std::process::id());
+    write_pid_file(&paths, "999999");
+    write_pid_file(&paths, &std::process::id().to_string());
 
-    assert_eq!(daemon::read_pid(), Some(std::process::id() as i32));
-    daemon::clear_pid_file();
+    assert_eq!(daemon::read_pid(&paths), Some(std::process::id() as i32));
+    remove_pid_file(&paths);
 }
 
-/// The state dir outlives reboots, so a recorded pid can be alive and belong to
-/// something else entirely. pid 1 is always alive and is never us.
+/// The state dir outlives reboots, so a recorded pid without ownership is
+/// stale even if the same process number is alive. pid 1 is always alive.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_reused_pid_belonging_to_another_program_is_not_a_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("reuse");
+    let dirs = TempDirs::new("reuse");
+    let paths = dirs.paths();
 
-    write_pid_file("1");
+    write_pid_file(&paths, "1");
 
     assert_eq!(
-        daemon::live_pid(),
+        daemon::live_pid(&paths).expect("live pid"),
         None,
-        "/proc/1/comm is not our binary, so this pid was reused"
+        "no sampler owns this session, so this pid is stale"
     );
     assert!(
-        !exists(&config::pid_file()),
-        "and the reused marker is swept so --enable can spawn"
+        exists(&paths.pid_file()),
+        "status reads do not mutate lifecycle state"
     );
+    daemon::forget_history(&paths).expect("lifecycle cleanup");
+    assert!(!exists(&paths.pid_file()));
 }
 
 #[test]
 fn a_live_daemon_that_is_not_this_process_still_counts() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("successor");
-    let Some(sleeper) = Sleeper::spawn() else {
+    let dirs = TempDirs::new("successor");
+    let paths = dirs.paths();
+    let Some(sleeper) = Sleeper::spawn(&paths) else {
         eprintln!("skipping: no usable `sleep` binary to stand in for a daemon");
         return;
     };
 
-    write_pid_file(&sleeper.pid.to_string());
+    write_pid_file(&paths, &sleeper.pid.to_string());
 
-    assert_eq!(daemon::live_pid(), Some(sleeper.pid));
+    assert_eq!(
+        daemon::live_pid(&paths).expect("live pid"),
+        Some(sleeper.pid)
+    );
     // The real daemon is never the process asking, so a guard that only accepted
     // our own pid would report every running daemon as dead.
-    assert!(exists(&config::pid_file()));
+    assert!(exists(&paths.pid_file()));
 }
 
 #[test]
 fn a_successors_marker_is_never_deleted_by_someone_elses_cleanup() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("nosweep");
-    let Some(sleeper) = Sleeper::spawn() else {
+    let dirs = TempDirs::new("nosweep");
+    let paths = dirs.paths();
+    let Some(sleeper) = Sleeper::spawn(&paths) else {
         eprintln!("skipping: no usable `sleep` binary to stand in for a daemon");
         return;
     };
 
-    write_pid_file(&sleeper.pid.to_string());
-    daemon::clear_pid_file();
+    write_pid_file(&paths, &sleeper.pid.to_string());
+    daemon::live_pid(&paths).expect("check live marker");
 
     assert!(
-        exists(&config::pid_file()),
+        exists(&paths.pid_file()),
         "a live daemon of ours owns this marker; deleting it would let a second one start"
     );
-    assert_eq!(daemon::read_pid(), Some(sleeper.pid));
+    assert_eq!(daemon::read_pid(&paths), Some(sleeper.pid));
 }
 
 #[test]
-fn an_unwritable_state_dir_is_reported_and_never_fatal() {
+fn an_unwritable_state_dir_is_reported_without_panicking() {
     let _guard = env_lock();
     let dirs = TempDirs::new("readonly");
+    let paths = dirs.paths();
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipping: root ignores directory permissions");
         return;
     }
     std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o500)).expect("chmod");
 
-    // Neither call may panic or abort the user's action; both warn on stderr.
-    daemon::write_pid(std::process::id());
-    daemon::mark_enabled(true);
+    // Marker writes remain non-panicking. Status reads do not create/open lock
+    // files, so an unwritable empty state reports no published sampler.
+    let _ = std::fs::write(paths.pid_file(), std::process::id().to_string());
+    let _ = daemon::mark_enabled(&paths, true);
 
-    assert!(!exists(&config::pid_file()));
-    assert!(!daemon::is_enabled());
-    assert_eq!(daemon::read_pid(), None);
-    assert_eq!(
-        daemon::live_pid(),
-        None,
-        "no marker means no daemon, not a crash"
-    );
+    assert!(!exists(&paths.pid_file()));
+    assert!(!daemon::is_enabled(&paths));
+    assert_eq!(daemon::read_pid(&paths), None);
+    assert_eq!(daemon::live_pid(&paths).expect("status read"), None);
     // And clearing markers that were never written is still quiet.
-    daemon::clear_pid_file();
-    daemon::mark_enabled(false);
+    remove_pid_file(&paths);
+    daemon::mark_enabled(&paths, false).expect("clear missing marker");
 
     std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o755))
         .expect("restore");
@@ -797,54 +1087,75 @@ fn an_unwritable_state_dir_is_reported_and_never_fatal() {
 #[test]
 fn restore_is_a_no_op_when_never_enabled() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("restore-off");
+    let dirs = TempDirs::new("restore-off");
+    let paths = dirs.paths();
 
-    daemon::restore().expect("restore must stay silent, not fail");
+    daemon::restore(&paths).expect("restore must stay silent, not fail");
 
     assert!(
-        !exists(&config::pid_file()),
+        !exists(&paths.pid_file()),
         "restore must not spawn a daemon the user never asked for"
     );
-    assert!(!daemon::is_enabled());
+    assert!(!daemon::is_enabled(&paths));
 }
 
 #[test]
 fn restore_is_a_no_op_when_a_daemon_is_already_live() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("restore-live");
+    let dirs = TempDirs::new("restore-live");
+    let paths = dirs.paths();
 
-    daemon::mark_enabled(true);
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    let _owner = hold_owner(&paths);
     // Our own pid stands in for a live daemon, so restore has nothing to do.
-    daemon::write_pid(std::process::id());
+    write_pid_file(&paths, &std::process::id().to_string());
 
-    daemon::restore().expect("restore");
+    daemon::restore(&paths).expect("restore");
 
     assert_eq!(
-        daemon::read_pid(),
+        daemon::read_pid(&paths),
         Some(std::process::id() as i32),
         "a second daemon would double every badge push"
     );
-    daemon::clear_pid_file();
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn restore_spawns_a_detached_daemon_when_it_was_enabled_and_nothing_is_live() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("restore-on");
-    daemon::mark_enabled(true);
-    assert!(!exists(&config::pid_file()));
+    let dirs = TempDirs::new("restore-on");
+    let server = SamplerServer::start(&dirs.root);
+    std::env::set_var("HERDR_SOCKET_PATH", &server.path);
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    assert!(!exists(&paths.pid_file()));
 
-    daemon::restore().expect("restore");
+    let output = server
+        .command(&dirs)
+        .arg("--restore")
+        .output()
+        .expect("restore");
+    assert!(
+        output.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // The detached child is this test binary re-execed with `--daemon`, which it
     // rejects and exits on — enough to prove the spawn happened and the pid was
     // recorded, without a sampler ever touching a socket.
-    let pid = daemon::read_pid().expect("restore records the pid it spawned");
+    let pid = await_file(&paths.pid_file(), Duration::from_secs(5), |contents| {
+        contents.trim().parse::<i32>().is_ok()
+    })
+    .expect("restore records the pid it spawned")
+    .trim()
+    .parse::<i32>()
+    .expect("pid");
     assert_ne!(pid, std::process::id() as i32);
-    reap_spawned();
-    assert!(!exists(&config::pid_file()));
+    reap_spawned(&paths);
+    assert!(!exists(&paths.pid_file()));
     assert!(
-        daemon::is_enabled(),
+        daemon::is_enabled(&paths),
         "restore must not disturb the enabled marker"
     );
 }
@@ -867,10 +1178,10 @@ struct InstalledUnit {
 }
 
 impl InstalledUnit {
-    fn new(root: &Path) -> Self {
+    fn new(root: &Path, paths: &config::SessionPaths) -> Self {
         let previous_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", root.join("home"));
-        let path = supervise::unit_path().expect("a supervised platform with a home");
+        let path = supervise::unit_path(paths).expect("a supervised platform with a home");
         std::fs::create_dir_all(path.parent().expect("unit dir")).expect("unit dir");
         std::fs::write(&path, "written by a test, never loaded").expect("unit");
         Self {
@@ -897,17 +1208,18 @@ fn restore_leaves_a_supervised_sampler_to_its_supervisor() {
     // history file, each rewriting what the other just wrote.
     let _guard = env_lock();
     let dirs = TempDirs::new("restore-supervised");
-    let _unit = InstalledUnit::new(&dirs.root);
-    daemon::mark_enabled(true);
+    let paths = dirs.paths();
+    let _unit = InstalledUnit::new(&dirs.root, &paths);
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
-    daemon::restore().expect("restore");
+    daemon::restore(&paths).expect("restore");
 
     assert!(
-        !exists(&config::pid_file()),
+        !exists(&paths.pid_file()),
         "the hook spawned nothing, because the supervisor owns the process"
     );
     assert!(
-        daemon::is_enabled(),
+        daemon::is_enabled(&paths),
         "and the user's choice is untouched: the supervisor is what starts it"
     );
 }
@@ -915,27 +1227,30 @@ fn restore_leaves_a_supervised_sampler_to_its_supervisor() {
 #[test]
 fn enable_does_not_spawn_a_second_daemon_when_one_is_already_live() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("enable-live");
-    daemon::write_pid(std::process::id());
+    let dirs = TempDirs::new("enable-live");
+    let paths = dirs.paths();
+    let _owner = hold_owner(&paths);
+    write_pid_file(&paths, &std::process::id().to_string());
 
-    daemon::enable(&owned(&["--enable"])).expect("enable");
+    daemon::enable(&paths, &owned(&["--enable"])).expect("enable");
 
     assert!(
-        daemon::is_enabled(),
+        daemon::is_enabled(&paths),
         "the marker is set first, so a handoff mid-enable still restores"
     );
     assert_eq!(
-        daemon::read_pid(),
+        daemon::read_pid(&paths),
         Some(std::process::id() as i32),
         "the existing daemon's marker is left exactly as it was"
     );
-    daemon::clear_pid_file();
+    remove_pid_file(&paths);
 }
 
 #[test]
 fn enable_rejects_a_bad_value_before_changing_any_state() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("enable-bad");
+    let dirs = TempDirs::new("enable-bad");
+    let paths = dirs.paths();
 
     for args in [
         owned(&["--enable", "--interval", "soon"]),
@@ -943,34 +1258,168 @@ fn enable_rejects_a_bad_value_before_changing_any_state() {
         owned(&["--enable", "--bucket-seconds"]),
         owned(&["--enable", "--retention-buckets", "-4"]),
     ] {
-        let err = daemon::enable(&args).expect_err("a typo'd value must be fatal: {args:?}");
+        let err =
+            daemon::enable(&paths, &args).expect_err("a typo'd value must be fatal: {args:?}");
 
         assert!(
             !err.to_string().is_empty(),
             "the message must name the flag: {err}"
         );
         assert!(
-            !daemon::is_enabled(),
+            !daemon::is_enabled(&paths),
             "nothing is marked until the arguments parse: {args:?}"
         );
         assert!(
-            !exists(&config::pid_file()),
+            !exists(&paths.pid_file()),
             "and nothing is spawned either: {args:?}"
         );
     }
 }
 
 #[test]
+fn concurrent_enables_publish_one_same_session_owner() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("enable-concurrent");
+    std::fs::write(
+        dirs.config().join("config.json"),
+        r#"{"interval_seconds":1,"bucket_seconds":10}"#,
+    )
+    .expect("sampler config");
+    let server = SamplerServer::start(&dirs.root);
+    let paths = session_paths(&server.path);
+
+    let mut first_command = server.command(&dirs);
+    first_command
+        .arg("--enable")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut second_command = server.command(&dirs);
+    second_command
+        .arg("--enable")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let first = first_command.spawn().expect("first enable");
+    let second = second_command.spawn().expect("second enable");
+    let first = first.wait_with_output().expect("first result");
+    let second = second.wait_with_output().expect("second result");
+    let _sampler = SamplerProcess::detached(paths.clone());
+
+    assert!(
+        first.status.success(),
+        "first enable: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second enable: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(owner_is_busy(&paths), "one daemon retains OWNER");
+    assert!(
+        daemon::read_pid(&paths).is_some(),
+        "the owner published one pid"
+    );
+    await_file(&paths.history_file(), Duration::from_secs(5), |contents| {
+        contents.contains("label-old")
+    })
+    .expect("the sole owner sampled");
+}
+
+#[test]
+fn named_sessions_run_and_stop_independently() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("named-independent");
+    std::fs::write(
+        dirs.config().join("config.json"),
+        r#"{"interval_seconds":1,"bucket_seconds":10}"#,
+    )
+    .expect("sampler config");
+    let first_server = SamplerServer::start_named(&dirs.root, "first.sock");
+    let second_server = SamplerServer::start_named(&dirs.root, "second.sock");
+    first_server.set_workspace("first");
+    second_server.set_workspace("second");
+    let first_paths = session_paths(&first_server.path);
+    let second_paths = session_paths(&second_server.path);
+
+    let first = first_server
+        .command(&dirs)
+        .arg("--enable")
+        .output()
+        .expect("enable first");
+    let second = second_server
+        .command(&dirs)
+        .arg("--enable")
+        .output()
+        .expect("enable second");
+    let _first_sampler = SamplerProcess::detached(first_paths.clone());
+    let _second_sampler = SamplerProcess::detached(second_paths.clone());
+    assert!(
+        first.status.success(),
+        "first session: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second session: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_ne!(first_paths.state_dir, second_paths.state_dir);
+    assert_ne!(
+        daemon::read_pid(&first_paths),
+        daemon::read_pid(&second_paths)
+    );
+    assert!(owner_is_busy(&first_paths));
+    assert!(owner_is_busy(&second_paths));
+    await_file(
+        &first_paths.history_file(),
+        Duration::from_secs(5),
+        |contents| contents.contains("label-first"),
+    )
+    .expect("first history");
+    await_file(
+        &second_paths.history_file(),
+        Duration::from_secs(5),
+        |contents| contents.contains("label-second"),
+    )
+    .expect("second history");
+    let second_pid = daemon::read_pid(&second_paths);
+
+    let disabled = first_server
+        .command(&dirs)
+        .env("PULSE_SOCKET_IS_DEFAULT", "1")
+        .arg("--disable")
+        .output()
+        .expect("disable first");
+    assert!(
+        disabled.status.success(),
+        "disable first: {}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert!(!owner_is_busy(&first_paths));
+    assert!(!daemon::is_enabled(&first_paths));
+    assert!(owner_is_busy(&second_paths));
+    assert!(daemon::is_enabled(&second_paths));
+    assert_eq!(daemon::read_pid(&second_paths), second_pid);
+    let second_history =
+        std::fs::read_to_string(second_paths.history_file()).expect("second history remains");
+    assert!(second_history.contains("label-second"));
+    assert!(!second_history.contains("label-first"));
+}
+
+#[test]
 fn forgetting_while_stopped_does_not_start_or_enable_the_sampler() {
     let _guard = env_lock();
     let dirs = TempDirs::new("forget-stopped");
-    std::fs::write(dirs.state().join("history.json"), b"recorded").expect("history");
+    let paths = dirs.paths();
+    std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+    std::fs::write(paths.history_file(), b"recorded").expect("history");
 
-    daemon::forget_history().expect("forget stopped history");
+    daemon::forget_history(&paths).expect("forget stopped history");
 
-    assert!(!dirs.state().join("history.json").exists());
-    assert!(!daemon::is_enabled());
-    assert!(!config::pid_file().exists());
+    assert!(!paths.history_file().exists());
+    assert!(!daemon::is_enabled(&paths));
+    assert!(!paths.pid_file().exists());
 }
 
 #[test]
@@ -983,7 +1432,9 @@ fn forgetting_while_sampling_cannot_resurrect_the_loaded_history() {
     )
     .expect("sampler config");
     let server = SamplerServer::start(&dirs.root);
-    daemon::mark_enabled(true);
+    std::env::set_var("HERDR_SOCKET_PATH", &server.path);
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
 
     let child = server
         .command(&dirs)
@@ -993,13 +1444,13 @@ fn forgetting_while_sampling_cannot_resurrect_the_loaded_history() {
         .stderr(Stdio::null())
         .spawn()
         .expect("start real sampler");
-    let _sampler = SamplerProcess::new(child);
-    let history_file = dirs.state().join("history.json");
+    let _sampler = SamplerProcess::new(child, paths.clone());
+    let history_file = paths.history_file();
     await_file(&history_file, Duration::from_secs(5), |contents| {
         contents.contains("label-old") && contents.contains("/work/old")
     })
     .expect("the first daemon persisted its in-memory history");
-    let original_pid = daemon::read_pid().expect("the first daemon recorded its pid");
+    let original_pid = daemon::read_pid(&paths).expect("the first daemon recorded its pid");
 
     server.set_workspace("new");
     let output = server
@@ -1026,9 +1477,12 @@ fn forgetting_while_sampling_cannot_resurrect_the_loaded_history() {
         !after.contains("label-old") && !after.contains("/work/old"),
         "the pre-forget in-memory store must not return: {after}"
     );
-    assert!(daemon::is_enabled(), "the user's enabled choice survives");
+    assert!(
+        daemon::is_enabled(&paths),
+        "the user's enabled choice survives"
+    );
     assert_ne!(
-        daemon::read_pid(),
+        daemon::read_pid(&paths),
         Some(original_pid),
         "the process holding the old in-memory store was replaced"
     );
@@ -1037,35 +1491,37 @@ fn forgetting_while_sampling_cannot_resurrect_the_loaded_history() {
 #[test]
 fn disable_clears_the_marker_and_sweeps_a_stale_pid_file() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("disable-stale");
-    daemon::mark_enabled(true);
-    write_pid_file(&reaped_pid().to_string());
+    let dirs = TempDirs::new("disable-stale");
+    let paths = dirs.paths();
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    write_pid_file(&paths, &reaped_pid().to_string());
 
     // The sweep needs a server; there is deliberately none, so disable reports
     // the connection failure. Everything before that must already have happened.
-    let err = daemon::disable().expect_err("no herdr to sweep against");
+    let err = daemon::disable(&paths).expect_err("no herdr to sweep against");
 
     assert!(err.to_string().contains("cannot reach herdr"), "{err}");
     assert!(
-        !daemon::is_enabled(),
+        !daemon::is_enabled(&paths),
         "the marker is cleared first, so nothing mid-teardown concludes a daemon is still wanted"
     );
-    assert!(!exists(&config::pid_file()));
+    assert!(!exists(&paths.pid_file()));
 }
 
 #[test]
 fn disable_stops_a_live_daemon_and_waits_for_it_to_go() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("disable-live");
-    let Some(sleeper) = Sleeper::spawn() else {
+    let dirs = TempDirs::new("disable-live");
+    let paths = dirs.paths();
+    let Some(sleeper) = Sleeper::spawn(&paths) else {
         eprintln!("skipping: no usable `sleep` binary to stand in for a daemon");
         return;
     };
-    daemon::mark_enabled(true);
-    write_pid_file(&sleeper.pid.to_string());
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    write_pid_file(&paths, &sleeper.pid.to_string());
 
     let started = Instant::now();
-    let _ = daemon::disable();
+    let _ = daemon::disable(&paths);
 
     assert!(
         !is_alive(sleeper.pid),
@@ -1075,9 +1531,9 @@ fn disable_stops_a_live_daemon_and_waits_for_it_to_go() {
         started.elapsed() < Duration::from_secs(3),
         "a daemon that exits promptly must not cost the whole stop timeout"
     );
-    assert!(!daemon::is_enabled());
+    assert!(!daemon::is_enabled(&paths));
     assert!(
-        !exists(&config::pid_file()),
+        !exists(&paths.pid_file()),
         "the marker goes once the daemon is gone, so --enable can spawn again"
     );
 }
@@ -1085,33 +1541,46 @@ fn disable_stops_a_live_daemon_and_waits_for_it_to_go() {
 #[test]
 fn toggle_stops_a_live_daemon() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("toggle-off");
-    let Some(sleeper) = Sleeper::spawn() else {
+    let dirs = TempDirs::new("toggle-off");
+    let paths = dirs.paths();
+    let Some(sleeper) = Sleeper::spawn(&paths) else {
         eprintln!("skipping: no usable `sleep` binary to stand in for a daemon");
         return;
     };
-    daemon::mark_enabled(true);
-    write_pid_file(&sleeper.pid.to_string());
+    daemon::mark_enabled(&paths, true).expect("enable marker");
+    write_pid_file(&paths, &sleeper.pid.to_string());
 
-    let _ = daemon::toggle(&owned(&["--toggle"]));
+    let _ = daemon::toggle(&paths, &owned(&["--toggle"]));
 
     assert!(!is_alive(sleeper.pid));
-    assert!(!daemon::is_enabled());
+    assert!(!daemon::is_enabled(&paths));
 }
 
 #[test]
 fn toggle_starts_a_daemon_when_none_is_live() {
     let _guard = env_lock();
-    let _dirs = TempDirs::new("toggle-on");
+    let dirs = TempDirs::new("toggle-on");
+    let server = SamplerServer::start(&dirs.root);
+    std::env::set_var("HERDR_SOCKET_PATH", &server.path);
+    let paths = dirs.paths();
 
-    daemon::toggle(&owned(&["--toggle"])).expect("toggle");
-
-    assert!(daemon::is_enabled());
+    let output = server
+        .command(&dirs)
+        .arg("--toggle")
+        .output()
+        .expect("toggle");
     assert!(
-        daemon::read_pid().is_some(),
+        output.status.success(),
+        "toggle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(daemon::is_enabled(&paths));
+    assert!(
+        daemon::read_pid(&paths).is_some(),
         "toggle with nothing running is an enable"
     );
-    reap_spawned();
+    reap_spawned(&paths);
 }
 
 #[test]

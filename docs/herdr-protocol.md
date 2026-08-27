@@ -9,8 +9,9 @@ back out of the server rather than by trusting an `ok`, it says so.
 
 `HERDR_SOCKET_PATH` is injected into every command herdr spawns. Fall back to
 `$XDG_CONFIG_HOME/herdr/herdr.sock` only for hand invocation. Treat an
-empty-string environment variable as unset — herdr injects empty strings for
-absent context rather than omitting the variable.
+empty-string environment variable as unset. Resolve a relative injected socket
+against the invoking process's cwd before spawning or supervising anything.
+The resolved pathname is retained for the whole operation.
 
 Framing is **newline-delimited JSON**. Not length-prefixed. There is no
 `jsonrpc` field.
@@ -94,6 +95,11 @@ What that proves, and what it does not, is in **Still unverified** below. The
 error it can make is to report two sessions where there was one, which splits a
 history; the error it cannot make is to report one where there were two, which
 would join two incomparable series.
+
+This inode-derived mark is historical provenance only. Sampler ownership is
+scoped by the resolved absolute socket pathname, so unlinking and rebinding the
+same path may split historical series but cannot change its state directory,
+locks or supervisor identity.
 
 ### Two corrections to the notes this plugin inherited
 
@@ -277,10 +283,29 @@ Commands are argv arrays run with **no shell**, cwd = plugin root, and a minimal
 run `[[build]]`; `herdr plugin install` does. Logs are in-server only
 (`herdr plugin log list`), with no log file on disk.
 
-State lives in `HERDR_PLUGIN_STATE_DIR`. Both the pid marker and the enabled
-marker are needed — one answers "is a daemon live right now", the other answers
-"did the user ever ask for one" — and both writes are best-effort, since an
-unwritable state dir must not fail the user's action.
+`HERDR_PLUGIN_STATE_DIR` is a global plugin state root. The fallback socket uses
+that root directly for compatibility, including the existing `history.json`.
+Every named socket uses `sessions/socket-<full lowercase hex of the resolved
+absolute pathname's raw Unix bytes>`. All markers, history, temporary history,
+control/owner locks, status, badge cleanup and forgetting stay inside that
+namespace. The full reversible encoding is never replaced by an inode,
+`SessionMark`, hash or truncation.
+
+The root-level `default.socket` file remembers the default pathname's raw bytes.
+Initialization is serialized by `default.socket.lock` and committed through a
+synced temporary file plus atomic rename, so concurrent first starts cannot
+assign one socket to both the legacy root and a named directory. The remembered
+pathname, not a later caller's `HOME` or `XDG_CONFIG_HOME`, remains authoritative.
+Existing unscoped artifacts with no reconcilable default marker are an error,
+never assigned to whichever socket happened to invoke pulse next.
+
+One blocking control flock serializes lifecycle changes. One exclusive owner
+flock is retained by the sampler for its entire lifetime and is authoritative;
+the atomically published PID is diagnostic and a signal target only. A detached
+parent transfers its locked owner descriptor to the child and waits boundedly
+for child-owned PID publication. Losing concurrent starts cannot publish a PID
+or write history, and a crash releases ownership through normal descriptor
+close.
 
 ## What the protocol does not expose: the width a badge has
 

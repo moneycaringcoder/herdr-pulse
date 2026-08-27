@@ -24,7 +24,9 @@ use std::io::Write;
 
 use serde_json::{json, Value};
 
-use crate::config::{Config, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS};
+use crate::config::{
+    Config, SessionPaths, WEEK_BUCKETS_PER_COLUMN, WEEK_BUCKET_SECONDS, WEEK_COLUMNS,
+};
 use crate::model::{AgentActivity, AgentState, Level, SessionMark, WorkspaceActivity};
 use crate::Result;
 use crate::{daemon, herdr, history};
@@ -598,45 +600,38 @@ pub fn week_pane(
     render_pane(&activity, config, as_of, session, PaneView::week(config))
 }
 
-/// The live herdr identity, when both locating and fingerprinting its socket
-/// succeed. Reporting commands still render saved history when there is no
-/// socket, so a path lookup failure is provenance we do not know, not a command
-/// failure.
-fn live_session() -> Option<SessionMark> {
-    herdr::socket_path()
-        .ok()
-        .and_then(|socket| herdr::session_mark(&socket))
+/// The current inode provenance behind this invocation's fixed socket path.
+fn live_session(paths: &SessionPaths) -> Option<SessionMark> {
+    herdr::session_mark(&paths.socket_path)
 }
 
 /// `--once`: print the pane once and exit.
-pub fn run_once(config: &Config) -> Result<()> {
+pub fn run_once(paths: &SessionPaths, config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
-    let session = live_session();
+    let session = live_session(paths);
     let window = fine_window(config);
-    let activity =
-        history::load(config).activity(as_of, window.columns, window.buckets_per_column, config);
+    let activity = history::load(paths, config).activity(
+        as_of,
+        window.columns,
+        window.buckets_per_column,
+        config,
+    );
     print!("{}", pane(&activity, config, as_of, session.as_ref()));
     report_window(&window, config.bucket_seconds, config.retention_buckets);
 
-    // A stopped sampler can leave either an empty report or a convincing stretch
-    // of saved history. Say what stopped in both cases. On stderr, so
-    // `pulse --once > report.txt` still captures only the report.
-    if let Some(message) = sampler_stop_message(current_sampler_stop().as_ref(), as_of) {
+    if let Some(message) = sampler_stop_message(current_sampler_stop(paths)?.as_ref(), as_of) {
         eprintln!("pulse: {message}");
     }
     Ok(())
 }
 
 /// `--week`: print the week pane once and exit.
-pub fn run_week(config: &Config) -> Result<()> {
+pub fn run_week(paths: &SessionPaths, config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
-    let session = live_session();
-    // Each ring answers `--since` in its own units: the fine geometry still
-    // drives the store's fine projection, and the week's window is computed
-    // against the week ring's hours.
+    let session = live_session(paths);
     let fine = fine_window(config);
     let week = week_window(config);
-    let activity = history::load(config).activity_with(
+    let activity = history::load(paths, config).activity_with(
         as_of,
         (fine.columns, fine.buckets_per_column),
         (week.columns, week.buckets_per_column),
@@ -649,7 +644,7 @@ pub fn run_week(config: &Config) -> Result<()> {
         crate::config::WEEK_RETENTION_BUCKETS,
     );
 
-    if let Some(message) = sampler_stop_message(current_sampler_stop().as_ref(), as_of) {
+    if let Some(message) = sampler_stop_message(current_sampler_stop(paths)?.as_ref(), as_of) {
         eprintln!("pulse: {message}");
     }
     Ok(())
@@ -724,16 +719,14 @@ fn report_window(window: &PaneWindow, bucket_seconds: u64, retention_buckets: us
 /// A series of `null` buckets only says nobody was watching. The top-level
 /// `sampler` field is the only field that says whether that was on purpose or
 /// because the last run ended.
-pub fn run_json(config: &Config) -> Result<()> {
+pub fn run_json(paths: &SessionPaths, config: &Config) -> Result<()> {
     let as_of = crate::now_unix();
-    let session = live_session();
-    let stop = current_sampler_stop();
+    let session = live_session(paths);
+    let stop = current_sampler_stop(paths)?;
     let window = fine_window(config);
     let (columns, buckets_per_column) = (window.columns, window.buckets_per_column);
-    let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
-    // On stderr, so `pulse --json | jq` still reads one clean document. The
-    // document's own `columns` and `seconds_per_column` describe what was drawn
-    // truthfully either way; this says what was asked for and could not be.
+    let activity =
+        history::load(paths, config).activity(as_of, columns, buckets_per_column, config);
     report_window(&window, config.bucket_seconds, config.retention_buckets);
     let document = json_document(
         config,
@@ -743,7 +736,7 @@ pub fn run_json(config: &Config) -> Result<()> {
         &activity,
         session.as_ref(),
         SamplerState {
-            running: sampler_is_running(),
+            running: sampler_is_running(paths)?,
             stop: stop.as_ref(),
         },
     );
@@ -912,42 +905,31 @@ pub fn json_document(
 }
 
 /// `--watch`: the pane, redrawn on an interval, reading the history the daemon
-/// writes. Must degrade with a clear message when no sampler is running, rather
-/// than showing an empty pane that looks like a quiet session.
-pub fn run_watch(config: &Config) -> Result<()> {
-    if !sampler_is_running() {
-        return Err(no_sampler_error(current_sampler_stop().as_ref(), crate::now_unix()).into());
+/// writes. Must degrade with a clear message when no sampler is running.
+pub fn run_watch(paths: &SessionPaths, config: &Config) -> Result<()> {
+    if !sampler_is_running(paths)? {
+        return Err(
+            no_sampler_error(current_sampler_stop(paths)?.as_ref(), crate::now_unix()).into(),
+        );
     }
 
     let window = fine_window(config);
     let (columns, buckets_per_column) = (window.columns, window.buckets_per_column);
-    // Inside every frame, not once before the loop: the first frame clears the
-    // screen, so a note printed ahead of it is erased before anyone reads it.
-    // Repeating it costs nothing, because each frame repaints from the top
-    // rather than scrolling.
     let notes = window_notes(&window, config.bucket_seconds, config.retention_buckets);
     let mut out = std::io::stdout();
     loop {
-        // Re-checked every cycle, not just at startup. A sampler that dies under
-        // a running watch would otherwise leave the last frame on screen for
-        // hours, ageing into a confident lie.
-        //
-        // Liveness is the gate rather than the stop report, because a machine
-        // that never started a sampler has nothing to report and still has
-        // nothing to watch.
-        if !sampler_is_running() {
+        if !sampler_is_running(paths)? {
             write!(out, "{CLEAR}")?;
             out.flush()?;
             return Err(
-                no_sampler_error(current_sampler_stop().as_ref(), crate::now_unix()).into(),
+                no_sampler_error(current_sampler_stop(paths)?.as_ref(), crate::now_unix()).into(),
             );
         }
 
         let as_of = crate::now_unix();
-        // The bound socket can be replaced while a watch is open, so provenance
-        // is sampled with each frame rather than frozen at startup.
-        let session = live_session();
-        let activity = history::load(config).activity(as_of, columns, buckets_per_column, config);
+        let session = live_session(paths);
+        let activity =
+            history::load(paths, config).activity(as_of, columns, buckets_per_column, config);
         write!(
             out,
             "{CLEAR}{}",
@@ -979,28 +961,14 @@ fn no_sampler_error(stop: Option<&daemon::SamplerStop>, as_of: u64) -> String {
     )
 }
 
-/// The recorded reason the sampler is not running, or `None` when there is
-/// nothing to explain.
-///
-/// A thin pass-through, and deliberately nothing more. [`daemon::stop_report`]
-/// already answers all three cases — a live daemon, a recorded stop, and a run
-/// that died without a word — and its third answer is `None` for a machine where
-/// no sampler was ever started. Inventing an "unknown stop" here would put "the
-/// last run stopped for an unknown reason" under the pane on a fresh install,
-/// directly beside the pane's own "start the sampler with `pulse --enable`":
-/// two lines contradicting each other, and a `--json` consumer told a run died
-/// where none ever ran.
-fn current_sampler_stop() -> Option<daemon::SamplerStop> {
-    daemon::stop_report()
+/// The recorded reason this namespace's sampler is not running.
+fn current_sampler_stop(paths: &SessionPaths) -> Result<Option<daemon::SamplerStop>> {
+    daemon::stop_report(paths)
 }
 
-/// Whether a sampler is live right now.
-///
-/// Asked separately from [`current_sampler_stop`] because they are different
-/// questions: "is one running" has an answer on a machine that has never run
-/// one, and "why did the last one stop" does not.
-fn sampler_is_running() -> bool {
-    daemon::live_pid().is_some()
+/// Whether this namespace has a sampler owner right now.
+fn sampler_is_running(paths: &SessionPaths) -> Result<bool> {
+    Ok(daemon::is_running(paths))
 }
 
 /// What a pane will draw: its geometry, and anything about the request that the

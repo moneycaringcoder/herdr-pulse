@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use pulse::herdr::{error_code, reduce_snapshot, session_mark, socket_path, Herdr};
+use pulse::herdr::{error_code, reduce_snapshot, session_mark, socket_path, socket_target, Herdr};
 use pulse::model::AgentState;
 use serde_json::{json, Value};
 
@@ -1425,7 +1425,12 @@ fn connect_reports_the_socket_path_when_there_is_no_server() {
 #[test]
 fn the_injected_socket_path_wins_over_every_fallback() {
     let _guard = env_lock();
-    let env = EnvGuard::new(&["HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "HOME"]);
+    let env = EnvGuard::new(&[
+        "HERDR_SOCKET_PATH",
+        "XDG_CONFIG_HOME",
+        "HOME",
+        "PULSE_SOCKET_IS_DEFAULT",
+    ]);
     env.set("HOME", "/home/ignored");
     env.set("XDG_CONFIG_HOME", "/xdg/ignored");
     env.set("HERDR_SOCKET_PATH", "/injected/herdr.sock");
@@ -1434,6 +1439,32 @@ fn the_injected_socket_path_wins_over_every_fallback() {
         socket_path().expect("path"),
         PathBuf::from("/injected/herdr.sock")
     );
+
+    env.set("HOME", "");
+    env.set("XDG_CONFIG_HOME", "");
+    let target = socket_target().expect("an injected socket needs no fallback home");
+    assert_eq!(target.path, PathBuf::from("/injected/herdr.sock"));
+    assert!(!target.is_default);
+
+    env.set("PULSE_SOCKET_IS_DEFAULT", "1");
+    assert!(
+        !socket_target().expect("public target").is_default,
+        "private daemon handoff state cannot redirect a public lifecycle action"
+    );
+}
+
+#[test]
+fn relative_injected_socket_is_absolutized_before_it_can_be_spawned() {
+    let _guard = env_lock();
+    let env = EnvGuard::new(&["HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "HOME"]);
+    env.set("XDG_CONFIG_HOME", "/config-root");
+    env.set("HERDR_SOCKET_PATH", "relative/herdr.sock");
+    let target = socket_target().expect("target");
+    assert_eq!(
+        target.path,
+        std::env::current_dir().unwrap().join("relative/herdr.sock")
+    );
+    assert!(!target.is_default);
 }
 
 #[test]
@@ -1456,6 +1487,15 @@ fn an_empty_socket_variable_counts_as_unset() {
         socket_path().expect("path"),
         PathBuf::from("/home/test/.config/herdr/herdr.sock")
     );
+}
+
+#[test]
+fn explicitly_selecting_the_fallback_keeps_default_compatibility() {
+    let _guard = env_lock();
+    let env = EnvGuard::new(&["HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "HOME"]);
+    env.set("XDG_CONFIG_HOME", "/config-root");
+    env.set("HERDR_SOCKET_PATH", "/config-root/herdr/herdr.sock");
+    assert!(socket_target().expect("target").is_default);
 }
 
 #[test]
