@@ -896,7 +896,7 @@ fn push(
     }
 
     let ttl_ms = config.ttl_ms();
-    let plan = badge_plan(&active.clone(), activity, live_session, config);
+    let plan = badge_plan(&active, activity, live_session, config);
     let mut lit: HashMap<String, String> = HashMap::new();
 
     for entry in batch(plan) {
