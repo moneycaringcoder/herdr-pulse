@@ -29,6 +29,11 @@ All notable changes to this project are documented here. The format follows
   before/after recovery metadata, restores only a config Herdr actually rejected,
   distinguishes launch failures from validation failures, and refuses rollback
   without writing when later user edits would be overwritten.
+- Snapshot reduction now rejects missing/wrong-type arrays, malformed records,
+  and absent, wrong-type or blank required workspace/agent fields. An explicit
+  empty session remains valid, optional evidence stays tolerant, and future
+  non-empty agent states remain present as `Unknown`; protocol drift can no
+  longer render as plausible quiet activity.
 
 ## [0.1.1] - 2026-08-23
 

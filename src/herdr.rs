@@ -409,35 +409,27 @@ pub fn reduce_snapshot(
             )
         })?;
 
-    // Agents first, keyed by workspace, so the workspace pass is a lookup rather
-    // than a rescan of the whole array per workspace.
+    let agents = required_array(snapshot, "agents")?;
+    let workspace_records = required_array(snapshot, "workspaces")?;
+
+    // Agents first, keyed by workspace, so the workspace pass is a lookup
+    // rather than a rescan of the whole array per workspace.
     let mut by_workspace: Vec<(String, Vec<AgentObservation>)> = Vec::new();
-    for agent in array(snapshot, "agents") {
-        // Both ids are required. `workspace_id` is the only way to attribute the
-        // agent to anything, and `pane_id` is the key `history` uses to track a
-        // single agent's `state_change_seq` across samples — two agents sharing
-        // a blank key would silently merge into one.
-        let (Some(workspace_id), Some(pane_id)) =
-            (text(agent, "workspace_id"), text(agent, "pane_id"))
-        else {
-            continue;
-        };
+    for (index, agent) in agents.iter().enumerate() {
+        require_object(agent, "agents", index)?;
+        let workspace_id = require_text(agent, "agents", index, "workspace_id")?;
+        let pane_id = require_text(agent, "agents", index, "pane_id")?;
+        let status = require_text(agent, "agents", index, "agent_status")?;
         let observation = AgentObservation {
             pane_id: pane_id.to_string(),
             workspace_id: workspace_id.to_string(),
-            // The program, not the user's label — see the module header.
+            // Optional display/program evidence remains forward-compatible.
             program: text(agent, "agent").map(str::to_string),
-            // An unrecognised or absent status becomes `Unknown`, which still
-            // counts as "an agent is here". Dropping the agent instead would
-            // make a future sixth herdr state read as an empty workspace.
-            state: AgentState::parse(
-                agent
-                    .get("agent_status")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-            ),
-            // Absent seq is 0, which compares equal to itself and so records no
-            // transition. Inventing a value would manufacture activity.
+            // A future non-empty enum member stays present as Unknown. Missing,
+            // wrong-type, or blank status was rejected above.
+            state: AgentState::parse(status),
+            // Optional in Herdr's schema. Absence or an unreadable value cannot
+            // justify inventing a transition, so it remains neutral zero.
             state_change_seq: agent
                 .get("state_change_seq")
                 .and_then(Value::as_u64)
@@ -450,27 +442,32 @@ pub fn reduce_snapshot(
     }
 
     let mut workspaces = Vec::new();
-    for workspace in array(snapshot, "workspaces") {
-        // Without an id there is nothing to key a history against, and nothing
-        // to push a badge to.
-        let Some(workspace_id) = text(workspace, "workspace_id") else {
-            continue;
+    for (index, workspace) in workspace_records.iter().enumerate() {
+        require_object(workspace, "workspaces", index)?;
+        let workspace_id = require_text(workspace, "workspaces", index, "workspace_id")?;
+        let label = require_text(workspace, "workspaces", index, "label")?;
+        let checkout_path = match workspace.get("worktree") {
+            None | Some(Value::Null) => None,
+            Some(worktree) if worktree.is_object() => {
+                let path = text(worktree, "checkout_path").ok_or_else(|| {
+                    format!(
+                        "session.snapshot.workspaces[{index}].worktree.checkout_path must be a \
+                         non-empty string"
+                    )
+                })?;
+                Some(path.to_string())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "session.snapshot.workspaces[{index}].worktree must be an object or null"
+                )
+                .into())
+            }
         };
         workspaces.push(WorkspaceObservation {
             workspace_id: workspace_id.to_string(),
-            // Falling back to the id keeps a label-less workspace from looking
-            // renamed on every sample, which still matters: the label is the
-            // only identity evidence there is for a workspace herdr reports no
-            // worktree for.
-            label: text(workspace, "label").unwrap_or(workspace_id).to_string(),
-            // `worktree` is null for a workspace that is not on a checkout —
-            // seven of the ten in the captured fixture. Absent means "no durable
-            // identity", never "a different workspace", so it is an `Option` all
-            // the way into the store rather than an empty string.
-            checkout_path: workspace
-                .get("worktree")
-                .and_then(|worktree| text(worktree, "checkout_path"))
-                .map(str::to_string),
+            label: label.to_string(),
+            checkout_path,
             agents: by_workspace
                 .iter()
                 .find(|(id, _)| id == workspace_id)
@@ -567,6 +564,24 @@ fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
-    value.get(key).and_then(Value::as_array).map_or(&[], |a| a)
+fn required_array<'a>(value: &'a Value, key: &str) -> Result<&'a [Value]> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("session.snapshot.{key} must be an array").into())
+}
+
+fn require_object(value: &Value, kind: &str, index: usize) -> Result<()> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(format!("session.snapshot.{kind}[{index}] must be an object").into())
+    }
+}
+
+fn require_text<'a>(value: &'a Value, kind: &str, index: usize, key: &str) -> Result<&'a str> {
+    text(value, key).ok_or_else(|| {
+        format!("session.snapshot.{kind}[{index}].{key} must be a non-empty string").into()
+    })
 }
