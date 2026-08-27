@@ -59,7 +59,7 @@ snapshot.version    "0.8.0"        snapshot.protocol  19
 snapshot.workspaces[]  workspace_id, number, label, focused, pane_count,
                        tab_count, active_tab_id, agent_status, tokens?, worktree?
 snapshot.agents[]      pane_id, workspace_id, tab_id, terminal_id, agent,
-                       agent_session, agent_status, state_change_seq, revision,
+                       agent_session, agent_status, state_change_seq?, revision,
                        cwd, foreground_cwd, focused, terminal_title, tokens
 snapshot.panes[]       the same shape, plus `scroll`
 snapshot.tabs[] snapshot.layouts[]
@@ -69,6 +69,21 @@ snapshot.focused_workspace_id / focused_tab_id / focused_pane_id
 Reading the arrays off `result` instead of `result.snapshot` yields no data at
 all, which is indistinguishable from an idle session. An absent `snapshot`
 object must therefore be a loud error, never a fallback to empty.
+
+### Validation boundary
+
+An actual pair of empty `workspaces` and `agents` arrays is a valid idle
+session. Missing or wrong-type arrays are not. Pulse also rejects non-object
+records and missing, wrong-type or blank required fields it consumes:
+workspace id/label, agent pane/workspace ids and agent status. A present,
+non-null worktree must be an object with a non-empty checkout path. The error
+names only the structural field and record index; it never echoes payload data.
+
+Forward compatibility remains deliberate. Absent or null worktrees are valid;
+agent program and sequence evidence stays optional; unknown object fields are
+ignored; and a future non-empty agent-status string keeps the agent as
+`Unknown`. A rejected snapshot never reaches history recording or badge
+planning, so broken observation cannot render as quiet.
 
 ### There is no session identity in here
 

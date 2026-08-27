@@ -882,12 +882,89 @@ fn a_genuinely_idle_session_is_an_empty_sample_and_not_an_error() {
 
     assert!(sample.workspaces.is_empty());
     assert_eq!(sample.taken_at, 9);
+}
 
-    // Absent arrays are the same thing: the `snapshot` object was there, so we
-    // did read the payload, and it really was empty.
-    let sample =
-        reduce_snapshot(&result_with(json!({"version": "0.8.0"})), None, 9).expect("reduce");
-    assert!(sample.workspaces.is_empty());
+#[test]
+fn required_snapshot_arrays_cannot_collapse_to_empty() {
+    for field in ["workspaces", "agents"] {
+        let mut missing = json!({"workspaces": [], "agents": []});
+        missing.as_object_mut().unwrap().remove(field);
+        let err = reduce_snapshot(&result_with(missing), None, 0)
+            .expect_err("a missing required array is not an idle session");
+        assert!(
+            err.to_string()
+                .contains(&format!("session.snapshot.{field} must be an array")),
+            "{err}"
+        );
+
+        for malformed in [Value::Null, json!("bad"), json!({}), json!(7)] {
+            let mut snapshot = json!({"workspaces": [], "agents": []});
+            snapshot[field] = malformed;
+            let err = reduce_snapshot(&result_with(snapshot), None, 0)
+                .expect_err("a wrong-type array is not an idle session");
+            assert!(
+                err.to_string()
+                    .contains(&format!("session.snapshot.{field} must be an array")),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn snapshot_array_entries_must_be_objects() {
+    for kind in ["workspaces", "agents"] {
+        for malformed in [Value::Null, json!("bad"), json!([]), json!(7)] {
+            let mut snapshot = json!({"workspaces": [], "agents": []});
+            snapshot[kind] = json!([malformed]);
+            let err = reduce_snapshot(&result_with(snapshot), None, 0)
+                .expect_err("a malformed record cannot disappear");
+            assert!(
+                err.to_string()
+                    .contains(&format!("session.snapshot.{kind}[0] must be an object")),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn worktree_is_optional_but_present_structure_is_strict() {
+    for worktree in [
+        json!("bad"),
+        json!([]),
+        json!({"checkout_path": null}),
+        json!({"checkout_path": ""}),
+        json!({}),
+    ] {
+        let err = reduce_snapshot(
+            &result_with(json!({
+                "workspaces": [{
+                    "workspace_id": "w1",
+                    "label": "one",
+                    "worktree": worktree
+                }],
+                "agents": []
+            })),
+            None,
+            0,
+        )
+        .expect_err("present malformed worktree evidence cannot become None");
+        assert!(err.to_string().contains(".worktree"), "{err}");
+    }
+
+    for workspace in [
+        json!({"workspace_id": "w1", "label": "one"}),
+        json!({"workspace_id": "w1", "label": "one", "worktree": null}),
+    ] {
+        let sample = reduce_snapshot(
+            &result_with(json!({"workspaces": [workspace], "agents": []})),
+            None,
+            0,
+        )
+        .expect("absent and null worktree are valid");
+        assert_eq!(sample.workspaces[0].checkout_path, None);
+    }
 }
 
 #[test]
@@ -911,75 +988,64 @@ fn a_workspace_with_no_agents_is_tracked_and_reads_as_unknown() {
 }
 
 #[test]
-fn a_workspace_without_a_label_falls_back_to_its_id() {
-    for workspace in [
-        json!({"workspace_id": "w1"}),
-        json!({"workspace_id": "w1", "label": ""}),
-        json!({"workspace_id": "w1", "label": "   "}),
-        json!({"workspace_id": "w1", "label": null}),
+fn malformed_required_workspace_fields_are_protocol_errors() {
+    for (field, workspace) in [
+        ("workspace_id", json!({"label": "one"})),
+        ("workspace_id", json!({"workspace_id": "", "label": "one"})),
+        ("workspace_id", json!({"workspace_id": 7, "label": "one"})),
+        ("label", json!({"workspace_id": "w1"})),
+        ("label", json!({"workspace_id": "w1", "label": "   "})),
+        ("label", json!({"workspace_id": "w1", "label": null})),
     ] {
-        let sample = reduce_snapshot(&result_with(json!({"workspaces": [workspace]})), None, 0)
-            .expect("reduce");
-        // The label is `history`'s guard against workspace-id reuse. A stable
-        // fallback keeps that comparison stable; an empty one would make every
-        // sample look like a rename and drop the history each cycle.
-        assert_eq!(sample.workspaces[0].label, "w1");
+        let err = reduce_snapshot(
+            &result_with(json!({"workspaces": [workspace], "agents": []})),
+            None,
+            0,
+        )
+        .expect_err("required workspace evidence cannot disappear");
+        assert!(
+            err.to_string()
+                .contains(&format!(".{field} must be a non-empty string")),
+            "{err}"
+        );
     }
 }
 
 #[test]
-fn a_workspace_with_no_id_is_dropped_because_nothing_can_be_keyed_to_it() {
-    let sample = reduce_snapshot(
-        &result_with(json!({
-            "workspaces": [
-                {"label": "nameless"},
-                {"workspace_id": "", "label": "empty"},
-                {"workspace_id": "w2", "label": "real"}
-            ]
-        })),
-        None,
-        0,
-    )
-    .expect("reduce");
-
-    assert_eq!(
-        sample
-            .workspaces
-            .iter()
-            .map(|w| w.workspace_id.as_str())
-            .collect::<Vec<_>>(),
-        ["w2"]
-    );
-}
-
-#[test]
-fn an_agent_missing_either_id_is_dropped_rather_than_merged() {
-    let sample = reduce_snapshot(
-        &result_with(json!({
-            "workspaces": [{"workspace_id": "w1", "label": "one"}],
-            "agents": [
-                {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "working"},
-                // No pane id: `history` keys an agent's sequence by pane, so two
-                // of these would silently collapse into one agent.
-                {"workspace_id": "w1", "agent_status": "working"},
-                {"pane_id": "", "workspace_id": "w1", "agent_status": "working"},
-                // No workspace id: nothing to attribute it to.
-                {"pane_id": "w1:p9", "agent_status": "working"}
-            ]
-        })),
-        None,
-        0,
-    )
-    .expect("reduce");
-
-    assert_eq!(
-        sample.workspaces[0]
-            .agents
-            .iter()
-            .map(|a| a.pane_id.as_str())
-            .collect::<Vec<_>>(),
-        ["w1:p1"]
-    );
+fn malformed_required_agent_ids_are_protocol_errors() {
+    for (field, agent) in [
+        (
+            "pane_id",
+            json!({"workspace_id": "w1", "agent_status": "working"}),
+        ),
+        (
+            "pane_id",
+            json!({"pane_id": "", "workspace_id": "w1", "agent_status": "working"}),
+        ),
+        (
+            "workspace_id",
+            json!({"pane_id": "w1:p1", "agent_status": "working"}),
+        ),
+        (
+            "workspace_id",
+            json!({"pane_id": "w1:p1", "workspace_id": 7, "agent_status": "working"}),
+        ),
+    ] {
+        let err = reduce_snapshot(
+            &result_with(json!({
+                "workspaces": [{"workspace_id": "w1", "label": "one"}],
+                "agents": [agent]
+            })),
+            None,
+            0,
+        )
+        .expect_err("an unkeyable agent cannot be silently dropped");
+        assert!(
+            err.to_string()
+                .contains(&format!(".{field} must be a non-empty string")),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -1048,41 +1114,50 @@ fn every_agent_status_the_server_can_send_round_trips() {
 }
 
 #[test]
-fn an_unparseable_status_keeps_the_agent_as_unknown() {
+fn a_future_non_empty_status_keeps_the_agent_as_unknown() {
     let sample = reduce_snapshot(
         &result_with(json!({
             "workspaces": [{"workspace_id": "w1", "label": "one"}],
             "agents": [
                 {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "compacting"},
-                {"pane_id": "w1:p2", "workspace_id": "w1", "agent_status": ""},
-                {"pane_id": "w1:p3", "workspace_id": "w1"},
-                {"pane_id": "w1:p4", "workspace_id": "w1", "agent_status": 7},
-                {"pane_id": "w1:p5", "workspace_id": "w1", "agent_status": "WORKING"}
+                {"pane_id": "w1:p2", "workspace_id": "w1", "agent_status": "WORKING"}
             ]
         })),
         None,
         0,
     )
-    .expect("reduce");
+    .expect("future enum members remain representable");
 
-    // A sixth herdr state must degrade to "we saw an agent and could not
-    // classify it", never to "there was no agent here".
-    assert_eq!(sample.workspaces[0].agents.len(), 5);
     assert_eq!(
         sample.workspaces[0]
             .agents
             .iter()
-            .map(|a| a.state)
+            .map(|agent| agent.state)
             .collect::<Vec<_>>(),
-        [
-            AgentState::Unknown,
-            AgentState::Unknown,
-            AgentState::Unknown,
-            AgentState::Unknown,
-            // Case-insensitive, per the contract's own parser.
-            AgentState::Working
-        ]
+        [AgentState::Unknown, AgentState::Working]
     );
+}
+
+#[test]
+fn missing_wrong_type_or_blank_status_is_a_protocol_error() {
+    for status in [None, Some(json!("")), Some(json!("   ")), Some(json!(7))] {
+        let mut agent = json!({"pane_id": "w1:p1", "workspace_id": "w1"});
+        if let Some(status) = status {
+            agent["agent_status"] = status;
+        }
+        let err = reduce_snapshot(
+            &result_with(json!({
+                "workspaces": [{"workspace_id": "w1", "label": "one"}],
+                "agents": [agent]
+            })),
+            None,
+            0,
+        )
+        .expect_err("required status cannot become a plausible Unknown");
+        assert!(err
+            .to_string()
+            .contains(".agent_status must be a non-empty string"));
+    }
 }
 
 #[test]
@@ -1090,11 +1165,11 @@ fn a_missing_or_odd_sequence_number_never_manufactures_a_transition() {
     let sample = reduce_snapshot(&result_with(json!({
         "workspaces": [{"workspace_id": "w1", "label": "one"}],
         "agents": [
-            {"pane_id": "w1:p1", "workspace_id": "w1"},
-            {"pane_id": "w1:p2", "workspace_id": "w1", "state_change_seq": null},
-            {"pane_id": "w1:p3", "workspace_id": "w1", "state_change_seq": "795"},
-            {"pane_id": "w1:p4", "workspace_id": "w1", "state_change_seq": -1},
-            {"pane_id": "w1:p5", "workspace_id": "w1", "state_change_seq": 18446744073709551615u64}
+            {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "idle"},
+            {"pane_id": "w1:p2", "workspace_id": "w1", "agent_status": "idle", "state_change_seq": null},
+            {"pane_id": "w1:p3", "workspace_id": "w1", "agent_status": "idle", "state_change_seq": "795"},
+            {"pane_id": "w1:p4", "workspace_id": "w1", "agent_status": "idle", "state_change_seq": -1},
+            {"pane_id": "w1:p5", "workspace_id": "w1", "agent_status": "idle", "state_change_seq": 18446744073709551615u64}
         ]
     })), None, 0)
     .expect("reduce");
@@ -1117,10 +1192,10 @@ fn a_program_that_is_absent_or_blank_is_none_rather_than_an_empty_label() {
         &result_with(json!({
             "workspaces": [{"workspace_id": "w1", "label": "one"}],
             "agents": [
-                {"pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude"},
-                {"pane_id": "w1:p2", "workspace_id": "w1", "agent": ""},
-                {"pane_id": "w1:p3", "workspace_id": "w1", "agent": "  opencode  "},
-                {"pane_id": "w1:p4", "workspace_id": "w1"}
+                {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "idle", "agent": "claude"},
+                {"pane_id": "w1:p2", "workspace_id": "w1", "agent_status": "idle", "agent": ""},
+                {"pane_id": "w1:p3", "workspace_id": "w1", "agent_status": "idle", "agent": "  opencode  "},
+                {"pane_id": "w1:p4", "workspace_id": "w1", "agent_status": "idle"}
             ]
         })),
         None,
