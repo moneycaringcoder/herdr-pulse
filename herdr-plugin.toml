@@ -67,7 +67,7 @@ command = ["./target/release/pulse", "--setup"]
 [[actions]]
 id = "setup-rollback"
 title = "Pulse: undo sidebar setup"
-description = "Restore the config.toml backup taken by setup."
+description = "Undo sidebar setup only if config.toml has not changed since."
 contexts = ["global"]
 command = ["./target/release/pulse", "--setup-rollback"]
 
