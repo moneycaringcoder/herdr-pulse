@@ -12,7 +12,9 @@
 
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use pulse::config::Config;
 use pulse::history::{self, Bucket, History, FORMAT_VERSION};
@@ -4253,6 +4255,117 @@ fn saving_replaces_state_symlinks_without_following_them() {
         .file_type()
         .is_symlink());
     assert_eq!(history::load_from(dir.path(), &config), expected);
+}
+
+#[test]
+fn concurrent_readers_see_only_complete_history_generations() {
+    let dir = TempDir::new("concurrent-reader");
+    let config = config(60, 16, 8);
+    let first = recorded(&config);
+    history::save_to(dir.path(), &first).expect("initial save");
+    let target = dir.file("history.json");
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
+        while !reader_stop.load(Ordering::SeqCst) {
+            let bytes = std::fs::read(&target).expect("target remains present");
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .expect("reader saw one complete JSON generation");
+        }
+    });
+
+    let mut generation = first;
+    for index in 0..200 {
+        generation.record(
+            &one(
+                T0 + (index + 1) * 60,
+                "wA",
+                "alpha",
+                &[("wA:p1", "working", index + 100)],
+            ),
+            &config,
+        );
+        history::save_to(dir.path(), &generation).expect("replace generation");
+    }
+    stop.store(true, Ordering::SeqCst);
+    reader.join().expect("reader thread");
+    assert_eq!(history::load_from(dir.path(), &config), generation);
+}
+
+#[test]
+#[ignore = "release persistence benchmark; run with --ignored --nocapture"]
+fn persistence_cost_baseline() {
+    let fallback = TempDir::new("persistence-benchmark");
+    let external_root = std::env::var_os("PULSE_BENCH_DIR").map(PathBuf::from);
+    let benchmark_dir = external_root.as_ref().map_or_else(
+        || fallback.path().to_path_buf(),
+        |root| {
+            root.join(format!(
+                "pulse-persistence-benchmark-{}",
+                std::process::id()
+            ))
+        },
+    );
+    if external_root.is_some() {
+        let _ = std::fs::remove_dir_all(&benchmark_dir);
+        std::fs::create_dir_all(&benchmark_dir).expect("external benchmark directory");
+    }
+    let config = Config::default();
+    let mut benchmark = History::empty(&config);
+    for minute in 0..config.retention_buckets as u64 {
+        let workspaces = (0..10)
+            .map(|index| WorkspaceObservation {
+                workspace_id: format!("w{index}"),
+                label: format!("workspace-{index}"),
+                checkout_path: Some(format!("/home/dev/repos/workspace-{index}")),
+                agents: vec![AgentObservation {
+                    pane_id: format!("w{index}:p1"),
+                    workspace_id: format!("w{index}"),
+                    program: Some("claude".to_string()),
+                    state: AgentState::Working,
+                    state_change_seq: minute + index,
+                }],
+            })
+            .collect();
+        benchmark.record(
+            &Sample {
+                taken_at: T0 + minute * config.bucket_seconds,
+                session: Some(SessionMark {
+                    fingerprint: "benchmark-session".to_string(),
+                    began: T0,
+                }),
+                workspaces,
+            },
+            &config,
+        );
+    }
+
+    const CYCLES: usize = 100;
+    let mut elapsed = Vec::with_capacity(CYCLES);
+    for _ in 0..CYCLES {
+        let started = Instant::now();
+        history::save_to(&benchmark_dir, &benchmark).expect("benchmark save");
+        elapsed.push(started.elapsed().as_nanos());
+    }
+    elapsed.sort_unstable();
+    let bytes = std::fs::metadata(benchmark_dir.join("history.json"))
+        .unwrap()
+        .len() as u128;
+    println!(
+        "revision,cycles,history_bytes,serialized_bytes,write_bytes,renames,elapsed_ns,p50_cycle_ns,p95_cycle_ns"
+    );
+    println!(
+        "{},{CYCLES},{bytes},{},{},{CYCLES},{},{},{}",
+        env!("CARGO_PKG_VERSION"),
+        bytes * CYCLES as u128,
+        bytes * CYCLES as u128,
+        elapsed.iter().sum::<u128>(),
+        elapsed[CYCLES / 2],
+        elapsed[CYCLES * 95 / 100]
+    );
+    if external_root.is_some() {
+        std::fs::remove_dir_all(&benchmark_dir).expect("clean external benchmark directory");
+    }
 }
 
 #[test]

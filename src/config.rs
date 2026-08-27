@@ -107,7 +107,7 @@ pub const MAX_AGENTS_PER_WORKSPACE: usize = 4;
 /// is "bounded by construction": their documented maxima multiply out to tens of
 /// millions of buckets, and a measured
 /// `{"max_workspaces": 4096, "retention_buckets": 10000}` produced a 103 MB file
-/// that the daemon then rewrote and fsync'd every five seconds. Each bucket
+/// that the daemon then rewrote every five seconds. Each bucket
 /// serialises to roughly 55 bytes, so this ceiling corresponds to a few
 /// megabytes — generous next to the `(240 + 168) × 64 = 26,112` buckets (~1.4 MB)
 /// the defaults use, and small enough that the rewrite stays cheap.

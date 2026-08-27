@@ -625,42 +625,33 @@ fn run(paths: &SessionPaths, config: &Config, _owner: OwnerGuard) -> Result<()> 
 
 /// One cycle: snapshot, record, persist, push.
 ///
-/// Persisting sits *before* the push and happens every cycle, not on a timer and
-/// not at shutdown: a daemon that is SIGKILLed never gets to flush, and the
-/// whole point of the history is that it survives that.
+/// Persisting sits *before* the push and happens every cycle. The same-directory
+/// rename is the linearization point: a reader in this running kernel sees the
+/// previous complete JSON generation or the new complete generation, never the
+/// temp file or a partial target.
 ///
 /// # What that costs, measured
 ///
-/// A full re-serialise and `fsync` of the whole store per interval. Ten
-/// workspaces encode to 131 KB, so at the default 5 s interval that is 17,280
-/// rewrites and about **2.3 GB written per day**. Bounded — the store is capped
-/// by construction — but not small.
+/// The ten-workspace default benchmark encodes 223,818 bytes (~224 KB). At the
+/// default 5 s interval that is 17,280 serializations, complete temp writes and
+/// renames, about **3.87 GB/day of application-submitted bytes**. Per-agent
+/// rings and shorter intervals scale that figure upward. The format stays
+/// unchanged; compact encoding or a journal would add migration, replay, and
+/// corruption state without changing the observation contract.
 ///
-/// It is kept anyway, because every cheaper cadence buys its bytes back with the
-/// one property this file exists for. `History::record` bumps the current
-/// bucket's `samples` on *every* sample, so "save only when something changed"
-/// is never false in a running sampler; and saving every N cycles turns "a
-/// SIGKILLed daemon loses at most one interval" into "loses up to N", which is a
-/// different promise to a user reading a sparkline.
+/// There is deliberately no per-cycle `sync_all`. The old path forced 17,280
+/// file flushes/day but never synced the parent directory after rename, so it
+/// was not a complete machine-crash transaction. Removing that flush preserves
+/// the stated process-crash contract: SIGKILL closes the process but not the
+/// kernel page cache; a kill before rename leaves the previous target, and a
+/// kill after rename leaves the new complete target visible. At most the
+/// in-flight interval is absent.
 ///
-/// # Where the bytes actually are
-///
-/// Worth stating precisely, because the obvious answer is only half right.
-/// `Bucket` serialises four `u16` fields unconditionally, so an *unobserved*
-/// ring slot spends 53 bytes saying nothing, and a `skip_serializing_if` in
-/// `history.rs` would be a large win — measured at **13.5×** (2,269 → 167
-/// MB/day) on a young store whose ring is mostly empty.
-///
-/// But a daemon spends almost all its life in steady state, with every slot in
-/// the four-hour ring observed, and there the same change measures **1.3×**
-/// (2,393 → 1,895 MB/day): the fields are no longer zero, so there is nothing to
-/// skip. Sparsity is the young case, not the standing one, and the standing one
-/// is where the daily figure comes from.
-///
-/// So the lever that would actually move steady state is a compact encoding, or
-/// dropping `sync_all` — which is stronger than this guarantee needs anyway,
-/// since a killed *process* does not lose the page cache, only a killed *kernel*
-/// does. Both live in `history.rs`, which this module does not own.
+/// Power loss/kernel crash has no bounded recovery guarantee. A missing or
+/// corrupt target remains a loud empty-history recovery, never invented quiet.
+/// Async writeback/ENOSPC errors that occur after `write_all` may not be
+/// observable here; direct write and rename failures still use the existing
+/// warning path.
 fn cycle(
     paths: &SessionPaths,
     client: &mut Herdr,
