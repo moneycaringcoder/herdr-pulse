@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `--forget` now stops a live sampler before deleting its history and restarts
+  it under the same owner afterward. The daemon can no longer recreate deleted
+  workspace labels, checkout paths and activity from its in-memory copy on the
+  next sampling cycle. A stopped sampler stays stopped, and success is printed
+  only after deletion and any required restart both complete.
+
 ## [0.1.1] - 2026-08-23
 
 ### Added

@@ -92,6 +92,6 @@ command = ["./target/release/pulse", "--disable"]
 [[actions]]
 id = "forget"
 title = "Pulse: forget recorded history"
-description = "Delete the on-disk activity history and start over."
+description = "Safely stop a live sampler, delete its activity history, and restart it."
 contexts = ["global"]
 command = ["./target/release/pulse", "--forget"]

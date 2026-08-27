@@ -325,6 +325,103 @@ pub fn disable() -> Result<()> {
     sweep(&mut client)
 }
 
+/// Deletes recorded history without letting a live sampler write its in-memory
+/// copy back on the next cycle.
+///
+/// The sampler is quiesced before the file is removed and restored only when it
+/// was live on entry. An installed-but-stopped supervisor therefore stays
+/// stopped, while a live supervised sampler remains owned by its supervisor.
+pub fn forget_history() -> Result<()> {
+    if live_pid().is_none() {
+        history::forget()?;
+        println!("pulse: recorded history forgotten; the sampler remains stopped.");
+        return Ok(());
+    }
+
+    let supervised = supervise::is_installed();
+    if supervised {
+        supervise::stop().map_err(|err| {
+            format!("cannot forget history: could not stop the sampler supervisor: {err}")
+        })?;
+    }
+
+    if let Err(stop_error) = stop_sampler_confirmed() {
+        if supervised {
+            return match supervise::restore_start_at_login() {
+                Ok(()) => Err(format!(
+                    "cannot forget history: the running sampler could not be stopped \
+                     ({stop_error}); start-at-login supervision was restored without starting \
+                     a second sampler"
+                )
+                .into()),
+                Err(restore_error) => Err(format!(
+                    "cannot forget history: the running sampler could not be stopped \
+                     ({stop_error}), and start-at-login supervision could not be restored: \
+                     {restore_error}"
+                )
+                .into()),
+            };
+        }
+        return Err(format!(
+            "cannot forget history: the running sampler could not be stopped: {stop_error}"
+        )
+        .into());
+    }
+
+    if let Err(delete_error) = history::forget() {
+        return match restart_after_forget(supervised) {
+            Ok(()) => Err(format!(
+                "could not forget recorded history ({delete_error}); the sampler was restored"
+            )
+            .into()),
+            Err(restart_error) => Err(format!(
+                "could not forget recorded history ({delete_error}), and could not restore the \
+                 sampler: {restart_error}"
+            )
+            .into()),
+        };
+    }
+
+    restart_after_forget(supervised).map_err(|err| {
+        format!("recorded history was deleted, but the sampler could not be restarted: {err}")
+    })?;
+    let owner = if supervised {
+        "its supervisor"
+    } else {
+        "a detached process"
+    };
+    println!("pulse: recorded history forgotten; the sampler restarted under {owner}.");
+    Ok(())
+}
+
+fn restart_after_forget(supervised: bool) -> Result<()> {
+    if supervised {
+        supervise::start()
+    } else {
+        // Command-line recording overrides are intentionally not guessed from a
+        // foreign process. As after a herdr restart, the new daemon reads the
+        // durable config file.
+        spawn_detached(&[])
+    }
+}
+
+/// The strict stop used by destructive state changes.
+///
+/// [`stop_sampler`] is deliberately best effort for supervisor installation:
+/// arranging future recovery is still useful when a wedged old sampler will not
+/// exit. Forgetting is different. Deleting beneath a process that still owns an
+/// in-memory copy would report success immediately before resurrecting the data.
+fn stop_sampler_confirmed() -> Result<()> {
+    if let Some(pid) = live_pid() {
+        request_stop(pid);
+        if !await_exit(pid, STOP_TIMEOUT) {
+            return Err(format!("sampler {pid} did not exit within {STOP_TIMEOUT:?}").into());
+        }
+    }
+    clear_pid_file();
+    Ok(())
+}
+
 /// Stops a live sampler and clears its pid marker, leaving badges alone.
 ///
 /// The half of `--disable` that does not need herdr. Supervision uses it to take

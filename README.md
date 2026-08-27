@@ -366,7 +366,13 @@ Continuity of the unit is not continuity of observation.
 
 | Verb | What it does |
 |---|---|
-| `--forget` | Delete the recorded history and start over. |
+| `--forget` | Stop a live sampler, delete the recorded history, then restart it under the same owner. A stopped sampler stays stopped. |
+
+The restart prevents the sampler's in-memory copy from recreating the history
+on its next cycle. A supervised sampler returns to its supervisor; a detached
+sampler restarts from the durable config file, just as it does after herdr
+restarts. Pulse reports success only after deletion and any required restart
+both complete.
 
 ### Sidebar setup
 
