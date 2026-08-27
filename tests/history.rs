@@ -10,6 +10,7 @@
 //! snapshot with values sanitised and structure left byte-exact, rather than
 //! from what the shape of a snapshot ought to be.
 
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4235,6 +4236,26 @@ fn saving_leaves_no_temporary_file_behind() {
 }
 
 #[test]
+fn saving_replaces_state_symlinks_without_following_them() {
+    let dir = TempDir::new("symlink-state");
+    let config = config(60, 16, 8);
+    let victim = dir.file("victim");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    symlink(&victim, dir.file("history.json")).unwrap();
+    symlink(&victim, dir.file("history.json.tmp")).unwrap();
+
+    let expected = recorded(&config);
+    history::save_to(dir.path(), &expected).expect("safe save");
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(!std::fs::symlink_metadata(dir.file("history.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(history::load_from(dir.path(), &config), expected);
+}
+
+#[test]
 fn a_leftover_temporary_file_is_ignored_by_load() {
     let dir = TempDir::new("leftover-temp");
     let config = config(60, 16, 8);
@@ -4273,6 +4294,18 @@ fn saving_creates_the_state_directory() {
     history::save_to(&nested, &recorded(&config)).expect("save into a fresh directory");
 
     assert!(nested.join("history.json").exists());
+    assert_eq!(
+        std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(nested.join("history.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]

@@ -34,6 +34,11 @@ All notable changes to this project are documented here. The format follows
   empty session remains valid, optional evidence stays tolerant, and future
   non-empty agent states remain present as `Unknown`; protocol drift can no
   longer render as plausible quiet activity.
+- Runtime state now has an explicit privacy contract and owner-only Unix
+  permissions. Pulse documents the checkout/socket paths and optional program
+  names it intentionally retains, creates/tightens plugin-owned directories to
+  `0700` and files to `0600`, and refuses final symlinks so legacy/custom state
+  cannot redirect writes outside the plugin root.
 
 ## [0.1.1] - 2026-08-23
 

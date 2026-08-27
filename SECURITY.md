@@ -23,27 +23,43 @@ urgently:
 - **Any write outside the plugin's state directory**, and in particular any write
   to a user's repository. pulse runs unattended on machines full of in-flight,
   uncommitted agent work, and it has no business touching any of it.
-- **Any subprocess beyond the two declared ones** — the daemon re-execing itself,
-  and `herdr server reload-config` during setup. pulse never invokes git.
+- **Any subprocess beyond the three declared classes** — the daemon re-execing
+  itself, `herdr server reload-config` during setup, and the explicitly selected
+  systemd/launchd supervisor commands. pulse never invokes git.
 - **Any outbound network traffic.** pulse makes no network calls at all, so any
   is a bug by definition. There is no telemetry and no update check.
-- **Leaking session contents.** The history file records workspace labels,
-  workspace ids and agent lifecycle states. It should never record command lines,
-  terminal contents, file paths, or repository contents — if you find something
-  sensitive in it, that is a bug.
+- **Leaking uncollected session contents.** `history.json` deliberately records
+  workspace ids and labels, absolute checkout paths, socket-session
+  fingerprints/start times, lifecycle state/timing/counters, pane ids and
+  sequence counters, plus agent program names when per-agent recording is on.
+  Named-session directory names reversibly encode the absolute Herdr socket
+  pathname. `sampler.stop` may contain a bounded failure detail, including source
+  or filesystem paths. Pulse must not persist command lines, terminal contents,
+  repository contents, credentials, cwd/foreground-cwd, agent session ids or
+  names, tokens, titles, unrelated environment values, or unknown snapshot
+  fields.
+- **Crash-persistent state is included in the same contract.**
+  `history.json.tmp` may contain the complete history payload;
+  `sampler.pid.tmp` and `default.socket.tmp` contain the corresponding PID/path;
+  `default.socket.lock`, `sampler.owner.lock`, and `sampler.control.lock` are
+  empty files carrying kernel lock state. Successful operations rename/remove
+  their temporary files, and `--forget` removes the history temporary file.
 - **A path that lets a crafted socket response cause a crash, a hang, or an
   unbounded write.** The history file is bounded by construction; anything that
   defeats that bound is a denial-of-service issue.
 
-## What is out of scope
+## Deliberate writes and security boundaries
 
-- The `--setup` action deliberately edits `~/.config/herdr/config.toml`. It takes
-  a backup first, refuses to clobber an existing backup, and restores the
-  original if herdr rejects the result. That it writes to that one file, with
-  consent, is the feature — not a vulnerability. A failure of the backup or
-  rollback logic *is* in scope.
-- Bugs in herdr itself belong at
-  [herdr](https://github.com/SuperCodeAgents/herdr-terminal).
+- The `--setup` action deliberately edits the selected Herdr `config.toml`. Its
+  owner-only backup and transaction metadata sit beside that file. Atomic
+  replacement, validation restore, and rollback refusal are the feature; a
+  failure that truncates the file, clobbers recovery state, or overwrites later
+  user edits is in scope.
+- Runtime state is private to its owner: exact plugin-owned directories are mode
+  `0700`, files are `0600`, permissive legacy modes are tightened, and final
+  symlinks are refused/replaced rather than followed. A write through a state
+  symlink or permission migration outside the plugin-owned root is in scope.
+- Bugs in Herdr itself belong at [herdr](https://github.com/herdrdev/herdr).
 
 ## Supported versions
 

@@ -509,8 +509,27 @@ and pulse says so rather than quietly obeying:
 }
 ```
 
-State — the recorded history and the sampler's markers — lives separately, at
-`~/.local/state/herdr/plugins/moneycaringcoder.pulse/`.
+State lives separately at
+`~/.local/state/herdr/plugins/moneycaringcoder.pulse/`. Pulse creates/tightens
+that exact plugin root, its `sessions/` children, and socket namespaces to mode
+`0700`; runtime files are mode `0600`. It never chmods ancestors. Existing
+permissive plugin-owned state is tightened on use, and final-component symlinks
+are never followed.
+
+`history.json` contains workspace ids/labels, absolute checkout paths,
+session fingerprints/times, bucket counters/state/timing, pane ids/sequences,
+and optional agent program names. It contains no command line, terminal or
+repository contents. `enabled`, `sampler.pid`, `sampler.stop`, the owner/control
+locks, and `default.socket` carry lifecycle data; named-session directory names
+reversibly encode their absolute Herdr socket path. See [SECURITY.md](SECURITY.md)
+for the complete positive and negative persistence contract.
+
+Crash residue is part of that contract: `history.json.tmp` can contain the same
+history payload; `sampler.pid.tmp` and `default.socket.tmp` contain their final
+PID/path values; `default.socket.lock`, `sampler.owner.lock`, and
+`sampler.control.lock` are empty files whose kernel locks carry the live state.
+Successful writes rename/remove the temporary files; `--forget` also removes
+`history.json.tmp`.
 
 ## Why these numbers
 

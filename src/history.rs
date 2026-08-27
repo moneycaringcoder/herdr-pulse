@@ -72,6 +72,7 @@ use crate::config::{Config, SessionPaths};
 use crate::model::{
     AgentActivity, AgentState, Level, Sample, SessionMark, WorkspaceActivity, WorkspaceObservation,
 };
+use crate::private_fs;
 use crate::Result;
 
 /// Bump when the on-disk shape changes incompatibly. A file whose version is
@@ -1772,7 +1773,7 @@ pub fn load(paths: &SessionPaths, config: &Config) -> History {
 /// passing or failing depending on the machine.
 pub fn load_from(dir: &Path, config: &Config) -> History {
     let path = dir.join(HISTORY_FILE);
-    let raw = match std::fs::read(&path) {
+    let raw = match private_fs::read(&path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // The normal first run. Not a problem, so not a message.
@@ -1922,9 +1923,10 @@ pub fn save(paths: &SessionPaths, history: &History, _config: &Config) -> Result
 /// swallowing it. The tests drive this one; `save` is the daemon's
 /// never-fatal wrapper around it.
 pub fn save_to(dir: &Path, history: &History) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    private_fs::ensure_dir(dir)?;
     let target = dir.join(HISTORY_FILE);
     let temp = dir.join(TEMP_FILE);
+    let _ = std::fs::remove_file(&temp);
     let encoded = serde_json::to_vec(history).map_err(std::io::Error::other)?;
 
     // The temp file has to be in the same directory: `rename` is only atomic
@@ -1948,7 +1950,7 @@ pub fn save_to(dir: &Path, history: &History) -> std::io::Result<()> {
 fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut file = std::fs::File::create(path)?;
+    let mut file = private_fs::create_new(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }

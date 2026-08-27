@@ -48,7 +48,7 @@
 //! sampling intervals, 15 s at the default — and nothing shorter.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
@@ -63,6 +63,7 @@ use crate::config::{Config, SessionPaths};
 use crate::herdr::{self, Herdr};
 use crate::history;
 use crate::model::{SessionMark, Tone, WorkspaceActivity};
+use crate::private_fs;
 use crate::supervise;
 use crate::Result;
 
@@ -139,15 +140,7 @@ fn stat_device(stat: &libc::stat) -> u64 {
 }
 
 fn open_lock(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
+    private_fs::open(path)
 }
 
 fn flock_exclusive(file: &File, nonblocking: bool) -> io::Result<()> {
@@ -258,7 +251,7 @@ fn record_stop(paths: &SessionPaths, reason: StopReason, detail: Option<&str>) {
         Some(detail) => format!("{}\n{at}\n{}\n", reason.as_str(), one_line(detail)),
         None => format!("{}\n{at}\n", reason.as_str()),
     };
-    let _ = fs::write(paths.stop_marker(), line);
+    let _ = private_fs::write(&paths.stop_marker(), line.as_bytes());
 }
 
 /// Squeezes a detail onto one line, because the marker is line-delimited and a
@@ -311,7 +304,7 @@ pub fn stop_report(paths: &SessionPaths) -> Result<Option<SamplerStop>> {
     Ok(None)
 }
 fn read_stop_marker(paths: &SessionPaths) -> Option<SamplerStop> {
-    let raw = fs::read_to_string(paths.stop_marker()).ok()?;
+    let raw = private_fs::read_to_string(&paths.stop_marker()).ok()?;
     let mut lines = raw.lines();
     let reason = StopReason::parse(lines.next()?.trim());
     Some(SamplerStop {
@@ -1327,7 +1320,7 @@ pub fn is_running(paths: &SessionPaths) -> bool {
 }
 
 pub fn read_pid(paths: &SessionPaths) -> Option<i32> {
-    fs::read_to_string(paths.pid_file())
+    private_fs::read_to_string(&paths.pid_file())
         .ok()?
         .trim()
         .parse::<i32>()
@@ -1338,7 +1331,11 @@ pub fn read_pid(paths: &SessionPaths) -> Option<i32> {
 fn publish_pid(paths: &SessionPaths, pid: u32) -> Result<()> {
     let target = paths.pid_file();
     let temp = paths.state_dir.join("sampler.pid.tmp");
-    write_marker(&temp, &pid.to_string())?;
+    let _ = fs::remove_file(&temp);
+    let mut file = private_fs::create_new(&temp)?;
+    file.write_all(pid.to_string().as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&temp, &target).map_err(|err| {
         format!(
             "cannot publish sampler pid from {} to {}: {err}",
@@ -1364,7 +1361,7 @@ fn remove_pid_if_equals(paths: &SessionPaths, expected: i32) {
 }
 
 pub fn is_enabled(paths: &SessionPaths) -> bool {
-    paths.enabled_flag().exists()
+    private_fs::read(&paths.enabled_flag()).is_ok()
 }
 
 pub fn mark_enabled(paths: &SessionPaths, enabled: bool) -> Result<()> {
@@ -1382,8 +1379,5 @@ pub fn mark_enabled(paths: &SessionPaths, enabled: bool) -> Result<()> {
 }
 
 fn write_marker(path: &Path, contents: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, contents)
+    private_fs::write(path, contents.as_bytes())
 }
