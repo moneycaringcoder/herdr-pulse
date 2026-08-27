@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -385,6 +385,10 @@ fn exists(path: &Path) -> bool {
     path.exists()
 }
 
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 fn await_file(path: &Path, timeout: Duration, predicate: impl Fn(&str) -> bool) -> Option<String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -591,6 +595,9 @@ fn remembered_default_socket_survives_later_xdg_changes() {
         std::fs::read(dirs.state().join("default.socket")).unwrap(),
         default_socket.as_os_str().as_bytes()
     );
+    assert_eq!(mode(&dirs.state()), 0o700);
+    assert_eq!(mode(&dirs.state().join("default.socket")), 0o600);
+    assert_eq!(mode(&dirs.state().join("default.socket.lock")), 0o600);
 
     let different_config = dirs.root.join("different-config");
     env.set("XDG_CONFIG_HOME", &different_config);
@@ -603,8 +610,7 @@ fn remembered_default_socket_survives_later_xdg_changes() {
     let read_only =
         config::SessionPaths::resolve().expect("an existing marker needs no writable lock");
     assert_eq!(read_only.state_dir, dirs.state());
-    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o755))
-        .expect("restore state root");
+    assert_eq!(mode(&dirs.state()), 0o700);
 
     let different_socket = different_config.join("herdr/herdr.sock");
     std::env::set_var("HERDR_SOCKET_PATH", &different_socket);
@@ -1053,31 +1059,61 @@ fn a_successors_marker_is_never_deleted_by_someone_elses_cleanup() {
 }
 
 #[test]
-fn an_unwritable_state_dir_is_reported_without_panicking() {
+fn private_state_permissions_are_repaired_before_marker_writes() {
     let _guard = env_lock();
-    let dirs = TempDirs::new("readonly");
+    let dirs = TempDirs::new("private-modes");
     let paths = dirs.paths();
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipping: root ignores directory permissions");
-        return;
-    }
-    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("make legacy state permissive");
+    std::fs::write(paths.enabled_flag(), b"legacy").expect("legacy marker");
+    std::fs::set_permissions(paths.enabled_flag(), std::fs::Permissions::from_mode(0o644))
+        .expect("make legacy marker permissive");
 
-    // Marker writes remain non-panicking. Status reads do not create/open lock
-    // files, so an unwritable empty state reports no published sampler.
-    let _ = std::fs::write(paths.pid_file(), std::process::id().to_string());
-    let _ = daemon::mark_enabled(&paths, true);
+    daemon::mark_enabled(&paths, true).expect("rewrite marker privately");
+    daemon::record_failure(&paths, "private marker");
 
-    assert!(!exists(&paths.pid_file()));
-    assert!(!daemon::is_enabled(&paths));
-    assert_eq!(daemon::read_pid(&paths), None);
-    assert_eq!(daemon::live_pid(&paths).expect("status read"), None);
-    // And clearing markers that were never written is still quiet.
-    remove_pid_file(&paths);
-    daemon::mark_enabled(&paths, false).expect("clear missing marker");
+    assert_eq!(
+        std::fs::metadata(&paths.state_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(paths.enabled_flag())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(mode(&paths.stop_marker()), 0o600);
+    assert!(daemon::is_enabled(&paths));
+}
 
-    std::fs::set_permissions(dirs.state(), std::fs::Permissions::from_mode(0o755))
-        .expect("restore");
+#[test]
+fn state_marker_symlinks_are_never_followed() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("marker-symlink");
+    let paths = dirs.paths();
+    let victim = dirs.root.join("victim");
+    std::fs::write(&victim, b"do not touch").expect("victim");
+    symlink(&victim, paths.enabled_flag()).expect("enabled symlink");
+    symlink(&victim, paths.stop_marker()).expect("stop symlink");
+
+    assert!(daemon::mark_enabled(&paths, true).is_err());
+    daemon::record_failure(&paths, "must not escape");
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(std::fs::symlink_metadata(paths.enabled_flag())
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(std::fs::symlink_metadata(paths.stop_marker())
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,6 +1359,22 @@ fn concurrent_enables_publish_one_same_session_owner() {
         contents.contains("label-old")
     })
     .expect("the sole owner sampled");
+    for directory in [
+        paths.state_root.clone(),
+        paths.state_root.join("sessions"),
+        paths.state_dir.clone(),
+    ] {
+        assert_eq!(mode(&directory), 0o700, "{}", directory.display());
+    }
+    for file in [
+        paths.pid_file(),
+        paths.enabled_flag(),
+        paths.owner_lock(),
+        paths.control_lock(),
+        paths.history_file(),
+    ] {
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+    }
 }
 
 #[test]

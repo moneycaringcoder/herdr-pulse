@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::non_empty_env;
 use crate::model::Tone;
+use crate::private_fs;
 use crate::Result;
 
 const SECTION: &str = "[ui.sidebar.spaces]";
@@ -287,7 +288,7 @@ pub fn run_setup() -> Result<()> {
                 )
                 .into());
             }
-            let saved_original = fs::read_to_string(&backup)?;
+            let saved_original = private_fs::read_to_string(&backup)?;
             let transaction = load_transaction(&backup, &metadata, &saved_original)?;
             if transaction.installed != original {
                 return Err(format!(
@@ -439,7 +440,7 @@ pub fn run_rollback() -> Result<()> {
     }
 
     let current = fs::read_to_string(&target)?;
-    let original = fs::read_to_string(&backup)?;
+    let original = private_fs::read_to_string(&backup)?;
     let installed = load_transaction(&backup, &metadata, &original)?.installed;
     if current == original {
         remove_transaction(&backup, &metadata)?;
@@ -496,7 +497,7 @@ pub fn run_rollback() -> Result<()> {
 
 fn load_transaction(backup: &Path, metadata: &Path, original: &str) -> Result<SetupTransaction> {
     if metadata.exists() {
-        let raw = fs::read(metadata)?;
+        let raw = private_fs::read(metadata)?;
         let transaction: SetupTransaction = serde_json::from_slice(&raw)
             .map_err(|err| format!("{} is not valid setup metadata: {err}", metadata.display()))?;
         if transaction.version != TRANSACTION_VERSION {
@@ -538,7 +539,7 @@ fn mark_transaction_reloaded(metadata: &Path) -> Result<()> {
     if !metadata.exists() {
         return Ok(());
     }
-    let mut transaction: SetupTransaction = serde_json::from_slice(&fs::read(metadata)?)
+    let mut transaction: SetupTransaction = serde_json::from_slice(&private_fs::read(metadata)?)
         .map_err(|err| format!("{} is not valid setup metadata: {err}", metadata.display()))?;
     transaction.reloaded = true;
     atomic_replace(metadata, &serde_json::to_vec(&transaction)?)

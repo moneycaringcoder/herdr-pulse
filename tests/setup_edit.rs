@@ -369,6 +369,22 @@ fn setup_and_safe_rollback_are_complete_transactions() {
     assert_eq!(metadata["original"], ORIGINAL);
     assert_eq!(metadata["installed"], edited(ORIGINAL));
     assert_eq!(metadata["reloaded"], true);
+    assert_eq!(
+        std::fs::metadata(harness.backup())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(harness.metadata())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     let repeated = harness.run(&["--setup"], 9, "must not be called");
     assert!(repeated.status.success(), "{}", stderr(&repeated));
     assert_eq!(
@@ -536,7 +552,21 @@ fn existing_or_legacy_recovery_files_are_never_clobbered() {
 fn legacy_backup_without_metadata_remains_rollback_compatible() {
     let harness = SetupHarness::new("legacy");
     std::fs::write(harness.backup(), ORIGINAL).unwrap();
+    std::fs::set_permissions(harness.backup(), std::fs::Permissions::from_mode(0o644))
+        .expect("legacy mode");
     std::fs::write(&harness.config, edited(ORIGINAL)).unwrap();
+
+    let repeated = harness.run(&["--setup"], 9, "must not reload");
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    assert_eq!(
+        std::fs::metadata(harness.backup())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(harness.log().is_empty());
 
     let rollback = harness.run(&["--setup-rollback"], 0, "");
 

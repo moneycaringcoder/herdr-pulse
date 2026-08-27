@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod herdr;
 pub mod history;
 pub mod model;
+pub(crate) mod private_fs;
 pub mod render;
 pub mod setup;
 pub mod supervise;

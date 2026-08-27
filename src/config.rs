@@ -2,13 +2,14 @@
 //! us. Owned by the integrator; the other modules read it, none of them change
 //! it.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::private_fs;
 use crate::Result;
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.pulse";
@@ -475,7 +476,13 @@ impl SessionPaths {
         may_initialize_default: bool,
     ) -> Result<Self> {
         target.is_default = stable_default_classification(&target, may_initialize_default)?;
-        Ok(Self::for_socket(&target))
+        let paths = Self::for_socket(&target);
+        private_fs::ensure_dir(&paths.state_root)?;
+        if paths.scope_key.is_some() {
+            private_fs::ensure_dir(&paths.state_root.join("sessions"))?;
+            private_fs::ensure_dir(&paths.state_dir)?;
+        }
+        Ok(paths)
     }
 
     pub fn for_socket(target: &crate::herdr::SocketTarget) -> Self {
@@ -556,7 +563,7 @@ fn stable_default_classification(
         return Ok(is_default);
     }
 
-    fs::create_dir_all(&root)?;
+    private_fs::ensure_dir(&root)?;
     let _guard = lock_default_marker(&root)?;
     if let Some(is_default) = read_default_marker(&marker, &target.path)? {
         return Ok(is_default);
@@ -573,11 +580,7 @@ fn stable_default_classification(
         let temp = root.join(DEFAULT_SOCKET_TEMP);
         let _ = fs::remove_file(&temp);
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .truncate(false)
-                .open(&temp)?;
+            let mut file = private_fs::create_new(&temp)?;
             file.write_all(target.path.as_os_str().as_bytes())?;
             file.sync_all()?;
             fs::rename(&temp, &marker)?;
@@ -616,7 +619,7 @@ fn stable_default_classification(
 }
 
 fn read_default_marker(marker: &Path, socket: &Path) -> Result<Option<bool>> {
-    match fs::read(marker) {
+    match private_fs::read(marker) {
         Ok(recorded) if !recorded.is_empty() => Ok(Some(recorded == socket.as_os_str().as_bytes())),
         Ok(_) => Err(format!(
             "{} is empty; refusing to guess the default socket",
@@ -629,12 +632,7 @@ fn read_default_marker(marker: &Path, socket: &Path) -> Result<Option<bool>> {
 }
 
 fn lock_default_marker(root: &Path) -> Result<fs::File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join(DEFAULT_SOCKET_LOCK))?;
+    let file = private_fs::open(&root.join(DEFAULT_SOCKET_LOCK))?;
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
             return Ok(file);
