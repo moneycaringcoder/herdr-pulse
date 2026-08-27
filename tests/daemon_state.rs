@@ -14,12 +14,16 @@
 //! have a width the store could never emit.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 
 use pulse::config::{self, Config, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
 use pulse::daemon::{self, BadgeOp, WorkspaceBadge};
@@ -86,6 +90,10 @@ impl TempDirs {
     fn state(&self) -> PathBuf {
         self.root.join("state")
     }
+
+    fn config(&self) -> PathBuf {
+        self.root.join("config")
+    }
 }
 
 impl Drop for TempDirs {
@@ -103,6 +111,165 @@ impl Drop for TempDirs {
     }
 }
 
+/// A repeating Herdr socket for the real sampler binary.
+///
+/// The workspace can change while the server stays bound, which lets the
+/// forget regression distinguish history loaded before the action from samples
+/// recorded by the restarted daemon afterward.
+struct SamplerServer {
+    path: PathBuf,
+    workspace: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SamplerServer {
+    fn start(root: &Path) -> Self {
+        let path = root.join("herdr.sock");
+        let listener = UnixListener::bind(&path).expect("bind sampler socket");
+        listener.set_nonblocking(true).expect("nonblocking socket");
+        let workspace = Arc::new(Mutex::new("old".to_string()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let workspace = Arc::clone(&workspace);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let (stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let mut line = String::new();
+                    if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value =
+                        serde_json::from_str(line.trim_end()).expect("sampler request");
+                    let id = request["id"].clone();
+                    let response = match request["method"].as_str() {
+                        Some("session.snapshot") => {
+                            let workspace = workspace.lock().expect("workspace").clone();
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "type": "session_snapshot",
+                                    "snapshot": {
+                                        "workspaces": [{
+                                            "workspace_id": workspace,
+                                            "label": format!("label-{workspace}"),
+                                            "worktree": {
+                                                "checkout_path": format!("/work/{workspace}")
+                                            }
+                                        }],
+                                        "agents": [{
+                                            "workspace_id": workspace,
+                                            "pane_id": format!("{workspace}:p1"),
+                                            "agent": "claude",
+                                            "agent_status": "working",
+                                            "state_change_seq": 1
+                                        }],
+                                        "panes": [],
+                                        "tabs": [],
+                                        "layouts": [],
+                                        "focused_workspace_id": workspace,
+                                        "focused_tab_id": null,
+                                        "focused_pane_id": null
+                                    }
+                                }
+                            })
+                        }
+                        Some("workspace.report_metadata") => {
+                            json!({"id": id, "result": {"type": "ok"}})
+                        }
+                        method => json!({
+                            "id": id,
+                            "error": {
+                                "code": "unexpected_method",
+                                "message": format!("unexpected method {method:?}")
+                            }
+                        }),
+                    };
+                    let mut stream = &stream;
+                    let _ = writeln!(stream, "{response}");
+                    let _ = stream.flush();
+                }
+            })
+        };
+        Self {
+            path,
+            workspace,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn set_workspace(&self, workspace: &str) {
+        *self.workspace.lock().expect("workspace") = workspace.to_string();
+    }
+
+    fn command(&self, dirs: &TempDirs) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pulse"));
+        command
+            .env("HERDR_PLUGIN_STATE_DIR", dirs.state())
+            .env("HERDR_PLUGIN_CONFIG_DIR", dirs.config())
+            .env("HERDR_SOCKET_PATH", &self.path)
+            .env("HERDR_PLUGIN_ID", "moneycaringcoder.pulse")
+            .env("HOME", dirs.root.join("home"));
+        command
+    }
+}
+
+impl Drop for SamplerServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Owns every sampler pid recorded in the test state directory.
+///
+/// `--forget` replaces the direct child with a detached grandchild, so cleanup
+/// follows the pid marker rather than assuming the process first spawned is
+/// still the owner.
+struct SamplerProcess {
+    initial_reaper: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SamplerProcess {
+    fn new(mut child: Child) -> Self {
+        Self {
+            // Reap concurrently. A zombie still answers `kill(pid, 0)`, so the
+            // separate `pulse --forget` process would otherwise wait out its
+            // stop timeout even though the sampler had already exited.
+            initial_reaper: Some(std::thread::spawn(move || {
+                let _ = child.wait();
+            })),
+        }
+    }
+}
+
+impl Drop for SamplerProcess {
+    fn drop(&mut self) {
+        if let Some(pid) = daemon::read_pid() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            if !await_death(pid, Duration::from_secs(2)) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let _ = await_death(pid, Duration::from_secs(2));
+            }
+        }
+        if let Some(reaper) = self.initial_reaper.take() {
+            let _ = reaper.join();
+        }
+        daemon::clear_pid_file();
+    }
+}
+
 fn write_pid_file(contents: &str) {
     std::fs::write(config::pid_file(), contents).expect("write pid file");
 }
@@ -111,6 +278,18 @@ fn exists(path: &Path) -> bool {
     path.exists()
 }
 
+fn await_file(path: &Path, timeout: Duration, predicate: impl Fn(&str) -> bool) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if predicate(&contents) {
+                return Some(contents);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
 /// A pid that is guaranteed dead: a child we have already reaped. Immediate
 /// reuse by another process is vanishingly unlikely within one test.
 fn reaped_pid() -> u32 {
@@ -779,6 +958,80 @@ fn enable_rejects_a_bad_value_before_changing_any_state() {
             "and nothing is spawned either: {args:?}"
         );
     }
+}
+
+#[test]
+fn forgetting_while_stopped_does_not_start_or_enable_the_sampler() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("forget-stopped");
+    std::fs::write(dirs.state().join("history.json"), b"recorded").expect("history");
+
+    daemon::forget_history().expect("forget stopped history");
+
+    assert!(!dirs.state().join("history.json").exists());
+    assert!(!daemon::is_enabled());
+    assert!(!config::pid_file().exists());
+}
+
+#[test]
+fn forgetting_while_sampling_cannot_resurrect_the_loaded_history() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("forget-live");
+    std::fs::write(
+        dirs.config().join("config.json"),
+        r#"{"interval_seconds":1,"bucket_seconds":10}"#,
+    )
+    .expect("sampler config");
+    let server = SamplerServer::start(&dirs.root);
+    daemon::mark_enabled(true);
+
+    let child = server
+        .command(&dirs)
+        .arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start real sampler");
+    let _sampler = SamplerProcess::new(child);
+    let history_file = dirs.state().join("history.json");
+    await_file(&history_file, Duration::from_secs(5), |contents| {
+        contents.contains("label-old") && contents.contains("/work/old")
+    })
+    .expect("the first daemon persisted its in-memory history");
+    let original_pid = daemon::read_pid().expect("the first daemon recorded its pid");
+
+    server.set_workspace("new");
+    let output = server
+        .command(&dirs)
+        .arg("--forget")
+        .output()
+        .expect("run forget action");
+    assert!(
+        output.status.success(),
+        "forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("sampler restarted"),
+        "success is reported only after restart: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let after = await_file(&history_file, Duration::from_secs(5), |contents| {
+        contents.contains("label-new") && contents.contains("/work/new")
+    })
+    .expect("the restarted daemon persisted a new sample");
+    assert!(
+        !after.contains("label-old") && !after.contains("/work/old"),
+        "the pre-forget in-memory store must not return: {after}"
+    );
+    assert!(daemon::is_enabled(), "the user's enabled choice survives");
+    assert_ne!(
+        daemon::read_pid(),
+        Some(original_pid),
+        "the process holding the old in-memory store was replaced"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //!
 //! Verb dispatch only; every verb is implemented in the library crate.
 
-use pulse::{config, daemon, history, render, setup, supervise, Result};
+use pulse::{config, daemon, render, setup, supervise, Result};
 
 const USAGE: &str = "\
 pulse — agent activity history and sparklines for herdr
@@ -106,7 +106,7 @@ fn run(args: &[String]) -> Result<()> {
         // an error that ends the run is a reason a gap can carry, and losing it
         // would leave the run indistinguishable from one that was killed.
         "--daemon" => daemon::run_daemon(&config::load_with_args(args)?),
-        "--forget" => history::forget(),
+        "--forget" => daemon::forget_history(),
         "--setup" => setup::run_setup(),
         "--setup-rollback" => setup::run_rollback(),
         "--supervise" => supervise::install(args),

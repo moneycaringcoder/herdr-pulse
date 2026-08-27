@@ -588,6 +588,31 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
+/// Restores the unit's boot/login registration without starting another
+/// sampler now.
+///
+/// Used only after a destructive lifecycle transaction deactivated the unit but
+/// could not stop the process it found. Calling [`start`] there could create a
+/// second writer beside the wedged first one; restoring registration alone
+/// preserves the next-login behavior without risking concurrent history writes.
+pub fn restore_start_at_login() -> Result<()> {
+    let supervisor = Supervisor::current().ok_or(UNSUPPORTED)?;
+    run(&start_at_login_step(supervisor, uid()))
+}
+
+fn start_at_login_step(supervisor: Supervisor, uid: u32) -> Step {
+    match supervisor {
+        Supervisor::Systemd => {
+            let unit = supervisor.unit_name();
+            Step::required(&["systemctl", "--user", "enable", &unit])
+        }
+        Supervisor::Launchd => {
+            let target = format!("gui/{uid}/{LABEL}");
+            Step::required(&["launchctl", "enable", &target])
+        }
+    }
+}
+
 fn deactivation() -> Result<Vec<Step>> {
     Ok(lifecycle_steps()?.1)
 }
@@ -637,4 +662,26 @@ fn capture(step: &Step) -> Result<String> {
         return Err(format!("`{}` failed: {}", step.argv.join(" "), stderr.trim()).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoring_registration_never_starts_a_second_sampler() {
+        assert_eq!(
+            start_at_login_step(Supervisor::Systemd, 501).argv,
+            [
+                "systemctl",
+                "--user",
+                "enable",
+                "dev.herdr.pulse.sampler.service"
+            ]
+        );
+        assert_eq!(
+            start_at_login_step(Supervisor::Launchd, 501).argv,
+            ["launchctl", "enable", "gui/501/dev.herdr.pulse.sampler"]
+        );
+    }
 }
