@@ -540,9 +540,9 @@ history fits into a handful of columns. At the default 5-second interval, twelve
 samples land in each bucket, so a bucket can distinguish activity to about 8%.
 
 **240 buckets = 4 hours.** Enough to cover "since lunch", which is the longest
-span anyone asks this question about. The ring is allocated at this length and
-never grows, so the history file's size has a ceiling that does not depend on
-uptime.
+span anyone asks this question about. The ring allocation never grows with
+uptime. Encoded byte length still scales with retained workspace labels, paths,
+pane ids and session evidence rather than pretending protocol strings are free.
 
 **168 hourly buckets = 7 days.** The configurable fine ring answers what
 happened over the last few hours; the fixed week ring answers whether a
@@ -584,6 +584,20 @@ cycle — cheap enough that the finer resolution is worth having.
 
 - The sampler is a detached background process. It keeps running after herdr
   exits until you run `pulse --disable`.
+- The ten-workspace default benchmark encodes 223,818 bytes (about 224 KB). At
+  the default five-second interval Pulse submits 17,280 complete JSON
+  writes/renames, about 3.87 GB/day; shorter intervals and per-agent rings scale
+  that upward. The current path performs **zero explicit history file or
+  directory syncs**, letting the kernel coalesce physical writeback instead of
+  forcing 17,280 file flushes/day. Application-submitted bytes are not the same
+  as SSD media writes.
+- Atomic same-directory rename preserves complete generations for live readers
+  and process crashes: SIGKILL before rename leaves the prior target, after
+  rename exposes the new target from the running kernel's page cache. Pulse
+  claims no bounded power-loss/kernel-crash recovery; the old file-only
+  `sync_all` had no parent-directory sync and did not provide one either.
+  Deferred writeback/ENOSPC errors may surface after Pulse can report them;
+  missing/corrupt history still recovers loudly as empty, never as quiet.
 - Badges are pushed with a TTL of three refresh cycles, so they self-clear if the
   sampler is killed rather than lingering as stale claims.
 - herdr's workspace ids are session-scoped and can be reused. History is keyed on

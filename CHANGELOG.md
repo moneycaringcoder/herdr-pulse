@@ -40,6 +40,15 @@ All notable changes to this project are documented here. The format follows
   `0700` and files to `0600`, and refuses final symlinks so legacy/custom state
   cannot redirect writes outside the plugin root.
 
+### Changed
+
+- Per-cycle history persistence keeps the same private temp-file/atomic-rename
+  checkpoint and format but no longer forces `sync_all` on the complete store.
+  This removes 17,280 explicit file flushes/day at the default interval while
+  preserving complete generations and the at-most-one-in-flight-interval
+  process-crash contract. Application write volume is unchanged, and no
+  power-loss durability bound is claimed.
+
 ## [0.1.1] - 2026-08-23
 
 ### Added

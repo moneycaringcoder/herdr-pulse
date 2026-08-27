@@ -1932,7 +1932,7 @@ pub fn save_to(dir: &Path, history: &History) -> std::io::Result<()> {
     // The temp file has to be in the same directory: `rename` is only atomic
     // within a filesystem, and a temp dir elsewhere would silently degrade to a
     // copy that can be interrupted halfway.
-    if let Err(err) = write_all_synced(&temp, &encoded) {
+    if let Err(err) = write_all(&temp, &encoded) {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
@@ -1945,14 +1945,14 @@ pub fn save_to(dir: &Path, history: &History) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes and flushes to the platter before returning, so the rename cannot
-/// commit a name that points at unwritten bytes.
-fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes one complete generation to the private temp inode. The following
+/// rename is the live/process-crash linearization point; no synchronous device
+/// flush is claimed here.
+fn write_all(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let mut file = private_fs::create_new(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    file.write_all(bytes)
 }
 
 /// Deletes this socket namespace's recorded history.
