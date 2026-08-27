@@ -48,6 +48,10 @@ All notable changes to this project are documented here. The format follows
   preserving complete generations and the at-most-one-in-flight-interval
   process-crash contract. Application write volume is unchanged, and no
   power-loss durability bound is claimed.
+- Herdr 0.8.2/protocol 20 is now qualified by a sanitized live snapshot and its
+  complete generated schema, both exercised in tests; Herdr 0.8.0/protocol 19
+  remains the measured compatibility floor. Contributor docs now match all four
+  CI gates and record the observed issue/PR/release-PR/tag publication flow.
 
 ## [0.1.1] - 2026-08-23
 
@@ -242,5 +246,6 @@ against a live server, and both shaped the design:
 
 Both are written up in `docs/herdr-protocol.md`.
 
-[Unreleased]: https://github.com/moneycaringcoder/herdr-pulse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/moneycaringcoder/herdr-pulse/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/moneycaringcoder/herdr-pulse/releases/tag/v0.1.1
 [0.1.0]: https://github.com/moneycaringcoder/herdr-pulse/releases/tag/v0.1.0

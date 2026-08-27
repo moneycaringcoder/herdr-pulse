@@ -8,13 +8,12 @@
 //!
 //! # Why the fixture, and not a hand-written reply
 //!
-//! Every snapshot reply here is built from `tests/data/snapshot-live.json`, a
-//! real `session.snapshot` response captured from a live herdr 0.8.0 server with
-//! its values sanitised and its structure left byte-exact. The reference plugin
-//! this one is modelled on passed its entire suite while being wrong, because
-//! its fake server answered in the shape the client expected rather than the
-//! shape herdr actually sends. A fixture is the only fake that cannot drift
-//! toward the code it is testing.
+//! Protocol-floor tests use `snapshot-live.json`, a real Herdr 0.8.0/protocol-19
+//! response. Stable-current qualification also exercises
+//! `snapshot-live-0.8.2.json`, captured from Herdr 0.8.2/protocol 20. Both keep
+//! the server's keys, nesting, types and optional-field distribution; only
+//! identifying strings are sanitized. Hand-written replies previously let the
+//! reference plugin pass while reading the arrays from the wrong level.
 //!
 //! No running herdr is required, and nothing here touches the user's state.
 
@@ -34,6 +33,7 @@ const SOURCE: &str = "test.pulse";
 
 /// The captured response, whole: `{"id":..., "result":{"type":..., "snapshot":{...}}}`.
 const LIVE_SNAPSHOT: &str = include_str!("data/snapshot-live.json");
+const STABLE_SNAPSHOT: &str = include_str!("data/snapshot-live-0.8.2.json");
 
 fn live_response() -> Value {
     serde_json::from_str(LIVE_SNAPSHOT).expect("the fixture is JSON")
@@ -42,6 +42,14 @@ fn live_response() -> Value {
 /// The `result` object of the captured response — what `reduce_snapshot` takes.
 fn live_result() -> Value {
     live_response()["result"].clone()
+}
+
+fn stable_response() -> Value {
+    serde_json::from_str(STABLE_SNAPSHOT).expect("the protocol-20 fixture is JSON")
+}
+
+fn stable_result() -> Value {
+    stable_response()["result"].clone()
 }
 
 /// `HERDR_SOCKET_PATH` and `HERDR_PLUGIN_ID` are process-global, so the tests
@@ -230,6 +238,10 @@ fn notification_reply() -> Reply {
 /// reads cannot catch the client reading the wrong thing.
 fn live_reply() -> Reply {
     Reply::Line(live_response().to_string())
+}
+
+fn stable_reply() -> Reply {
+    Reply::Line(stable_response().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +681,31 @@ fn the_error_names_the_result_type_it_actually_saw() {
 // ---------------------------------------------------------------------------
 // Reduction: the captured session, read field by field
 // ---------------------------------------------------------------------------
+
+#[test]
+fn the_stable_protocol_20_capture_works_over_the_real_wire_client() {
+    let response = stable_response();
+    assert_eq!(response["result"]["snapshot"]["version"], "0.8.2");
+    assert_eq!(response["result"]["snapshot"]["protocol"], 20);
+    let reduced = reduce_snapshot(&stable_result(), None, 42).expect("protocol-20 reduction");
+    assert_eq!(reduced.workspaces.len(), 5);
+    assert_eq!(
+        reduced
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.agents.len())
+            .sum::<usize>(),
+        4
+    );
+
+    let _guard = env_lock();
+    let server = TestServer::start(vec![stable_reply()]);
+    let mut client = server.client();
+    let sample = client.sample(42).expect("protocol-20 socket sample");
+    assert_eq!(sample.workspaces, reduced.workspaces);
+    assert_eq!(sample.taken_at, reduced.taken_at);
+    assert_eq!(server.only_request()["method"], "session.snapshot");
+}
 
 #[test]
 fn the_captured_session_reduces_to_its_recorded_workspaces() {

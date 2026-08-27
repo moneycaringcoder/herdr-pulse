@@ -1,0 +1,725 @@
+{
+  "id": "fixture:snapshot",
+  "result": {
+    "snapshot": {
+      "agents": [
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-1",
+          "focused": true,
+          "foreground_cwd": "/home/dev/repos/workspace-1",
+          "pane_id": "w1:p2",
+          "revision": 325785,
+          "screen_detection_skipped": true,
+          "state_change_seq": 101,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_0002",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w1"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "working",
+          "cwd": "/home/dev/repos/workspace-2",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-2",
+          "pane_id": "w2:p2",
+          "revision": 124421,
+          "screen_detection_skipped": true,
+          "state_change_seq": 90,
+          "tab_id": "w2:t1",
+          "terminal_id": "term_0004",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w2"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-3",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-3",
+          "pane_id": "w3:p2",
+          "revision": 45314,
+          "screen_detection_skipped": true,
+          "state_change_seq": 99,
+          "tab_id": "w3:t1",
+          "terminal_id": "term_0006",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w3"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-4",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-4",
+          "pane_id": "w4:p2",
+          "revision": 97502,
+          "screen_detection_skipped": true,
+          "state_change_seq": 100,
+          "tab_id": "w4:t1",
+          "terminal_id": "term_0008",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w4"
+        }
+      ],
+      "focused_pane_id": "w1:p2",
+      "focused_tab_id": "w1:t1",
+      "focused_workspace_id": "w1",
+      "layouts": [
+        {
+          "area": {
+            "height": 77,
+            "width": 160,
+            "x": 22,
+            "y": 1
+          },
+          "focused_pane_id": "w1:p2",
+          "panes": [
+            {
+              "focused": false,
+              "pane_id": "w1:p1",
+              "rect": {
+                "height": 77,
+                "width": 26,
+                "x": 22,
+                "y": 1
+              }
+            },
+            {
+              "focused": true,
+              "pane_id": "w1:p2",
+              "rect": {
+                "height": 77,
+                "width": 134,
+                "x": 48,
+                "y": 1
+              }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "node-1",
+              "ratio": 0.16554049,
+              "rect": {
+                "height": 77,
+                "width": 160,
+                "x": 22,
+                "y": 1
+              }
+            }
+          ],
+          "tab_id": "w1:t1",
+          "workspace_id": "w1",
+          "zoomed": false
+        },
+        {
+          "area": {
+            "height": 77,
+            "width": 160,
+            "x": 22,
+            "y": 1
+          },
+          "focused_pane_id": "w2:p2",
+          "panes": [
+            {
+              "focused": false,
+              "pane_id": "w2:p1",
+              "rect": {
+                "height": 77,
+                "width": 26,
+                "x": 22,
+                "y": 1
+              }
+            },
+            {
+              "focused": true,
+              "pane_id": "w2:p2",
+              "rect": {
+                "height": 77,
+                "width": 134,
+                "x": 48,
+                "y": 1
+              }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "node-1",
+              "ratio": 0.16250001,
+              "rect": {
+                "height": 77,
+                "width": 160,
+                "x": 22,
+                "y": 1
+              }
+            }
+          ],
+          "tab_id": "w2:t1",
+          "workspace_id": "w2",
+          "zoomed": false
+        },
+        {
+          "area": {
+            "height": 77,
+            "width": 160,
+            "x": 22,
+            "y": 1
+          },
+          "focused_pane_id": "w3:p2",
+          "panes": [
+            {
+              "focused": false,
+              "pane_id": "w3:p1",
+              "rect": {
+                "height": 77,
+                "width": 26,
+                "x": 22,
+                "y": 1
+              }
+            },
+            {
+              "focused": true,
+              "pane_id": "w3:p2",
+              "rect": {
+                "height": 77,
+                "width": 134,
+                "x": 48,
+                "y": 1
+              }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "node-1",
+              "ratio": 0.16250001,
+              "rect": {
+                "height": 77,
+                "width": 160,
+                "x": 22,
+                "y": 1
+              }
+            }
+          ],
+          "tab_id": "w3:t1",
+          "workspace_id": "w3",
+          "zoomed": false
+        },
+        {
+          "area": {
+            "height": 77,
+            "width": 160,
+            "x": 22,
+            "y": 1
+          },
+          "focused_pane_id": "w4:p2",
+          "panes": [
+            {
+              "focused": false,
+              "pane_id": "w4:p1",
+              "rect": {
+                "height": 77,
+                "width": 24,
+                "x": 22,
+                "y": 1
+              }
+            },
+            {
+              "focused": true,
+              "pane_id": "w4:p2",
+              "rect": {
+                "height": 77,
+                "width": 136,
+                "x": 46,
+                "y": 1
+              }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "node-1",
+              "ratio": 0.15,
+              "rect": {
+                "height": 77,
+                "width": 160,
+                "x": 22,
+                "y": 1
+              }
+            }
+          ],
+          "tab_id": "w4:t1",
+          "workspace_id": "w4",
+          "zoomed": false
+        },
+        {
+          "area": {
+            "height": 77,
+            "width": 160,
+            "x": 22,
+            "y": 1
+          },
+          "focused_pane_id": "w5:p2",
+          "panes": [
+            {
+              "focused": false,
+              "pane_id": "w5:p1",
+              "rect": {
+                "height": 77,
+                "width": 24,
+                "x": 22,
+                "y": 1
+              }
+            },
+            {
+              "focused": true,
+              "pane_id": "w5:p2",
+              "rect": {
+                "height": 77,
+                "width": 136,
+                "x": 46,
+                "y": 1
+              }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "node-1",
+              "ratio": 0.15,
+              "rect": {
+                "height": 77,
+                "width": 160,
+                "x": 22,
+                "y": 1
+              }
+            }
+          ],
+          "tab_id": "w5:t1",
+          "workspace_id": "w5",
+          "zoomed": false
+        }
+      ],
+      "panes": [
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-1",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-1",
+          "label": "workspace-1",
+          "pane_id": "w1:p1",
+          "revision": 33902,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w1:t1",
+          "terminal_id": "term_0001",
+          "tokens": {
+            "herdr-sidebar-explorer": "files",
+            "herdr-sidebar-git": "git"
+          },
+          "workspace_id": "w1"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-1",
+          "focused": true,
+          "foreground_cwd": "/home/dev/repos/workspace-1",
+          "pane_id": "w1:p2",
+          "revision": 325785,
+          "scroll": {
+            "max_offset_from_bottom": 4550,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w1:t1",
+          "terminal_id": "term_0002",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-2",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-2",
+          "label": "workspace-2",
+          "pane_id": "w2:p1",
+          "revision": 6778,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w2:t1",
+          "terminal_id": "term_0003",
+          "tokens": {
+            "herdr-sidebar-explorer": "files",
+            "herdr-sidebar-git": "git"
+          },
+          "workspace_id": "w2"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "working",
+          "cwd": "/home/dev/repos/workspace-2",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-2",
+          "pane_id": "w2:p2",
+          "revision": 124421,
+          "scroll": {
+            "max_offset_from_bottom": 8306,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w2:t1",
+          "terminal_id": "term_0004",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w2"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-3",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-3",
+          "label": "workspace-3",
+          "pane_id": "w3:p1",
+          "revision": 6658,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w3:t1",
+          "terminal_id": "term_0005",
+          "tokens": {
+            "herdr-sidebar-explorer": "files",
+            "herdr-sidebar-git": "git"
+          },
+          "workspace_id": "w3"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-3",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-3",
+          "pane_id": "w3:p2",
+          "revision": 45314,
+          "scroll": {
+            "max_offset_from_bottom": 1002,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w3:t1",
+          "terminal_id": "term_0006",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w3"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-4",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-4",
+          "label": "workspace-4",
+          "pane_id": "w4:p1",
+          "revision": 3796,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w4:t1",
+          "terminal_id": "term_0007",
+          "tokens": {
+            "herdr-sidebar-explorer": "files",
+            "herdr-sidebar-git": "git"
+          },
+          "workspace_id": "w4"
+        },
+        {
+          "agent": "omp",
+          "agent_session": {
+            "agent": "omp",
+            "kind": "path",
+            "source": "herdr:omp",
+            "value": "/home/dev/.agent/sessions/session.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/repos/workspace-4",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-4",
+          "pane_id": "w4:p2",
+          "revision": 97502,
+          "scroll": {
+            "max_offset_from_bottom": 5237,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w4:t1",
+          "terminal_id": "term_0008",
+          "terminal_title": "agent session",
+          "terminal_title_stripped": "agent session",
+          "tokens": {
+            "context": "context",
+            "limit": "limit",
+            "provider": "provider",
+            "title": "tab"
+          },
+          "workspace_id": "w4"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-5",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-5",
+          "label": "workspace-5",
+          "pane_id": "w5:p1",
+          "revision": 3726,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w5:t1",
+          "terminal_id": "term_0009",
+          "tokens": {
+            "herdr-sidebar-explorer": "files",
+            "herdr-sidebar-git": "git"
+          },
+          "workspace_id": "w5"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/home/dev/repos/workspace-5",
+          "focused": false,
+          "foreground_cwd": "/home/dev/repos/workspace-5",
+          "pane_id": "w5:p2",
+          "revision": 0,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 75
+          },
+          "tab_id": "w5:t1",
+          "terminal_id": "term_0010",
+          "workspace_id": "w5"
+        }
+      ],
+      "protocol": 20,
+      "tabs": [
+        {
+          "agent_status": "idle",
+          "focused": true,
+          "label": "workspace-1",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w1:t1",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "working",
+          "focused": false,
+          "label": "workspace-2",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w2:t1",
+          "workspace_id": "w2"
+        },
+        {
+          "agent_status": "idle",
+          "focused": false,
+          "label": "workspace-3",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w3:t1",
+          "workspace_id": "w3"
+        },
+        {
+          "agent_status": "idle",
+          "focused": false,
+          "label": "workspace-4",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w4:t1",
+          "workspace_id": "w4"
+        },
+        {
+          "agent_status": "unknown",
+          "focused": false,
+          "label": "workspace-5",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w5:t1",
+          "workspace_id": "w5"
+        }
+      ],
+      "version": "0.8.2",
+      "workspaces": [
+        {
+          "active_tab_id": "w1:t1",
+          "agent_status": "idle",
+          "focused": true,
+          "label": "workspace-1",
+          "number": 1,
+          "pane_count": 2,
+          "tab_count": 1,
+          "tokens": {
+            "git_clean": "clean"
+          },
+          "workspace_id": "w1"
+        },
+        {
+          "active_tab_id": "w2:t1",
+          "agent_status": "working",
+          "focused": false,
+          "label": "workspace-2",
+          "number": 2,
+          "pane_count": 2,
+          "tab_count": 1,
+          "tokens": {
+            "git_clean": "clean"
+          },
+          "workspace_id": "w2"
+        },
+        {
+          "active_tab_id": "w3:t1",
+          "agent_status": "idle",
+          "focused": false,
+          "label": "workspace-3",
+          "number": 3,
+          "pane_count": 2,
+          "tab_count": 1,
+          "tokens": {
+            "git_clean": "clean"
+          },
+          "workspace_id": "w3"
+        },
+        {
+          "active_tab_id": "w4:t1",
+          "agent_status": "idle",
+          "focused": false,
+          "label": "workspace-4",
+          "number": 4,
+          "pane_count": 2,
+          "tab_count": 1,
+          "tokens": {
+            "git_clean": "clean"
+          },
+          "workspace_id": "w4"
+        },
+        {
+          "active_tab_id": "w5:t1",
+          "agent_status": "unknown",
+          "focused": false,
+          "label": "workspace-5",
+          "number": 5,
+          "pane_count": 2,
+          "tab_count": 1,
+          "tokens": {
+            "git_clean": "clean"
+          },
+          "workspace_id": "w5"
+        }
+      ]
+    },
+    "type": "session_snapshot"
+  }
+}
