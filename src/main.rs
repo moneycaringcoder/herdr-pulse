@@ -29,7 +29,7 @@ History:
 
 Sidebar setup:
   --setup                   Add pulse's tokens to herdr's config.toml and reload
-  --setup-rollback          Restore the config.toml backup taken by --setup
+  --setup-rollback          Undo setup only if config.toml has not changed since
 
 Other:
   --interval <SECS>         Seconds between snapshots (default: 5)

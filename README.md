@@ -124,10 +124,26 @@ Run this and it is done for you:
 pulse --setup
 ```
 
-It splices the entries into your existing `[ui.sidebar.spaces]` rows, takes a
-backup at `config.toml.pulse-backup` first, reloads herdr's config, and restores
-the backup automatically if that reload fails. Running it twice is a no-op.
-`pulse --setup-rollback` undoes it.
+It splices the entries into your existing `[ui.sidebar.spaces]` rows and
+atomically records the exact before/after transaction in
+`config.toml.pulse-backup` and `config.toml.pulse-backup.meta`. If herdr runs
+and rejects the edit, pulse atomically restores the original. If herdr cannot
+be launched, the complete valid edit and both recovery files stay in place;
+the error gives the reload command instead of claiming the config was rejected.
+
+`pulse --setup-rollback` restores the backup only while `config.toml` is still
+byte-for-byte the result setup installed. If anything else changed afterward,
+rollback refuses without writing and names the three Pulse token entries to
+remove manually. This prevents an old whole-file backup from erasing later
+keybindings, themes, or other plugin configuration.
+
+Herdr normally injects its executable path. For a hand-run setup, override it
+explicitly when needed:
+
+```sh
+HERDR_BIN_PATH=/absolute/path/to/herdr pulse --setup
+/absolute/path/to/herdr server reload-config
+```
 
 To do it by hand instead, add the three entries inside a row of your
 `[ui.sidebar.spaces]` rows array:
@@ -413,7 +429,7 @@ both complete.
 | Verb | What it does |
 |---|---|
 | `--setup` | Add pulse's tokens to herdr's `config.toml` and reload. |
-| `--setup-rollback` | Restore the `config.toml` backup taken by `--setup`. |
+| `--setup-rollback` | Undo setup only while `config.toml` still exactly matches what setup installed; otherwise refuse without writing. |
 
 ### Other
 

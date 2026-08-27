@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format follows
   atomically published PID and one history writer; stale PIDs are diagnostic
   only, crashes release ownership automatically, and parent/supervisor startup
   waits boundedly for ownership and PID readiness.
+- Sidebar setup and rollback are now atomic transactions. Pulse keeps exact
+  before/after recovery metadata, restores only a config Herdr actually rejected,
+  distinguishes launch failures from validation failures, and refuses rollback
+  without writing when later user edits would be overwritten.
 
 ## [0.1.1] - 2026-08-23
 
