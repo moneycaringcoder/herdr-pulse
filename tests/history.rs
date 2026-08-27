@@ -2373,14 +2373,7 @@ fn two_workspaces_that_swap_ids_keep_their_own_series() {
     }
 }
 
-#[test]
-fn a_checkout_path_two_workspaces_share_is_not_an_identity() {
-    let config = config(60, 16, 4);
-    let mut history = History::empty(&config);
-
-    // herdr will open two workspaces on one checkout, and then the path says
-    // "one of these two", which is a guess. Falling back to the id keeps the two
-    // series apart instead of merging them under whichever label came last.
+fn record_shared_checkout_history(history: &mut History, config: &Config) {
     for minute in 0..4u64 {
         history.record(
             &sample(
@@ -2400,9 +2393,20 @@ fn a_checkout_path_two_workspaces_share_is_not_an_identity() {
                     ),
                 ],
             ),
-            &config,
+            config,
         );
     }
+}
+
+#[test]
+fn a_checkout_path_two_workspaces_share_is_not_an_identity() {
+    let config = config(60, 16, 4);
+    let mut history = History::empty(&config);
+
+    // herdr will open two workspaces on one checkout, and then the path says
+    // "one of these two", which is a guess. Falling back to the id keeps the two
+    // series apart instead of merging them under whichever label came last.
+    record_shared_checkout_history(&mut history, &config);
 
     assert_eq!(history.workspaces.len(), 2);
     assert_ids_are_unique(&history);
@@ -2432,28 +2436,7 @@ fn the_survivor_of_a_shared_checkout_does_not_inherit_the_other_series() {
 
     // Four minutes with both workspaces on one checkout: one working throughout,
     // one idle throughout.
-    for minute in 0..4u64 {
-        history.record(
-            &sample(
-                T0 + minute * 60,
-                vec![
-                    checkout(
-                        "wA",
-                        "first",
-                        "/home/dev/repos/shared",
-                        &[("wA:p1", "working", 10 + minute)],
-                    ),
-                    checkout(
-                        "wB",
-                        "second",
-                        "/home/dev/repos/shared",
-                        &[("wB:p1", "idle", 500)],
-                    ),
-                ],
-            ),
-            &config,
-        );
-    }
+    record_shared_checkout_history(&mut history, &config);
     // The busy one closes, so the path is unambiguous again — and it must not
     // hand the idle workspace four minutes of somebody else's work.
     history.record(
@@ -3252,24 +3235,26 @@ fn workspaces_are_reported_in_the_order_they_were_first_seen() {
 // Transitions and state
 // ---------------------------------------------------------------------------
 
+fn single_agent_sequence_transitions(first_seq: u64, second_seq: u64) -> u16 {
+    let config = config(60, 8, 4);
+    let mut history = History::empty(&config);
+    history.record(
+        &one(T0, "w1", "alpha", &[("w1:p1", "working", first_seq)]),
+        &config,
+    );
+    history.record(
+        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", second_seq)]),
+        &config,
+    );
+    newest_bucket(&history, 0).transitions
+}
+
 #[test]
 fn a_moved_seq_is_a_transition_even_when_the_state_is_unchanged() {
     // The whole reason `state_change_seq` is recorded. An agent that went
     // working -> idle -> working between two samples looks identical to one that
     // never moved, unless the seq is compared.
-    let config = config(60, 8, 4);
-    let mut history = History::empty(&config);
-
-    history.record(
-        &one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]),
-        &config,
-    );
-    history.record(
-        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 799)]),
-        &config,
-    );
-
-    assert_eq!(newest_bucket(&history, 0).transitions, 1);
+    assert_eq!(single_agent_sequence_transitions(795, 799), 1);
 }
 
 #[test]
@@ -3277,19 +3262,7 @@ fn a_delta_in_the_global_seq_is_not_a_transition_count() {
     // The counter is session-global, so a jump of forty includes every other
     // workspace's transitions. One agent moving is one transition, whatever the
     // size of the step.
-    let config = config(60, 8, 4);
-    let mut history = History::empty(&config);
-
-    history.record(
-        &one(T0, "w1", "alpha", &[("w1:p1", "working", 700)]),
-        &config,
-    );
-    history.record(
-        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 740)]),
-        &config,
-    );
-
-    assert_eq!(newest_bucket(&history, 0).transitions, 1);
+    assert_eq!(single_agent_sequence_transitions(700, 740), 1);
 }
 
 #[test]
@@ -3336,19 +3309,7 @@ fn a_seq_that_went_backwards_is_still_a_transition() {
     // herdr restarting begins a fresh session-global sequence. Treating a lower
     // number as "no movement" would go quiet until the new session climbed past
     // the old one, which could be hours.
-    let config = config(60, 8, 4);
-    let mut history = History::empty(&config);
-
-    history.record(
-        &one(T0, "w1", "alpha", &[("w1:p1", "working", 795)]),
-        &config,
-    );
-    history.record(
-        &one(T0 + 5, "w1", "alpha", &[("w1:p1", "working", 3)]),
-        &config,
-    );
-
-    assert_eq!(newest_bucket(&history, 0).transitions, 1);
+    assert_eq!(single_agent_sequence_transitions(795, 3), 1);
 }
 
 #[test]
