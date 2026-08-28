@@ -145,9 +145,18 @@ impl TestServer {
                             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                                 continue;
                             }
-                            requests.lock().expect("requests").push(line);
+                            requests.lock().expect("requests").push(line.clone());
                             match replies.next() {
                                 Some(Reply::Line(reply)) => {
+                                    let reply = match serde_json::from_str::<Value>(&reply) {
+                                        Ok(mut response) => {
+                                            let request: Value = serde_json::from_str(&line)
+                                                .expect("fake request is JSON");
+                                            response["id"] = request["id"].clone();
+                                            response.to_string()
+                                        }
+                                        Err(_) => reply,
+                                    };
                                     let mut stream = &stream;
                                     let _ = stream.write_all(reply.as_bytes());
                                     let _ = stream.write_all(b"\n");
@@ -430,21 +439,19 @@ fn one_request_per_connection_is_survived_by_reconnecting() {
 }
 
 #[test]
-fn the_retry_reuses_the_same_request_id() {
+fn an_ambiguous_metadata_failure_is_not_retried() {
     let _guard = env_lock();
     let server = TestServer::start(vec![Reply::Eof, ok_reply()]);
     let mut client = server.client();
 
     client
         .set_badge("wM", "pulse_working", "x", 15_000)
-        .expect("set");
+        .expect_err("an ambiguous metadata outcome must be reported");
 
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
     assert_eq!(
-        parse_framed(&requests[0])["id"],
-        parse_framed(&requests[1])["id"],
-        "a retry is the same logical call, not a new one"
+        server.requests().len(),
+        1,
+        "a state-changing metadata report must not be repeated"
     );
 }
 
@@ -469,7 +476,7 @@ fn a_transport_failure_that_survives_the_retry_is_not_a_herdr_error_code() {
 }
 
 #[test]
-fn a_malformed_response_line_is_a_transport_failure_and_is_retried() {
+fn a_malformed_response_line_is_a_contract_failure_and_is_not_retried() {
     let _guard = env_lock();
     let server = TestServer::start(vec![
         Reply::Line("{ this is not json".to_string()),
@@ -477,24 +484,24 @@ fn a_malformed_response_line_is_a_transport_failure_and_is_retried() {
     ]);
     let mut client = server.client();
 
-    let sample = client.sample(5).expect("the retry lands");
+    let err = client.sample(5).expect_err("malformed JSON must fail");
 
-    assert_eq!(sample.workspaces.len(), 10);
-    assert_eq!(server.requests().len(), 2);
+    assert!(err.to_string().contains("malformed JSON"), "{err}");
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[test]
-fn a_response_with_neither_result_nor_error_is_a_transport_failure() {
+fn a_response_with_neither_result_nor_error_is_a_contract_failure() {
     let _guard = env_lock();
-    // Twice, so the retry is exhausted and the failure surfaces.
-    let reply = || Reply::Line(json!({"id": "pulse:1"}).to_string());
-    let server = TestServer::start(vec![reply(), reply()]);
+    let reply = Reply::Line(json!({"id": "pulse:1"}).to_string());
+    let server = TestServer::start(vec![reply, live_reply()]);
     let mut client = server.client();
 
     let err = client.sample(0).expect_err("nothing to read");
 
     assert_eq!(error_code(&*err), None);
-    assert_eq!(server.requests().len(), 2);
+    assert!(err.to_string().contains("neither `result` nor `error`"));
+    assert_eq!(server.requests().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,9 +536,8 @@ fn a_protocol_error_surfaces_as_a_typed_error_and_is_never_retried() {
 #[test]
 fn every_captured_error_envelope_keeps_its_code_and_message() {
     let _guard = env_lock();
-    // Verbatim from a live server. `invalid_request` is the odd one: it comes
-    // back with an empty `id` rather than the id we sent, so nothing may key off
-    // the echo.
+    // Captured server errors keep their real code/message. The fake server
+    // replaces only the capture's request-specific `id` with the ID it received.
     let captured = [
         ("pulse:1", "workspace_not_found", "workspace nope not found"),
         (
@@ -565,7 +571,7 @@ fn every_captured_error_envelope_keeps_its_code_and_message() {
 }
 
 #[test]
-fn an_error_envelope_with_no_code_still_reads_as_a_rejection() {
+fn an_error_envelope_with_no_code_is_a_contract_failure() {
     let _guard = env_lock();
     let server = TestServer::start(vec![Reply::Line(
         json!({"id": "pulse:1", "error": {}}).to_string(),
@@ -574,11 +580,10 @@ fn an_error_envelope_with_no_code_still_reads_as_a_rejection() {
 
     let err = client
         .clear_badge("wM", "pulse_quiet")
-        .expect_err("rejected");
+        .expect_err("malformed error envelope");
 
-    // Not `None`: a caller that reads `None` as "transport failure" would
-    // redial a server that is answering us perfectly well.
-    assert_eq!(error_code(&*err), Some("unknown_error"));
+    assert_eq!(error_code(&*err), None);
+    assert!(err.to_string().contains("missing its code"), "{err}");
     assert_eq!(server.requests().len(), 1);
 }
 

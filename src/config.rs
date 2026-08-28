@@ -2,6 +2,7 @@
 //! us. Owned by the integrator; the other modules read it, none of them change
 //! it.
 
+use crook::env::PluginEnv;
 use std::fs;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -427,7 +428,7 @@ fn value_arg(args: &[String], name: &str) -> Result<Option<String>> {
 }
 
 pub fn plugin_id() -> String {
-    non_empty_env("HERDR_PLUGIN_ID").unwrap_or_else(|| PLUGIN_ID.to_string())
+    PluginEnv::resolve(PLUGIN_ID).plugin_id().to_owned()
 }
 
 /// Unscoped state root injected by herdr, preserving the pre-session layout.
@@ -436,14 +437,7 @@ pub fn plugin_id() -> String {
 /// all runtime state below `sessions/socket-<full path hex>`; configuration
 /// remains global.
 pub fn state_root() -> PathBuf {
-    non_empty_env("HERDR_PLUGIN_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            xdg_dir("XDG_STATE_HOME", ".local/state")
-                .join("herdr")
-                .join("plugins")
-                .join(plugin_id())
-        })
+    PluginEnv::resolve(PLUGIN_ID).state_dir().to_path_buf()
 }
 
 /// Every runtime path belonging to one resolved Herdr socket namespace.
@@ -648,38 +642,7 @@ fn lock_default_marker(root: &Path) -> Result<fs::File> {
 /// split-brain rule as [`state_root`] — a config read by hand must be the config
 /// herdr reads.
 pub fn config_dir() -> PathBuf {
-    non_empty_env("HERDR_PLUGIN_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            xdg_dir("XDG_CONFIG_HOME", ".config")
-                .join("herdr")
-                .join("plugins")
-                .join("config")
-                .join(plugin_id())
-        })
-}
-
-/// An XDG base directory. The variable wins when it is set to an absolute path
-/// — the spec says a relative one must be ignored — otherwise `$HOME/<relative>`.
-///
-/// The temp path is a last resort for a process with no home directory at all
-/// (an empty-environment service manager). It is the wrong place for state, but
-/// it is better than writing to the working directory, which for a herdr plugin
-/// is somebody's repository.
-fn xdg_dir(variable: &str, relative: &str) -> PathBuf {
-    if let Some(base) = non_empty_env(variable)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        return base;
-    }
-    match non_empty_env("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        Some(home) => home.join(relative),
-        None => std::env::temp_dir().join("herdr-no-home"),
-    }
+    PluginEnv::resolve(PLUGIN_ID).config_dir().to_path_buf()
 }
 
 /// herdr injects empty strings for absent context, so empty means unset.

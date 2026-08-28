@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "crook"
+version = "0.1.0"
+source = "git+https://github.com/moneycaringcoder/herdr-crook?tag=v0.1.0#a1ff894a8ca9e7874fbde3de28165367cf1d12e4"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -43,6 +51,7 @@ dependencies = [
 name = "pulse"
 version = "0.1.1"
 dependencies = [
+ "crook",
  "libc",
  "serde",
  "serde_json",

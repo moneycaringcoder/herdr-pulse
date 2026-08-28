@@ -3,9 +3,9 @@
 //! Owned by the sampler. `model.rs` and `config.rs` are the contract and must
 //! not be edited here.
 //!
-//! Newline-delimited JSON over the socket at `HERDR_SOCKET_PATH`. The server
-//! answers exactly one request per connection and then closes, so every call
-//! must be able to reconnect and retry once — see `docs/herdr-protocol.md`.
+//! Newline-delimited JSON over the socket at `HERDR_SOCKET_PATH`. Crook opens
+//! one connection per request, matching the server's unary protocol, and
+//! retries only requests explicitly marked idempotent.
 //!
 //! # Snapshot shape, captured at both supported protocol generations
 //!
@@ -40,12 +40,11 @@
 //! having one that happens to be empty.
 
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crook::client::{Client, Error as CrookError, RetrySafety};
 use serde_json::{json, Map, Value};
 
 use crate::config;
@@ -91,18 +90,10 @@ pub fn error_code<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a 
     err.downcast_ref::<HerdrError>().map(|e| e.code.as_str())
 }
 
-/// Split so that only transport failures are retried. Retrying a rejected
-/// request would just be rejected again, and would double-count against herdr's
-/// own error accounting.
-enum Failure {
-    Transport(String),
-    Protocol(HerdrError),
-}
-
 #[derive(Debug)]
 pub struct Herdr {
     pub socket_path: PathBuf,
-    next_id: u64,
+    client: Client,
 }
 
 /// One invocation's stable socket pathname and compatibility classification.
@@ -115,10 +106,10 @@ pub struct SocketTarget {
 impl Herdr {
     /// Dials the already-resolved socket selected for this invocation.
     pub fn connect_at(socket_path: &Path) -> Result<Self> {
-        dial(socket_path)?;
+        let client = Client::connect(socket_path, "pulse").map_err(map_crook_error)?;
         Ok(Self {
             socket_path: socket_path.to_path_buf(),
-            next_id: 0,
+            client,
         })
     }
 
@@ -136,17 +127,20 @@ impl Herdr {
     /// history worth showing.
     ///
     /// The session is read on **both** sides of the call and only kept when the
-    /// two agree. Neither side is safe alone. [`Self::call`] retries a transport
-    /// failure precisely because the first attempt can land on a socket the old
-    /// server has just unlinked, so a mark read beforehand can name a session
-    /// that did not answer — and a mark read afterwards can name one that had not
-    /// started listening when we asked. Disagreement means the socket moved
-    /// across the call and pulse cannot say which server replied: that is an
-    /// unattributable sample, which the store knows how to record, and it lasts
-    /// exactly one cycle.
+    /// two agree. Neither side is safe alone. The idempotent Crook request
+    /// retries a transport failure precisely because the first attempt can land
+    /// on a socket the old server has just unlinked, so a mark read beforehand
+    /// can name a session that did not answer — and a mark read afterwards can
+    /// name one that had not started listening when we asked. Disagreement means
+    /// the socket moved across the call and pulse cannot say which server
+    /// replied: that is an unattributable sample, which the store knows how to
+    /// record, and it lasts exactly one cycle.
     pub fn sample(&mut self, taken_at: u64) -> Result<Sample> {
         let before = session_mark(&self.socket_path);
-        let result = self.call("session.snapshot", json!({}))?;
+        let result = self
+            .client
+            .request("session.snapshot", json!({}), RetrySafety::Idempotent)
+            .map_err(map_crook_error)?;
         let session = before.filter(|mark| session_mark(&self.socket_path).as_ref() == Some(mark));
         reduce_snapshot(&result, session, taken_at)
     }
@@ -217,103 +211,34 @@ impl Herdr {
             if sets_anything {
                 params.insert("ttl_ms".into(), json!(ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS)));
             }
-            self.call("workspace.report_metadata", Value::Object(params))?;
+            self.client
+                .request(
+                    "workspace.report_metadata",
+                    Value::Object(params),
+                    RetrySafety::Never,
+                )
+                .map_err(map_crook_error)?;
         }
         Ok(())
     }
 
     pub fn notify(&mut self, title: &str, body: &str) -> Result<()> {
-        self.call("notification.show", json!({ "title": title, "body": body }))?;
+        self.client
+            .request(
+                "notification.show",
+                json!({ "title": title, "body": body }),
+                RetrySafety::Never,
+            )
+            .map_err(map_crook_error)?;
         Ok(())
-    }
-
-    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.next_id += 1;
-        let id = format!("pulse:{}", self.next_id);
-        match self.call_once(&id, method, &params) {
-            Ok(result) => Ok(result),
-            Err(Failure::Protocol(err)) => Err(Box::new(err)),
-            // One request per connection is the normal path, not an error path:
-            // the server EOFs after answering, so the connection we would reuse
-            // is already gone. The same retry carries the client across a
-            // `herdr update --handoff`, where the first attempt lands on a socket
-            // the old server has just unlinked.
-            Err(Failure::Transport(first)) => match self.call_once(&id, method, &params) {
-                Ok(result) => Ok(result),
-                Err(Failure::Protocol(err)) => Err(Box::new(err)),
-                Err(Failure::Transport(second)) => {
-                    Err(format!("{method} failed twice: {first}; on retry: {second}").into())
-                }
-            },
-        }
-    }
-
-    fn call_once(
-        &self,
-        id: &str,
-        method: &str,
-        params: &Value,
-    ) -> std::result::Result<Value, Failure> {
-        let stream = dial(&self.socket_path).map_err(|e| Failure::Transport(e.to_string()))?;
-
-        // `params` is mandatory and must be an object — never null, `{}` when
-        // empty.
-        let params = if params.is_object() {
-            params.clone()
-        } else {
-            Value::Object(Map::new())
-        };
-        let mut line = serde_json::to_string(&json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .map_err(|e| Failure::Transport(format!("could not encode request: {e}")))?;
-        line.push('\n');
-
-        (&stream)
-            .write_all(line.as_bytes())
-            .and_then(|()| (&stream).flush())
-            .map_err(|e| Failure::Transport(format!("write to {method} failed: {e}")))?;
-
-        let mut response = String::new();
-        BufReader::new(&stream)
-            .read_line(&mut response)
-            .map_err(|e| Failure::Transport(format!("read of {method} response failed: {e}")))?;
-        if response.trim().is_empty() {
-            return Err(Failure::Transport(
-                "server closed the connection without answering".into(),
-            ));
-        }
-
-        let value: Value = serde_json::from_str(response.trim_end())
-            .map_err(|e| Failure::Transport(format!("malformed response to {method}: {e}")))?;
-
-        // The error envelope is checked before `result`, because an
-        // `invalid_request` failure comes back with `"id":""` rather than the id
-        // we sent — matching on the id first would classify it as a stray line.
-        if let Some(err) = value.get("error") {
-            return Err(Failure::Protocol(HerdrError {
-                code: text(err, "code").unwrap_or("unknown_error").to_string(),
-                message: text(err, "message").unwrap_or("no message").to_string(),
-            }));
-        }
-        match value.get("result") {
-            Some(result) => Ok(result.clone()),
-            None => Err(Failure::Transport(format!(
-                "response to {method} carried neither result nor error"
-            ))),
-        }
     }
 }
 
-fn dial(socket_path: &Path) -> Result<UnixStream> {
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("cannot reach herdr at {}: {e}", socket_path.display()))?;
-    // Without these a half-open socket parks the sampling loop forever.
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(stream)
+fn map_crook_error(error: CrookError) -> Box<dyn std::error::Error> {
+    match error {
+        CrookError::Protocol { code, message } => Box::new(HerdrError { code, message }),
+        error => Box::new(error),
+    }
 }
 
 /// The session behind a socket path, or `None` when it cannot be established.
