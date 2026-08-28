@@ -291,9 +291,10 @@ fn the_dependency_tree_cannot_reach_the_network() {
     // `cargo tree --target x86_64-unknown-linux-gnu` does not mention them, and
     // the manifest declares `platforms = ["linux", "macos"]`. They are Win32 API
     // bindings, not a network stack.
-    const ALLOWED: [&str; 19] = [
+    const ALLOWED: [&str; 20] = [
         "windows-link",
         "windows-sys",
+        "crook",
         "pulse",
         "serde",
         "serde_core",
